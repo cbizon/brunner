@@ -1,0 +1,16 @@
+{
+  "files": {
+    "answers.json": {
+      "sha256": "ef36dbcb306fd6b93f3c702087bd329ab8936602a13ddddacebe85fb126c5a7f",
+      "size": 32,
+      "type": "file"
+    }
+  },
+  "metadata": {
+    "benchmark_id": "numeric-square",
+    "benchmark_version": "1.0.0",
+    "contract_sha256": "c96993cd12ef09655f3e42fd88250c3d1030aaa4b8af8eb5d8bbc9c224096742"
+  },
+  "schema_version": "1.0",
+  "sha256": "f8e834abfe93dc79681e0e20c7a121b3037d38d92c229cbe326dc0bc69620c6c"
+}

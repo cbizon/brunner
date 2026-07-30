@@ -1,0 +1,41 @@
+[project]
+name = "brunner"
+version = "0.1.0"
+description = "Contract-driven runner for isolated agent benchmarks"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "jsonschema>=4.23",
+]
+
+[project.scripts]
+brunner = "brunner.cli:main"
+brunner-agent = "brunner.agent_cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brunner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/brunner/schemas" = "brunner/schemas"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+branch = true
+source = ["brunner"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

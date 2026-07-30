@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brunner.dev/schemas/output-contract.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "title",
+    "submission",
+    "run_status_path"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "benchmark_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "submission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_path", "schema"],
+      "properties": {
+        "manifest_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schema": {
+          "type": "object"
+        }
+      }
+    },
+    "run_status_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "work_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description"],
+        "oneOf": [
+          {"required": ["path"]},
+          {"required": ["manifest_pointer"]}
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "manifest_pointer": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "media_type": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean",
+            "default": true
+          },
+          "minimum_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maximum_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "json_schema": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "instructions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

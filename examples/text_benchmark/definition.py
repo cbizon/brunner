@@ -1,0 +1,26 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from brunner import (
+    BenchmarkDefinition,
+    ChallengeDefinition,
+    EvaluationDefinition,
+)
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def build_definition() -> BenchmarkDefinition:
+    return BenchmarkDefinition(
+        benchmark_id="text-uppercase",
+        version="1.0.0",
+        root=ROOT,
+        contract_path=ROOT / "output-contract.json",
+        challenge=ChallengeDefinition(root=ROOT / "challenge"),
+        evaluation=EvaluationDefinition(
+            command=(sys.executable, str(ROOT / "evaluator.py")),
+        ),
+    )

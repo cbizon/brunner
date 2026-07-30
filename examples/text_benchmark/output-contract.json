@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "text-uppercase",
+  "title": "Uppercase transformation",
+  "description": "Submit the uppercase form of the supplied input text.",
+  "submission": {
+    "manifest_path": "submission/manifest.json",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "output"],
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "description": "Submission contract version."
+        },
+        "output": {
+          "type": "string",
+          "description": "Path to the transformed text file."
+        }
+      }
+    }
+  },
+  "run_status_path": "submission/run-status.json",
+  "work_units": [
+    {
+      "id": "uppercase",
+      "description": "Transform the complete input text to uppercase."
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "transformed-text",
+      "description": "UTF-8 text containing the uppercase input.",
+      "manifest_pointer": "/output",
+      "media_type": "text/plain",
+      "minimum_bytes": 1
+    }
+  ],
+  "instructions": [
+    "Preserve punctuation and whitespace.",
+    "Do not add explanatory text to the transformed output."
+  ]
+}

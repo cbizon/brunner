@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "numeric-square",
+  "title": "Square a sequence of values",
+  "description": "Compute the square of every input value in original order.",
+  "submission": {
+    "manifest_path": "submission/manifest.json",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "results"],
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "description": "Submission contract version."
+        },
+        "results": {
+          "type": "string",
+          "description": "Path to the JSON results artifact."
+        }
+      }
+    }
+  },
+  "run_status_path": "submission/run-status.json",
+  "work_units": [
+    {
+      "id": "square-values",
+      "description": "Square every supplied value and preserve input order."
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "squared-values",
+      "description": "JSON object containing the computed values.",
+      "manifest_pointer": "/results",
+      "media_type": "application/json",
+      "minimum_bytes": 10,
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["results"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "instructions": [
+    "Read values and operation from input.json.",
+    "Preserve the original value order."
+  ]
+}
