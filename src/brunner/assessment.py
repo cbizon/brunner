@@ -575,7 +575,6 @@ def _run_reviewer(
         provider_home.mkdir()
         combined_events = transcript / "events.jsonl"
         combined_stderr = transcript / "stderr.log"
-        final_output = transcript / "final.json"
         resolved_schema_path = (
             isolated_workspace / "resolved-output.schema.json"
         )
@@ -618,6 +617,7 @@ def _run_reviewer(
                 break
             events = attempts_root / f"{number:04d}.events.jsonl"
             stderr = attempts_root / f"{number:04d}.stderr.log"
+            final_output = attempts_root / f"{number:04d}.final.json"
             context = ProviderRunContext(
                 workspace=isolated_workspace,
                 transcript_dir=transcript,
@@ -631,6 +631,21 @@ def _run_reviewer(
             )
             provider_command = adapter.build_command(settings, context)
             started_at = _now()
+
+            def terminal_success_ready() -> bool:
+                try:
+                    candidates = _response_candidates(
+                        None,
+                        events,
+                        final_output,
+                    )
+                except OSError:
+                    return False
+                return any(
+                    not _validation_errors(schema, candidate)
+                    for candidate in candidates
+                )
+
             outcome = run_attempt(
                 adapter=adapter,
                 command=provider_command.command,
@@ -647,19 +662,29 @@ def _run_reviewer(
                 deadline_epoch=deadline,
                 stop_requested=threading.Event(),
                 terminal_exit_grace_seconds=5,
+                terminal_success_ready=terminal_success_ready,
             )
             attempt: dict[str, Any] = {
                 "number": number,
                 "started_at": started_at,
                 "ended_at": _now(),
-                "return_code": outcome["return_code"],
                 "events": (
                     f"reviewer/attempts/{events.name}"
                 ),
                 "stderr": (
                     f"reviewer/attempts/{stderr.name}"
                 ),
+                "final_output": (
+                    f"reviewer/attempts/{final_output.name}"
+                ),
             }
+            attempt.update(
+                {
+                    key: value
+                    for key, value in outcome.items()
+                    if key != "observed_response"
+                }
+            )
             records = read_json_records(events)
             stderr_text = (
                 stderr.read_text(errors="replace")
@@ -671,13 +696,24 @@ def _run_reviewer(
                 attempt["failure"] = failure.summary
                 attempt["terminal"] = failure.terminal
                 last_error = failure.summary
-            if int(outcome["return_code"]) == 0:
+            launch_error = outcome.get("launch_error")
+            if launch_error is not None:
+                last_error = f"reviewer launch failed: {launch_error}"
+                attempt["status"] = "failed"
+                attempt["failure"] = last_error
+                attempts.append(attempt)
+                break
+            if (
+                int(outcome["return_code"]) == 0
+                and outcome["terminal_result_succeeded"]
+            ):
                 validation_messages = []
-                for candidate in _response_candidates(
+                candidates = _response_candidates(
                     outcome.get("observed_response"),
                     events,
                     final_output,
-                ):
+                )
+                for candidate in candidates:
                     errors = _validation_errors(schema, candidate)
                     if not errors:
                         write_json_atomic(output_path, candidate)
@@ -693,11 +729,19 @@ def _run_reviewer(
                         persist_transcript()
                         return attempts, usage
                     validation_messages.extend(errors)
-                if validation_messages:
+                if not candidates:
+                    last_error = (
+                        "reviewer returned no valid current structured output"
+                    )
+                elif validation_messages:
                     last_error = (
                         "reviewer output failed schema validation: "
                         + "; ".join(validation_messages)
                     )
+            elif int(outcome["return_code"]) == 0:
+                last_error = (
+                    "reviewer exited without a successful terminal event"
+                )
             attempt["status"] = "failed"
             attempt["failure"] = last_error
             attempts.append(attempt)

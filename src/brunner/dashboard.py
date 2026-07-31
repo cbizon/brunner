@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +25,42 @@ def _seconds(value: object) -> str:
     return f"{value:.1f}"
 
 
+def _elapsed(trial: dict[str, Any], now: datetime) -> str:
+    submitted_at = trial.get("submitted_at")
+    if not submitted_at:
+        return ""
+    try:
+        started = datetime.fromisoformat(str(submitted_at))
+        completed_at = trial.get("completed_at")
+        ended = (
+            datetime.fromisoformat(str(completed_at))
+            if completed_at
+            else now
+        )
+        seconds = max(0, int((ended - started).total_seconds()))
+    except (TypeError, ValueError):
+        return ""
+    days, remainder = divmod(seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    pieces = []
+    if days:
+        pieces.append(f"{days}d")
+    if hours or days:
+        pieces.append(f"{hours}h")
+    if minutes or hours or days:
+        pieces.append(f"{minutes}m")
+    pieces.append(f"{seconds}s")
+    return " ".join(pieces)
+
+
 def write_campaign_dashboard(
     state: dict[str, Any],
     output: Path,
+    *,
+    now: datetime | None = None,
 ) -> Path:
+    dashboard_now = now or datetime.now(UTC)
     trials = state.get("trials", [])
     phases = Counter(str(trial.get("phase")) for trial in trials)
     outcomes = Counter(
@@ -74,10 +107,16 @@ def write_campaign_dashboard(
                     f"{html.escape(str(assessment.get('assessment_id', 'review')))}</a>"
                 )
         snapshot = trial.get("backend_snapshot", {})
+        snapshot_warnings = snapshot.get("warnings", ())
+        if not isinstance(snapshot_warnings, (list, tuple)):
+            snapshot_warnings = []
         warning = (
             trial.get("error")
             or trial.get("collection_error")
             or trial.get("cleanup_error")
+            or trial.get("log_warning")
+            or "; ".join(str(item) for item in snapshot_warnings)
+            or snapshot.get("message")
             or ""
         )
         usage = trial.get("usage", {})
@@ -89,6 +128,7 @@ def write_campaign_dashboard(
             f"<td>{html.escape(str(trial.get('model', '')))}</td>"
             f"<td>{html.escape(str(trial.get('effort') or 'default'))}</td>"
             f"<td>{html.escape(str(trial.get('phase', '')))}</td>"
+            f"<td>{html.escape(_elapsed(trial, dashboard_now))}</td>"
             f"<td>{html.escape(str(trial.get('outcome') or ''))}</td>"
             f"<td>{html.escape(str(evaluation.get('assessment_status') or ''))}</td>"
             f"<td>{html.escape(str(usage.get('total_tokens') or ''))}</td>"
@@ -151,7 +191,7 @@ a {{ color:var(--green); font-weight:bold; }}
 <div class="cards">{cards}</div>
 <div class="table"><table>
 <thead><tr><th>Trial</th><th>Provider</th><th>Model</th><th>Effort</th>
-<th>Phase</th><th>Outcome</th><th>Assessment</th><th>Tokens</th>
+<th>Phase</th><th>Elapsed</th><th>Outcome</th><th>Assessment</th><th>Tokens</th>
 <th>Wall s</th><th>Agent s</th><th>External wait s</th>
 <th>Subscription wait s</th><th>Node</th>
 <th>Report</th><th>Assessment reports</th><th>Issue</th>

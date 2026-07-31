@@ -26,6 +26,7 @@ from brunner.providers import (
     ProviderSettings,
     get_provider,
 )
+from brunner.submission import validate_submission
 from brunner.trial import load_trial_identity
 from brunner.timing import (
     ACTIVITY_LOG_ENV,
@@ -289,14 +290,18 @@ def run_attempt(
     external_activity_path: Path | None = None,
     attempt_number: int = 1,
     timing_recorder: TimingRecorder | None = None,
+    terminal_success_ready: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     terminal_seen = threading.Event()
     terminal_succeeded = threading.Event()
+    terminal_exit_ready = threading.Event()
     observed_response: dict[str, Any] | None = None
     observation_lock = threading.Lock()
     activity_lock = threading.Lock()
     active_provider_activities: set[str] = set()
     provider_event_index = 0
+    prompt_delivery_errors: list[str] = []
+    prompt_delivery_done = threading.Event()
 
     def inspect_line(line: str) -> None:
         nonlocal observed_response, provider_event_index
@@ -348,6 +353,10 @@ def run_attempt(
         if observation.terminal:
             if observation.succeeded:
                 terminal_succeeded.set()
+                if terminal_success_ready is None:
+                    terminal_exit_ready.set()
+            else:
+                terminal_exit_ready.set()
             terminal_seen.set()
 
     def active_work() -> bool:
@@ -365,17 +374,39 @@ def run_attempt(
         combined_events.open("a") as combined_stdout,
         combined_stderr.open("a") as combined_error,
     ):
-        process = subprocess.Popen(
-            list(command),
-            cwd=workspace,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=workspace,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as error:
+            launch_error = f"{type(error).__name__}: {error}"
+            message = f"provider launch failed: {launch_error}\n"
+            attempt_error.write(message)
+            attempt_error.flush()
+            combined_error.write(message)
+            combined_error.flush()
+            return {
+                "return_code": 127,
+                "provider_return_code": 127,
+                "terminal_result_seen": False,
+                "terminal_result_succeeded": False,
+                "terminal_exit_ready": False,
+                "lingering_processes_terminated": False,
+                "forced_termination_reason": None,
+                "active_work_terminated": False,
+                "soft_deadline_activity_seen": False,
+                "launch_error": launch_error,
+                "prompt_delivery_error": None,
+                "observed_response": None,
+            }
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -400,14 +431,27 @@ def run_attempt(
         )
         stdout_thread.start()
         stderr_thread.start()
-        try:
-            process.stdin.write(prompt)
-            process.stdin.close()
-        except BrokenPipeError:
+
+        def deliver_prompt() -> None:
             try:
-                process.stdin.close()
-            except BrokenPipeError:
-                pass
+                process.stdin.write(prompt)
+                process.stdin.flush()
+            except (OSError, ValueError) as error:
+                prompt_delivery_errors.append(
+                    f"{type(error).__name__}: {error}"
+                )
+            finally:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+                prompt_delivery_done.set()
+
+        prompt_thread = threading.Thread(
+            target=deliver_prompt,
+            daemon=True,
+        )
+        prompt_thread.start()
 
         terminal_idle_since = None
         leader_exited_idle_since = None
@@ -420,7 +464,23 @@ def run_attempt(
             work_is_active = active_work()
             now_epoch = time.time()
             now_monotonic = time.monotonic()
-            if terminal_seen.is_set():
+            if (
+                terminal_seen.is_set()
+                and terminal_succeeded.is_set()
+                and not terminal_exit_ready.is_set()
+                and terminal_success_ready is not None
+                and terminal_success_ready()
+            ):
+                terminal_exit_ready.set()
+            if (
+                prompt_delivery_errors
+                and process.poll() is None
+                and not terminal_seen.is_set()
+            ):
+                terminate_process(process)
+                forced_termination_reason = "prompt_delivery_error"
+                break
+            if terminal_exit_ready.is_set():
                 if work_is_active:
                     terminal_idle_since = None
                 elif terminal_idle_since is None:
@@ -433,7 +493,7 @@ def run_attempt(
                     lingering_processes_terminated = True
                     forced_termination_reason = "terminal_exit_grace"
                     break
-            if process.poll() is not None and not terminal_seen.is_set():
+            if process.poll() is not None and not terminal_exit_ready.is_set():
                 if work_is_active:
                     leader_exited_idle_since = None
                 elif leader_exited_idle_since is None:
@@ -459,7 +519,7 @@ def run_attempt(
             if (
                 soft_deadline_epoch is not None
                 and now_epoch >= soft_deadline_epoch
-                and not terminal_seen.is_set()
+                and not terminal_exit_ready.is_set()
             ):
                 if work_is_active:
                     soft_deadline_activity_seen = True
@@ -491,6 +551,11 @@ def run_attempt(
                 process.wait(timeout=0.1)
             except subprocess.TimeoutExpired:
                 pass
+        prompt_thread.join(timeout=1)
+        if not prompt_delivery_done.is_set() and not prompt_delivery_errors:
+            prompt_delivery_errors.append(
+                "prompt delivery thread did not stop after provider exit"
+            )
         stdout_thread.join(timeout=10)
         stderr_thread.join(timeout=10)
 
@@ -510,10 +575,15 @@ def run_attempt(
         "provider_return_code": provider_return_code,
         "terminal_result_seen": terminal_seen.is_set(),
         "terminal_result_succeeded": terminal_succeeded.is_set(),
+        "terminal_exit_ready": terminal_exit_ready.is_set(),
         "lingering_processes_terminated": lingering_processes_terminated,
         "forced_termination_reason": forced_termination_reason,
         "active_work_terminated": active_work_terminated,
         "soft_deadline_activity_seen": soft_deadline_activity_seen,
+        "launch_error": None,
+        "prompt_delivery_error": (
+            prompt_delivery_errors[0] if prompt_delivery_errors else None
+        ),
         "observed_response": observed_response,
     }
 
@@ -597,7 +667,7 @@ def load_final_response(
     *,
     observed_response: object,
     attempt_events: Path,
-    final_paths: tuple[Path, ...],
+    final_output_path: Path,
 ) -> dict[str, Any] | None:
     response = _valid_response(observed_response, contract)
     if response is not None:
@@ -616,16 +686,34 @@ def load_final_response(
                 response = _valid_response(decoded, contract)
                 if response is not None:
                     return response
-    for path in final_paths:
-        if not path.is_file():
-            continue
+    if final_output_path.is_file():
         try:
-            value = json.loads(path.read_text())
+            value = json.loads(final_output_path.read_text())
         except json.JSONDecodeError:
-            continue
-        response = _valid_response(value, contract)
-        if response is not None:
-            return response
+            pass
+        else:
+            response = _valid_response(value, contract)
+            if response is not None:
+                return response
+    return None
+
+
+def submission_validation_error(
+    workspace: Path,
+    contract: OutputContract,
+    response: dict[str, Any],
+) -> str | None:
+    if response["status"] == "failed":
+        return None
+    try:
+        submission = validate_submission(workspace, contract)
+        if submission.run_status != response:
+            raise ContractError(
+                "run status does not match the current provider final "
+                "response"
+            )
+    except (ContractError, OSError) as error:
+        return str(error)
     return None
 
 
@@ -734,6 +822,7 @@ def _run_configured_trial(
     if state["status"] in PIPELINE_TERMINAL_STATUSES:
         write_terminal_artifacts(trial, state, adapter)
         return state
+    (transcript / "final.json").unlink(missing_ok=True)
 
     run_environment = os.environ.copy()
     run_environment.update(environment or {})
@@ -768,12 +857,13 @@ def _run_configured_trial(
         attempt_prefix = attempts_root / f"{attempt_number:04d}"
         attempt_events = attempt_prefix.with_suffix(".events.jsonl")
         attempt_stderr = attempt_prefix.with_suffix(".stderr.log")
+        attempt_final = attempt_prefix.with_suffix(".final.json")
         resume_session = bool(state["session_started"])
         context = ProviderRunContext(
             workspace=workspace,
             transcript_dir=transcript,
             final_schema_path=workspace / "schema/final-response.schema.json",
-            final_output_path=transcript / "final.json",
+            final_output_path=attempt_final,
             persist_session=True,
             resume_session=resume_session,
             session_id=state["session_id"],
@@ -792,6 +882,7 @@ def _run_configured_trial(
             "started_at": epoch_to_iso(attempt_started_epoch),
             "events": str(attempt_events.relative_to(trial)),
             "stderr": str(attempt_stderr.relative_to(trial)),
+            "final_output": str(attempt_final.relative_to(trial)),
         }
         state["attempts"].append(attempt)
         state["status"] = "finalizing" if finalizing else "running"
@@ -816,6 +907,27 @@ def _run_configured_trial(
             **provider_command.environment,
         }
         protected_control_plane = snapshot_control_plane(trial)
+
+        def terminal_success_ready() -> bool:
+            try:
+                response = load_final_response(
+                    contract,
+                    observed_response=None,
+                    attempt_events=attempt_events,
+                    final_output_path=attempt_final,
+                )
+            except OSError:
+                return False
+            return bool(
+                response is not None
+                and submission_validation_error(
+                    workspace,
+                    contract,
+                    response,
+                )
+                is None
+            )
+
         outcome = run_attempt(
             adapter=adapter,
             command=provider_command.command,
@@ -833,6 +945,7 @@ def _run_configured_trial(
             external_activity_path=external_timing_events,
             attempt_number=attempt_number,
             timing_recorder=timing_recorder,
+            terminal_success_ready=terminal_success_ready,
         )
         control_plane_changes = restore_control_plane(
             trial,
@@ -879,8 +992,6 @@ def _run_configured_trial(
         attempt["ended_at"] = attempt_ended["recorded_at"]
         return_code = int(outcome["return_code"])
         attempt["status"] = "complete" if return_code == 0 else "failed"
-        if attempt_events.stat().st_size:
-            state["session_started"] = True
 
         records = read_json_records(attempt_events)
         stderr = (
@@ -888,6 +999,27 @@ def _run_configured_trial(
             if attempt_stderr.is_file()
             else ""
         )
+        resume_unavailable = (
+            resume_session
+            and adapter.resume_is_unavailable(records, stderr)
+        )
+        if resume_unavailable:
+            state["session_started"] = False
+            attempt["session_reset"] = True
+        elif records:
+            state["session_started"] = True
+
+        launch_error = outcome.get("launch_error")
+        if launch_error is not None:
+            attempt["status"] = "failed"
+            attempt["failure"] = f"provider launch failed: {launch_error}"
+            state["status"] = "provider_error"
+            state["failure"] = attempt["failure"]
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
+
         failure = adapter.classify_failure(records, stderr)
         if failure is not None:
             attempt["failure"] = failure.summary
@@ -897,25 +1029,46 @@ def _run_configured_trial(
             attempt["retry_at_epoch"] = failure.retry_at_epoch
 
         final_response = None
-        if return_code == 0:
+        if return_code == 0 and outcome["terminal_result_succeeded"]:
             final_response = load_final_response(
                 contract,
                 observed_response=outcome["observed_response"],
                 attempt_events=attempt_events,
-                final_paths=(
-                    transcript / "final.json",
-                    workspace / contract.run_status_path,
-                ),
+                final_output_path=attempt_final,
             )
             if final_response is None:
                 attempt["status"] = "failed"
                 attempt["failure"] = (
-                    "provider returned no valid structured final response"
+                    "provider returned no valid current structured final "
+                    "response"
                 )
             else:
-                attempt["status"] = final_response["status"]
-                attempt["provider_status"] = final_response["status"]
-                write_json_atomic(transcript / "final.json", final_response)
+                provider_status = str(final_response["status"])
+                attempt["provider_status"] = provider_status
+                validation_error = submission_validation_error(
+                    workspace,
+                    contract,
+                    final_response,
+                )
+                if validation_error is not None:
+                    attempt["status"] = "failed"
+                    attempt["submission_validation_error"] = validation_error
+                    attempt["failure"] = (
+                        "provider final response did not have a valid "
+                        f"matching submission: {validation_error}"
+                    )
+                    final_response = None
+                if final_response is not None:
+                    attempt["status"] = provider_status
+                    write_json_atomic(
+                        transcript / "final.json",
+                        final_response,
+                    )
+        elif return_code == 0:
+            attempt["status"] = "failed"
+            attempt["failure"] = (
+                "provider exited without a successful terminal event"
+            )
 
         if final_response is not None:
             state["status"] = str(final_response["status"])
@@ -925,7 +1078,11 @@ def _run_configured_trial(
             write_terminal_artifacts(trial, state, adapter)
             return state
 
-        if failure is not None and failure.terminal:
+        if (
+            failure is not None
+            and failure.terminal
+            and not resume_unavailable
+        ):
             state["status"] = "provider_error"
             state["failure"] = failure.summary
             state["completed_at"] = utc_now()
@@ -933,8 +1090,6 @@ def _run_configured_trial(
             write_terminal_artifacts(trial, state, adapter)
             return state
 
-        if resume_session and adapter.resume_is_unavailable(stderr):
-            state["session_started"] = False
         if stop_requested.is_set():
             state["status"] = "interrupted"
             state["completed_at"] = utc_now()
@@ -950,7 +1105,7 @@ def _run_configured_trial(
             else "runner_retry_wait"
         )
         now = time.time()
-        requested_wait = retry_seconds
+        requested_wait = 0.0 if resume_unavailable else retry_seconds
         if (
             failure is not None
             and wait_category == "subscription_wait"
@@ -1000,7 +1155,9 @@ def _run_configured_trial(
             source="runner",
             attempt=attempt_number,
         )
-        if wait_category == "runner_retry_wait":
+        if resume_unavailable:
+            retry_seconds = runtime.retry_initial_seconds
+        elif wait_category == "runner_retry_wait":
             retry_seconds = min(
                 retry_seconds * 2,
                 runtime.retry_max_seconds,

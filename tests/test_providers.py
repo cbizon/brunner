@@ -223,3 +223,16 @@ def test_provider_activity_observations_normalize_tool_lifecycles() -> None:
     assert codex_start[0].activity_id == "item-1"
     assert claude_end[0].phase == "end"
     assert claude_end[0].activity_id == "tool-1"
+
+
+@pytest.mark.parametrize("adapter", [CodexAdapter(), ClaudeAdapter()])
+def test_resume_unavailable_is_detected_in_json_records(adapter) -> None:
+    assert adapter.resume_is_unavailable(
+        [
+            {
+                "type": "error",
+                "error": "No session found for requested identifier",
+            }
+        ],
+        "",
+    )

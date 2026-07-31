@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -104,6 +104,8 @@ class CampaignPlan:
     backend_image: str | None = None
     provider_executable: str | None = None
     included_artifact_groups: frozenset[str] = frozenset()
+    collection_retry_seconds: float = 60.0
+    collection_max_attempts: int = 3
 
     def validate(self) -> None:
         if not self.campaign_id.strip():
@@ -112,6 +114,14 @@ class CampaignPlan:
             raise ValueError("campaign must contain at least one trial")
         if self.max_parallel < 1:
             raise ValueError("campaign max_parallel must be positive")
+        if self.collection_retry_seconds < 0:
+            raise ValueError(
+                "campaign collection_retry_seconds must not be negative"
+            )
+        if self.collection_max_attempts < 1:
+            raise ValueError(
+                "campaign collection_max_attempts must be positive"
+            )
         identities: dict[str, dict[str, Any]] = {}
         for trial in self.trials:
             trial.validate()
@@ -134,6 +144,8 @@ class CampaignPlan:
             "included_artifact_groups": sorted(
                 self.included_artifact_groups
             ),
+            "collection_retry_seconds": self.collection_retry_seconds,
+            "collection_max_attempts": self.collection_max_attempts,
         }
 
 
@@ -484,6 +496,7 @@ class CampaignRunner:
         if entry["phase"] != "evaluation_pending":
             entry["phase"] = "collecting"
             entry["attempts"]["collection"] += 1
+            entry.pop("next_collection_attempt_at", None)
             self._save(state)
             try:
                 collection = self.backend.collect(
@@ -494,8 +507,42 @@ class CampaignRunner:
                 )
             except BackendConnectivityError:
                 raise
+            except ArtifactTransferError as error:
+                attempts = int(entry["attempts"]["collection"])
+                if attempts < self.plan.collection_max_attempts:
+                    next_attempt = datetime.now(UTC) + timedelta(
+                        seconds=self.plan.collection_retry_seconds
+                    )
+                    entry["phase"] = "collection_retry_wait"
+                    entry["collection_error"] = str(error)
+                    entry["next_collection_attempt_at"] = (
+                        next_attempt.isoformat()
+                    )
+                    self._event(
+                        state,
+                        "collection_retry_scheduled",
+                        (
+                            f"artifact transfer attempt {attempts} failed; "
+                            f"retrying at {next_attempt.isoformat()}"
+                        ),
+                        test_id=entry["test_id"],
+                    )
+                    self._save(state)
+                    return
+                entry["phase"] = "collection_failed"
+                entry["collection_error"] = str(error)
+                self._event(
+                    state,
+                    "collection_failed",
+                    (
+                        f"artifact transfer failed after {attempts} "
+                        f"attempts: {error}"
+                    ),
+                    test_id=entry["test_id"],
+                )
+                self._save(state)
+                return
             except (
-                ArtifactTransferError,
                 BackendError,
                 IntegrityError,
                 OSError,
@@ -633,6 +680,7 @@ class CampaignRunner:
                 "pending",
                 "running",
                 "collection_pending",
+                "collection_retry_wait",
                 "evaluation_pending",
                 "cleanup_pending",
             }:
@@ -663,6 +711,30 @@ class CampaignRunner:
                 )
                 continue
             if entry["phase"] == "collection_pending":
+                backend_phase = str(
+                    entry.get("backend_phase", "failed")
+                )
+                try:
+                    self._collect_and_evaluate(
+                        state,
+                        entry,
+                        handle,
+                        backend_phase,
+                    )
+                except BackendConnectivityError as error:
+                    return self._pause_connectivity(state, error)
+                continue
+            if entry["phase"] == "collection_retry_wait":
+                retry_at = entry.get("next_collection_attempt_at")
+                if retry_at:
+                    try:
+                        retry_time = datetime.fromisoformat(str(retry_at))
+                    except ValueError:
+                        retry_time = datetime.now(UTC)
+                    if retry_time.tzinfo is None:
+                        retry_time = retry_time.replace(tzinfo=UTC)
+                    if retry_time > datetime.now(UTC):
+                        continue
                 backend_phase = str(
                     entry.get("backend_phase", "failed")
                 )
@@ -712,9 +784,15 @@ class CampaignRunner:
                 log_path = Path(entry["trial"]) / "backend/workload.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    log_path.write_text(self.backend.logs(handle))
+                    workload_logs = self.backend.logs(handle)
+                except BackendConnectivityError as error:
+                    return self._pause_connectivity(state, error)
                 except BackendError as error:
                     entry["log_warning"] = str(error)
+                else:
+                    if workload_logs or not log_path.exists():
+                        log_path.write_text(workload_logs)
+                    entry.pop("log_warning", None)
                 entry["backend_phase"] = snapshot.phase
                 try:
                     self._collect_and_evaluate(
@@ -739,6 +817,7 @@ class CampaignRunner:
                 "pending",
                 "running",
                 "collection_pending",
+                "collection_retry_wait",
                 "collecting",
                 "evaluating",
                 "cleanup_pending",
@@ -814,6 +893,7 @@ class CampaignRunner:
             "submitted",
             "running",
             "collection_pending",
+            "collection_retry_wait",
             "collecting",
             "evaluation_pending",
             "evaluating",
@@ -842,6 +922,9 @@ class CampaignRunner:
             raise ValueError("poll_seconds must be positive")
         while True:
             state = self.advance()
-            if state["status"] != "running":
+            if state["status"] not in {
+                "running",
+                "paused_backend_connectivity",
+            }:
                 return state
             time.sleep(poll_seconds)

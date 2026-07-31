@@ -150,16 +150,39 @@ failure classification, and resume behavior. The runner persists:
 - Canonical token accounting with provider-native source counters
 - Exclusive wall-time accounting and overlapping background-job intervals
 
+Every provider invocation writes to attempt-specific event, stderr, and final
+output paths. Brunner accepts structured output only from the current attempt
+and only after that attempt emits a successful provider terminal event. A
+`complete` or `partial` response must exactly match the contract-valid run
+status, manifest, and artifacts in the workspace. Only then does Brunner write
+the canonical `transcript/final.json`; stale canonical files are removed when
+a nonterminal run resumes. Reviewer attempts use the same attempt isolation.
+
+Provider launch errors become durable `provider_error` results rather than
+escaping before status is written. Prompt input is delivered on a separate
+thread, so a provider that never reads stdin remains subject to the normal
+soft stop, hard deadline, and process-group termination logic.
+
 Ordinary transient API failures retry with bounded exponential delay.
 Authentication, authorization, unavailable model, invalid request, and
 disabled-credit conditions terminate immediately.
 
+Session-unavailable detection examines both parsed JSON events and stderr. If
+a resumed session is missing, Brunner clears the persisted session-started
+state and immediately retries with a fresh invocation instead of repeatedly
+resuming an invalid session.
+
 The work deadline is a soft transition into finalization. An open provider
 tool or benchmark-declared `external_wait`/`background_job` interval may drain
-until the hard trial deadline. A provider terminal event starts its exit grace
-only after declared work drains. Undeclared orphan process groups are
-terminated and reaped before the attempt returns, so artifact collection
-cannot race a leftover child process.
+until the hard trial deadline. A successful provider terminal event starts
+its exit grace only after the current structured response and required
+submission are valid and declared work has drained. A success event without
+ready output does not terminate a provider that is still finishing work, but
+it does not disable the soft deadline or consume the reserved finalization
+window once declared work is idle.
+Undeclared orphan process groups are terminated and reaped before the attempt
+returns, so artifact collection cannot race a leftover child process or a
+child that writes files after the provider leader exits.
 
 Rejected subscription boundaries are distinct from ordinary retry backoff.
 When a provider exposes a reset epoch, Brunner waits directly for that
@@ -195,10 +218,11 @@ truncation collisions.
 
 Kubernetes distinguishes connectivity failures from rejected requests and
 workload failures. It reports pending PVCs, inspects terminated init/main
-containers, preserves workload logs, retries artifact readers, excludes
-failed reader nodes when rescheduling, resumes partial files by byte offset,
-and verifies every SHA-256. A failed workload's PVC is retained until artifact
-collection succeeds.
+containers, preserves previously recovered workload logs, and includes
+Kubernetes warning events for pending storage and failed artifact readers. It
+retries artifact readers, excludes failed reader nodes when rescheduling,
+resumes partial files by byte offset, and verifies every SHA-256. A failed
+workload's PVC is retained until artifact collection succeeds.
 
 ## Campaign State
 
@@ -214,15 +238,18 @@ Campaign reconciliation:
 - Rejects only an ID reused with conflicting execution attributes
 - Submits only up to plan and backend capacity
 - Resumes from persisted handles
-- Pauses the campaign on backend connectivity loss
+- Pauses individual steps on backend connectivity loss; `run()` waits and
+  resumes without changing remote workloads
 - Collects artifacts for both successful and failed workloads
 - Recovers interrupted collection and evaluation phases after a crash
-- Keeps durable collection/evaluation failures visible without retry loops
+- Retries interrupted artifact transfers with a bounded, configurable policy
+- Keeps integrity and evaluation failures durable instead of retrying them
 - Continues healthy running or pending trials when another needs attention
 - Does not clean up when recovery fails
 - Runs trusted evaluation after verified collection
 - Runs configured assessments after deterministic evaluation
-- Regenerates `index.html` after each transition
+- Regenerates `index.html` after each transition with live elapsed time,
+  backend warnings, usage, timing, and report links
 
 No campaign environment values are serialized. A plan may name environment
 variables to pass at submission time; their values are read from the current

@@ -111,7 +111,11 @@ the agent is blocked waiting for an external process.
 
 Declared tool, wait, and background intervals are allowed to drain across the
 soft finalization boundary, up to the hard trial deadline. Undeclared orphan
-process groups are terminated before artifact collection begins.
+process groups are terminated before artifact collection begins. Successful
+provider events do not start exit grace until current structured output is
+valid, preventing premature termination while final artifacts are still being
+written without allowing a nonfinal event to consume the reserved finalization
+window.
 
 The repository includes:
 

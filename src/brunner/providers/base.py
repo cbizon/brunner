@@ -106,7 +106,11 @@ class ProviderAdapter(Protocol):
         stderr: str,
     ) -> ProviderFailure | None: ...
 
-    def resume_is_unavailable(self, stderr: str) -> bool: ...
+    def resume_is_unavailable(
+        self,
+        records: list[dict[str, Any]],
+        stderr: str,
+    ) -> bool: ...
 
 
 def validate_effort(

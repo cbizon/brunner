@@ -185,6 +185,31 @@ Set `required=True` only when failure to obtain a valid assessment should make
 the campaign trial unsuccessful. Deterministic `evaluation.status` is never
 overwritten by an assessment result.
 
+## Provider Attempt Semantics
+
+Brunner treats every provider invocation as an isolated attempt. Event logs,
+stderr, and provider final output are attempt-specific. A trial reaches
+`complete` or `partial` only when the current attempt:
+
+- emits a provider-specific successful terminal event;
+- returns final JSON conforming to the generated response schema;
+- leaves a contract-valid manifest and all required artifacts; and
+- writes a run-status document exactly matching the provider response.
+
+The canonical `transcript/final.json` is published only after those checks.
+Files left by an earlier attempt cannot terminate a later one. Assessment
+reviewers follow the same current-attempt and terminal-event rules. A
+successful provider event without ready structured output does not start the
+exit grace, so work still being completed by that provider is not killed
+prematurely.
+
+Provider launch failures are persisted as `provider_error`. Prompt delivery is
+deadline-controlled even when a provider never reads stdin. Missing resumed
+sessions are recognized from JSON events or stderr and cause an immediate
+fresh invocation. Before an attempt returns, Brunner terminates and reaps its
+remaining process group, including undeclared children that could otherwise
+modify the workspace during collection.
+
 ## Resource Accounting
 
 Brunner maps provider counters into one token scheme:
@@ -243,7 +268,8 @@ its overlap with agent work remains visible.
 Open `foreground_tool`, `external_wait`, and `background_job` intervals also
 protect declared work from the soft finalization boundary. Brunner waits for
 the interval to close, up to the trial's hard deadline. A provider terminal
-event likewise waits for declared work to drain before its exit grace starts.
+event likewise waits for valid current output and declared work to drain before
+its exit grace starts.
 Undeclared child processes are reaped as an orphaned process group before the
 attempt returns.
 
@@ -369,6 +395,8 @@ def build_campaign(definition, contract):
         ),
         max_parallel=2,
         included_artifact_groups=frozenset({"debug"}),
+        collection_retry_seconds=60,
+        collection_max_attempts=3,
     )
     return CampaignRunner(
         definition,
@@ -415,6 +443,19 @@ are not required in the agent image.
 Provider secrets should be inherited from the local environment or referenced
 through `KubernetesProfile.secret_environment`. Do not place secret values in
 campaign objects.
+
+`campaign-step` returns a persisted `paused_backend_connectivity` state when
+the backend cannot be reached. `campaign-run` keeps waiting and retries until
+connectivity returns or the process is interrupted; it does not alter remote
+workloads while disconnected.
+
+Artifact-transfer interruptions retain verified partial files and retry after
+`collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
+identity, path, and other integrity failures are not retried automatically.
+An empty remote log response does not overwrite a previously recovered
+workload log. Kubernetes snapshots include relevant warning events for
+pending PVCs and artifact-reader mount failures, and the campaign dashboard
+shows those warnings with live elapsed time.
 
 `RuntimeDefaults.timeout_seconds` is the agent's hard deadline.
 `backend_shutdown_grace_seconds` is added only to the enclosing backend

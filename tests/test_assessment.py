@@ -478,6 +478,110 @@ printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","c
     ]
 
 
+def test_provider_reviewer_does_not_reuse_prior_attempt_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    _write_assessment_materials(assessment_root)
+    reviewer = tmp_path / "codex-reviewer"
+    reviewer.write_text(
+        """#!/bin/sh
+set -eu
+count_file="$HOME/attempt-count"
+count=0
+if [ -f "$count_file" ]; then count="$(cat "$count_file")"; fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+final=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--output-last-message" ]; then final="$argument"; fi
+  previous="$argument"
+done
+if [ "$count" -eq 1 ]; then
+  result='{"verdict":"pass","criterion":{"applicability":"not_applicable","rating":"not_applicable","confidence":"high","summary":"","evidence":[]}}'
+  printf '%s\n' "$result" > "$final"
+  printf '%s\n' '{"type":"turn.failed","error":"temporary failure"}'
+  exit 1
+fi
+printf '%s\n' '{"type":"turn.completed"}'
+"""
+    )
+    reviewer.chmod(0o755)
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="stale-review",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            rubric_paths=("rubric.md",),
+            output_schema_path="review.schema.json",
+            output_path="evaluation/stale-review.json",
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="judge-model",
+            ),
+            reviewer_executable=str(reviewer),
+            max_attempts=2,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    _pythonpath(monkeypatch)
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assessment = result["assessments"][0]
+    assert assessment["status"] == "failed"
+    assert len(assessment["attempts"]) == 2
+    assert assessment["attempts"][1]["failure"] == (
+        "reviewer returned no valid current structured output"
+    )
+    assert not (trial / "evaluation/stale-review.json").exists()
+
+
+def test_provider_reviewer_launch_failure_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    _write_assessment_materials(assessment_root)
+    missing_reviewer = tmp_path / "missing-reviewer"
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="missing-reviewer",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            rubric_paths=("rubric.md",),
+            output_schema_path="review.schema.json",
+            output_path="evaluation/missing-reviewer.json",
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="judge-model",
+            ),
+            reviewer_executable=str(missing_reviewer),
+            max_attempts=3,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    _pythonpath(monkeypatch)
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assessment = result["assessments"][0]
+    assert assessment["status"] == "failed"
+    assert len(assessment["attempts"]) == 1
+    assert str(missing_reviewer) in assessment["attempts"][0]["launch_error"]
+    assert "reviewer launch failed" in assessment["error"]["message"]
+
+
 def test_assessment_contract_drift_fails_before_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

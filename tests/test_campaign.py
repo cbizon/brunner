@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,8 @@ from brunner.campaign import (
 )
 from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
-from brunner.errors import BackendConnectivityError
+from brunner.dashboard import write_campaign_dashboard
+from brunner.errors import ArtifactTransferError, BackendConnectivityError
 from examples.text_benchmark.definition import build_definition
 
 
@@ -120,6 +122,56 @@ class CleanupReconnectBackend(ImmediateBackend):
         super().cleanup(handle)
 
 
+class FlakyConnectivityBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capacity_attempts = 0
+
+    def capacity(self) -> BackendCapacity:
+        self.capacity_attempts += 1
+        if self.capacity_attempts == 1:
+            raise BackendConnectivityError("cluster API is unavailable")
+        return super().capacity()
+
+
+class TransferRetryBackend(ImmediateBackend):
+    def collect(
+        self,
+        handle: BackendHandle,
+        destination: Path,
+        policy: ArtifactPolicy,
+        *,
+        included_groups: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        self.collection_calls += 1
+        if self.collection_calls == 1:
+            raise ArtifactTransferError("artifact stream ended early")
+        return collect_local_artifacts(
+            handle.trial,
+            destination,
+            policy,
+            included_groups=included_groups,
+        )
+
+
+class PersistentTransferFailureBackend(ImmediateBackend):
+    def collect(
+        self,
+        handle: BackendHandle,
+        destination: Path,
+        policy: ArtifactPolicy,
+        *,
+        included_groups: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        self.collection_calls += 1
+        raise ArtifactTransferError("artifact stream ended early")
+
+
+class EmptyLogBackend(ImmediateBackend):
+    def logs(self, handle: BackendHandle) -> str:
+        return ""
+
+
 class MixedStateBackend(ImmediateBackend):
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
         if handle.workload_id == "needs-attention":
@@ -215,6 +267,41 @@ def test_campaign_pauses_when_backend_is_unreachable(
     assert state["trials"][0]["phase"] == "pending"
 
 
+def test_campaign_run_waits_for_connectivity_and_resumes(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = FlakyConnectivityBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="connectivity-retry",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    state = runner.run(poll_seconds=0.001)
+
+    assert state["status"] == "complete"
+    assert backend.capacity_attempts >= 2
+    assert any(
+        event["type"] == "backend_connectivity"
+        for event in state["events"]
+    )
+
+
 def test_campaign_resumes_cleanup_after_connectivity_loss(
     tmp_path: Path,
     monkeypatch: Any,
@@ -248,6 +335,158 @@ def test_campaign_resumes_cleanup_after_connectivity_loss(
     assert paused["trials"][0]["phase"] == "cleanup_pending"
     assert resumed["status"] == "complete"
     assert backend.cleanup_attempts == 2
+
+
+def test_campaign_retries_transient_artifact_transfer(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = TransferRetryBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="artifact-retry",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+            collection_retry_seconds=0,
+            collection_max_attempts=2,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    waiting = runner.advance()
+    completed = runner.advance()
+
+    assert waiting["status"] == "running"
+    assert waiting["trials"][0]["phase"] == "collection_retry_wait"
+    assert completed["status"] == "complete"
+    assert completed["trials"][0]["attempts"]["collection"] == 2
+    assert backend.collection_calls == 2
+
+
+def test_campaign_stops_retrying_artifact_transfer_at_limit(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = PersistentTransferFailureBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="artifact-retry-limit",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+            collection_retry_seconds=0,
+            collection_max_attempts=2,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    waiting = runner.advance()
+    failed = runner.advance()
+    unchanged = runner.advance()
+
+    assert waiting["trials"][0]["phase"] == "collection_retry_wait"
+    assert failed["status"] == "attention_required"
+    assert failed["trials"][0]["phase"] == "collection_failed"
+    assert failed["trials"][0]["attempts"]["collection"] == 2
+    assert unchanged["trials"][0]["attempts"]["collection"] == 2
+    assert backend.collection_calls == 2
+
+
+def test_empty_backend_logs_do_not_overwrite_recovered_log(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = EmptyLogBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="preserve-log",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    submitted = runner.advance()
+    trial = Path(submitted["trials"][0]["trial"])
+    log_path = trial / "backend/workload.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("previously recovered log\n")
+
+    completed = runner.advance()
+
+    assert completed["status"] == "complete"
+    assert log_path.read_text() == "previously recovered log\n"
+
+
+def test_dashboard_shows_live_elapsed_time_and_backend_warning(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "index.html"
+
+    write_campaign_dashboard(
+        {
+            "campaign_id": "dashboard",
+            "status": "running",
+            "benchmark_id": "benchmark",
+            "trials": [
+                {
+                    "test_id": "run-a",
+                    "provider": "codex",
+                    "model": "model-a",
+                    "effort": "high",
+                    "phase": "pending",
+                    "submitted_at": "2026-07-31T10:00:00+00:00",
+                    "backend_snapshot": {
+                        "warnings": [
+                            "PVC data: ProvisioningFailed: storage offline"
+                        ]
+                    },
+                }
+            ],
+            "events": [],
+        },
+        output,
+        now=datetime(2026, 7, 31, 11, 2, 3, tzinfo=UTC),
+    )
+
+    rendered = output.read_text()
+    assert "<th>Elapsed</th>" in rendered
+    assert "1h 2m 3s" in rendered
+    assert "ProvisioningFailed: storage offline" in rendered
 
 
 def test_required_assessment_failure_marks_campaign_trial_failed(

@@ -38,9 +38,13 @@ from brunner.io import write_json_atomic
 CONNECTIVITY_FRAGMENTS = (
     "unable to connect to the server",
     "connection refused",
+    "connection reset by peer",
     "context deadline exceeded",
+    "dial tcp",
     "i/o timeout",
     "no route to host",
+    "no such host",
+    "temporary failure in name resolution",
     "tls handshake timeout",
     "service unavailable",
 )
@@ -390,6 +394,58 @@ class KubernetesBackend:
             )
         return json.loads(result.stdout)
 
+    def _warning_events(
+        self,
+        name: str,
+        uid: str | None,
+    ) -> tuple[str, ...]:
+        selectors = [f"involvedObject.name={name}"]
+        if uid:
+            selectors.append(f"involvedObject.uid={uid}")
+        result = self._run(
+            "get",
+            "events",
+            "-n",
+            self.profile.namespace,
+            "--field-selector",
+            ",".join(selectors),
+            "-o",
+            "json",
+            check=False,
+        )
+        if result.returncode:
+            return ()
+        try:
+            events = json.loads(result.stdout).get("items", ())
+        except (AttributeError, json.JSONDecodeError):
+            return ()
+        warnings = []
+        for event in events:
+            if not isinstance(event, dict) or event.get("type") != "Warning":
+                continue
+            series = event.get("series")
+            if not isinstance(series, dict):
+                series = {}
+            metadata = event.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            reason = str(event.get("reason") or "").strip()
+            message = str(event.get("message") or "").strip()
+            detail = ": ".join(
+                value for value in (reason, message) if value
+            )
+            if not detail:
+                continue
+            timestamp = str(
+                event.get("eventTime")
+                or series.get("lastObservedTime")
+                or event.get("lastTimestamp")
+                or metadata.get("creationTimestamp")
+                or ""
+            )
+            warnings.append((timestamp, detail))
+        return tuple(detail for _, detail in sorted(warnings))
+
     def _wait_for_pod(self, name: str, timeout_seconds: float) -> None:
         result = self._run(
             "wait",
@@ -563,6 +619,17 @@ class KubernetesBackend:
                 f"PVC {claim_name} is still Pending; check storage class, "
                 "capacity, and volume binding events"
             )
+            warnings.extend(
+                f"PVC {claim_name}: {warning}"
+                for warning in self._warning_events(
+                    claim_name,
+                    (
+                        str(pvc.get("metadata", {}).get("uid"))
+                        if pvc.get("metadata", {}).get("uid") is not None
+                        else None
+                    ),
+                )
+            )
         job = self._get("job", handle.native_id, check=False)
         if job is None:
             return BackendSnapshot(
@@ -686,8 +753,20 @@ class KubernetesBackend:
                 if pod is not None
                 else None
             )
+            event_warnings = self._warning_events(
+                name,
+                (
+                    str(pod.get("metadata", {}).get("uid"))
+                    if pod
+                    and pod.get("metadata", {}).get("uid") is not None
+                    else None
+                ),
+            )
             self._delete("pod", name)
-            raise ReaderMountError(str(error), node=node) from error
+            detail = str(error)
+            if event_warnings:
+                detail += "; Kubernetes warning: " + event_warnings[-1]
+            raise ReaderMountError(detail, node=node) from error
         pod = self._get("pod", name)
         node = pod.get("spec", {}).get("nodeName") if pod else None
         return name, node

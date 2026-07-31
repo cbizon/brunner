@@ -85,6 +85,156 @@ def test_run_attempt_terminates_process_after_terminal_result(
     assert outcome["lingering_processes_terminated"] is True
 
 
+def test_success_event_without_ready_output_does_not_terminate_work(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    combined_events = tmp_path / "combined.jsonl"
+    combined_stderr = tmp_path / "combined.stderr.log"
+    marker = tmp_path / "background-complete"
+    script = (
+        "import json,pathlib,time;"
+        "print(json.dumps({'type':'turn.completed'}),flush=True);"
+        "time.sleep(0.12);"
+        f"pathlib.Path({str(marker)!r}).write_text('complete')"
+    )
+
+    outcome = run_attempt(
+        adapter=CodexAdapter(),
+        command=(sys.executable, "-c", script),
+        workspace=tmp_path,
+        environment=os.environ.copy(),
+        prompt="",
+        attempt_events=events,
+        attempt_stderr=stderr,
+        combined_events=combined_events,
+        combined_stderr=combined_stderr,
+        deadline_epoch=time.time() + 2,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.01,
+        terminal_success_ready=lambda: False,
+    )
+
+    assert marker.read_text() == "complete"
+    assert outcome["return_code"] == 0
+    assert outcome["terminal_result_seen"] is True
+    assert outcome["terminal_exit_ready"] is False
+    assert outcome["lingering_processes_terminated"] is False
+
+
+def test_nonfinal_success_cannot_consume_finalization_window(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "reserved-finalization",
+            "codex",
+            "fake-model",
+            None,
+        ),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+import time
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+if count == 1:
+    print(json.dumps({"type": "turn.completed"}), flush=True)
+    time.sleep(60)
+
+arguments = sys.argv[1:]
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=1,
+            finalization_seconds=0.5,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.02,
+        ),
+    )
+
+    assert state["status"] == "complete"
+    assert [attempt["mode"] for attempt in state["attempts"]] == [
+        "initial",
+        "finalize",
+    ]
+    assert state["attempts"][0]["forced_termination_reason"] == (
+        "soft_deadline"
+    )
+
+
+def test_prompt_delivery_cannot_block_the_hard_deadline(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    combined_events = tmp_path / "combined.jsonl"
+    combined_stderr = tmp_path / "combined.stderr.log"
+
+    started = time.monotonic()
+    outcome = run_attempt(
+        adapter=CodexAdapter(),
+        command=(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+        ),
+        workspace=tmp_path,
+        environment=os.environ.copy(),
+        prompt="x" * 2_000_000,
+        attempt_events=events,
+        attempt_stderr=stderr,
+        combined_events=combined_events,
+        combined_stderr=combined_stderr,
+        deadline_epoch=time.time() + 0.1,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.02,
+    )
+
+    assert time.monotonic() - started < 2
+    assert outcome["return_code"] != 0
+    assert outcome["forced_termination_reason"] == "hard_deadline"
+
+
 def test_durable_runner_produces_contract_valid_submission(
     tmp_path: Path,
 ) -> None:
@@ -153,6 +303,42 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens
     assert timing["summary"]["wall_seconds"] >= 0
     assert timing["summary"]["unclassified_seconds"] == 0
     assert timing["summary"]["foreground_tool_seconds"] > 0
+
+
+def test_provider_launch_failure_is_persisted(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("missing-provider", "codex", "fake-model", None),
+    )
+    missing_executable = tmp_path / "missing-codex"
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(missing_executable),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    persisted = json.loads((trial / "status.json").read_text())
+    assert state["status"] == "provider_error"
+    assert persisted == state
+    assert state["attempts"][0]["return_code"] == 127
+    assert str(missing_executable) in state["attempts"][0]["launch_error"]
+    assert "provider launch failed" in state["failure"]
 
 
 def test_runner_waits_for_provider_subscription_reset(
@@ -232,6 +418,299 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     assert state["attempts"][0]["wait_category"] == "subscription_wait"
     assert elapsed < 1
     assert timing["summary"]["subscription_wait_seconds"] > 0
+
+
+def test_missing_resumed_session_retries_as_fresh_session(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("session-reset", "codex", "fake-model", None),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+resume = "resume" in sys.argv[1:]
+with pathlib.Path(".modes").open("a") as stream:
+    stream.write(("resume" if resume else "initial") + "\n")
+
+if count == 1:
+    print(json.dumps({
+        "type": "error",
+        "error": "temporary session creation failure",
+    }), flush=True)
+    raise SystemExit(1)
+if count == 2:
+    print(json.dumps({
+        "type": "error",
+        "error": "No session found for requested identifier",
+    }), flush=True)
+    raise SystemExit(1)
+
+arguments = sys.argv[1:]
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.1,
+            retry_max_seconds=0.2,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    modes = (trial / "workspace/.modes").read_text().splitlines()
+    assert state["status"] == "complete"
+    assert modes == ["initial", "resume", "initial"]
+    assert state["attempts"][1]["session_reset"] is True
+
+
+def test_stale_canonical_final_response_is_ignored(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("stale-final", "codex", "fake-model", None),
+    )
+    stale_response = {
+        "status": "complete",
+        "submission_manifest": "submission/manifest.json",
+        "completed_units": ["uppercase"],
+        "limitations": [],
+    }
+    (trial / "transcript/final.json").write_text(
+        json.dumps(stale_response)
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+if count == 1:
+    print(json.dumps({"type": "turn.completed"}), flush=True)
+    raise SystemExit
+
+arguments = sys.argv[1:]
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "complete"
+    assert len(state["attempts"]) == 2
+    assert "no valid current structured" in state["attempts"][0]["failure"]
+
+
+def test_final_response_requires_successful_terminal_event(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("missing-terminal", "codex", "fake-model", None),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+arguments = sys.argv[1:]
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+if count > 1:
+    print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "complete"
+    assert len(state["attempts"]) == 2
+    assert state["attempts"][0]["failure"] == (
+        "provider exited without a successful terminal event"
+    )
+
+
+def test_complete_response_requires_valid_matching_submission(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("invalid-submission", "codex", "fake-model", None),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+arguments = sys.argv[1:]
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+if count > 1:
+    (submission / "result.txt").write_text("HELLO\n")
+    (submission / "manifest.json").write_text(
+        '{"schema_version":"1.0","output":"result.txt"}\n'
+    )
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "complete"
+    assert len(state["attempts"]) == 2
+    assert "manifest" in (
+        state["attempts"][0]["submission_validation_error"]
+    )
 
 
 def test_staged_runner_does_not_require_benchmark_package(
@@ -451,6 +930,7 @@ def test_orphaned_process_group_is_reaped_before_return(
     combined_events = tmp_path / "combined.jsonl"
     combined_stderr = tmp_path / "combined.stderr.log"
     process_group_path = tmp_path / "process-group"
+    late_output_path = tmp_path / "late-output"
     script = r"""
 import os
 import pathlib
@@ -461,7 +941,16 @@ pathlib.Path(os.environ["PROCESS_GROUP_PATH"]).write_text(
     str(os.getpgrp())
 )
 subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(60)"],
+    [
+        sys.executable,
+        "-c",
+        (
+            "import os,pathlib,time;"
+            "time.sleep(0.2);"
+            "pathlib.Path(os.environ['LATE_OUTPUT_PATH'])"
+            ".write_text('late')"
+        ),
+    ],
 )
 """
 
@@ -473,6 +962,7 @@ subprocess.Popen(
         environment={
             **os.environ,
             "PROCESS_GROUP_PATH": str(process_group_path),
+            "LATE_OUTPUT_PATH": str(late_output_path),
         },
         prompt="",
         attempt_events=events,
@@ -490,6 +980,8 @@ subprocess.Popen(
     assert outcome["forced_termination_reason"] == "orphaned_process_group"
     assert outcome["lingering_processes_terminated"] is True
     assert process_group_alive(process_group_id) is False
+    time.sleep(0.3)
+    assert not late_output_path.exists()
 
 
 def test_runner_restores_agent_control_plane_mutation(

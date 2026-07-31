@@ -13,6 +13,7 @@ from brunner.providers.base import (
     ProviderRunContext,
     ProviderSettings,
     error_text,
+    record_strings,
     response_from_record,
     validate_effort,
 )
@@ -295,6 +296,19 @@ class CodexAdapter:
             retry_at_epoch=retry_at_epoch,
         )
 
-    def resume_is_unavailable(self, stderr: str) -> bool:
-        lowered = stderr.lower()
+    def resume_is_unavailable(
+        self,
+        records: list[dict[str, Any]],
+        stderr: str,
+    ) -> bool:
+        lowered = "\n".join(
+            (
+                stderr,
+                *(
+                    text
+                    for record in records
+                    for text in record_strings(record)
+                ),
+            )
+        ).lower()
         return any(fragment in lowered for fragment in RETRYABLE_RESUME_ERRORS)
