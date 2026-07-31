@@ -478,6 +478,58 @@ printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","c
     ]
 
 
+def test_provider_reviewer_model_substitution_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    _write_assessment_materials(assessment_root)
+    reviewer = tmp_path / "claude-reviewer"
+    reviewer.write_text(
+        """#!/bin/sh
+set -eu
+printf '%s\n' '{"type":"assistant","message":{"model":"claude-opus-5","content":[]}}'
+printf '%s\n' '{"type":"result","is_error":false,"result":{"verdict":"pass","criterion":{"applicability":"not_applicable","rating":"not_applicable","confidence":"high","summary":"","evidence":[]}}}'
+"""
+    )
+    reviewer.chmod(0o755)
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="substituted-reviewer",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            rubric_paths=("rubric.md",),
+            output_schema_path="review.schema.json",
+            output_path="evaluation/substituted-reviewer.json",
+            reviewer=ProviderSettings(
+                provider="claude",
+                model="claude-fable-5",
+            ),
+            reviewer_executable=str(reviewer),
+            max_attempts=3,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    _pythonpath(monkeypatch)
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assessment = result["assessments"][0]
+    assert assessment["status"] == "failed"
+    assert len(assessment["attempts"]) == 1
+    assert assessment["attempts"][0]["model_mismatch"][
+        "observed_model"
+    ] == "claude-opus-5"
+    assert "substituted model 'claude-opus-5'" in (
+        assessment["error"]["message"]
+    )
+    assert not (trial / "evaluation/substituted-reviewer.json").exists()
+
+
 def test_provider_reviewer_does_not_reuse_prior_attempt_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

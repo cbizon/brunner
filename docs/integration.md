@@ -196,6 +196,15 @@ stderr, and provider final output are attempt-specific. A trial reaches
 - leaves a contract-valid manifest and all required artifacts; and
 - writes a run-status document exactly matching the provider response.
 
+Provider adapters also inspect primary response model identity when the event
+format exposes it. A mismatch between the requested model and the model that
+produced a primary assistant response is a terminal `provider_error`; it is
+not retried or evaluated. Attempts persist `requested_model`,
+`observed_models`, and `model_mismatch` for audit. Claude uses
+top-level `assistant.message.model` records for this check and deliberately
+ignores subagent records and `modelUsage`, which may include helper models that
+did not produce the primary response.
+
 The canonical `transcript/final.json` is published only after those checks.
 Files left by an earlier attempt cannot terminate a later one. Assessment
 reviewers follow the same current-attempt and terminal-event rules. A

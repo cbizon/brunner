@@ -117,6 +117,11 @@ valid, preventing premature termination while final artifacts are still being
 written without allowing a nonfinal event to consume the reserved finalization
 window.
 
+When a provider exposes the model that produced a primary response, Brunner
+verifies it against the requested model. A provider-side substitution, such
+as a safety downgrade from Fable to Opus, terminates the attempt as
+`provider_error` and is never scored as a result from the requested model.
+
 The repository includes:
 
 - `examples/text_benchmark`: minimal non-reference text benchmark

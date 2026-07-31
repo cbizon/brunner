@@ -9,6 +9,7 @@ from brunner.providers.base import (
     ProviderActivity,
     ProviderCommand,
     ProviderFailure,
+    ProviderModelObservation,
     ProviderObservation,
     ProviderRunContext,
     ProviderSettings,
@@ -168,6 +169,19 @@ class CodexAdapter:
         if event_type == "turn.failed":
             return ProviderObservation(terminal=True, succeeded=False)
         return ProviderObservation(final_response=response_from_record(record))
+
+    def model_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderModelObservation, ...]:
+        return ()
+
+    def models_match(
+        self,
+        requested: str,
+        observed: str,
+    ) -> bool:
+        return requested.strip().lower() == observed.strip().lower()
 
     def activity_observations(
         self,

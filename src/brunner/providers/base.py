@@ -52,6 +52,12 @@ class ProviderObservation:
 
 
 @dataclass(frozen=True)
+class ProviderModelObservation:
+    model: str
+    source: str
+
+
+@dataclass(frozen=True)
 class ProviderActivity:
     activity_id: str
     phase: str
@@ -89,6 +95,17 @@ class ProviderAdapter(Protocol):
         self,
         record: dict[str, Any],
     ) -> ProviderObservation: ...
+
+    def model_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderModelObservation, ...]: ...
+
+    def models_match(
+        self,
+        requested: str,
+        observed: str,
+    ) -> bool: ...
 
     def activity_observations(
         self,

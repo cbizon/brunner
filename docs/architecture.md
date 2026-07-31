@@ -139,12 +139,14 @@ evaluator helper API.
 
 ## Durable Agent Runtime
 
-Provider adapters define commands, terminal-event recognition, usage parsing,
-failure classification, and resume behavior. The runner persists:
+Provider adapters define commands, terminal-event recognition, primary model
+identity observations, usage parsing, failure classification, and resume
+behavior. The runner persists:
 
 - Immutable benchmark/provider/contract identity
 - Session identity and whether a session has started
 - Every attempt with event/stderr paths and terminal observations
+- Requested and provider-observed primary model identities
 - Retry delay, finalization transition, deadline, and final response
 - Raw provider events plus local receipt timestamps
 - Canonical token accounting with provider-native source counters
@@ -157,6 +159,16 @@ and only after that attempt emits a successful provider terminal event. A
 status, manifest, and artifacts in the workspace. Only then does Brunner write
 the canonical `transcript/final.json`; stale canonical files are removed when
 a nonterminal run resumes. Reviewer attempts use the same attempt isolation.
+
+When a provider reports that a primary assistant response came from a model
+other than the requested model, Brunner terminates the process and records a
+terminal `provider_error`. This makes provider-side safety substitutions,
+downgrades, or routing changes failures of the requested model rather than
+benchmark results for an undisclosed replacement. Claude identity is taken
+from top-level `assistant.message.model` records; subagent messages and
+aggregate `modelUsage` entries are not primary identity evidence because they
+may include legitimate internal helper models. If a provider exposes no
+primary model identity in its event stream, Brunner does not invent one.
 
 Provider launch errors become durable `provider_error` results rather than
 escaping before status is written. Prompt input is delivered on a separate

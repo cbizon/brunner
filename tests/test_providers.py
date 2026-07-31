@@ -225,6 +225,55 @@ def test_provider_activity_observations_normalize_tool_lifecycles() -> None:
     assert claude_end[0].activity_id == "tool-1"
 
 
+def test_claude_model_identity_uses_primary_assistant_records() -> None:
+    adapter = ClaudeAdapter()
+
+    assistant = adapter.model_observations(
+        {
+            "type": "assistant",
+            "message": {"model": "claude-fable-5"},
+        }
+    )
+    system = adapter.model_observations(
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-fable-5",
+        }
+    )
+    subagent = adapter.model_observations(
+        {
+            "type": "assistant",
+            "parent_tool_use_id": "tool-1",
+            "message": {"model": "claude-haiku-4-5"},
+        }
+    )
+    usage = adapter.model_observations(
+        {
+            "type": "result",
+            "modelUsage": {
+                "claude-fable-5": {},
+                "claude-haiku-4-5": {},
+            },
+        }
+    )
+
+    assert assistant[0].model == "claude-fable-5"
+    assert assistant[0].source == "assistant.message.model"
+    assert system == ()
+    assert subagent == ()
+    assert usage == ()
+    assert adapter.models_match("fable", "claude-fable-5")
+    assert adapter.models_match(
+        "claude-fable-5",
+        "claude-fable-5-20260731",
+    )
+    assert not adapter.models_match(
+        "claude-fable-5",
+        "claude-opus-5",
+    )
+
+
 @pytest.mark.parametrize("adapter", [CodexAdapter(), ClaudeAdapter()])
 def test_resume_unavailable_is_detected_in_json_records(adapter) -> None:
     assert adapter.resume_is_unavailable(

@@ -123,6 +123,85 @@ def test_success_event_without_ready_output_does_not_terminate_work(
     assert outcome["lingering_processes_terminated"] is False
 
 
+def test_model_substitution_is_terminal_provider_error(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "model-substitution",
+            "claude",
+            "claude-fable-5",
+            None,
+        ),
+    )
+    binary = tmp_path / "claude"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import time
+
+print(json.dumps({
+    "type": "system",
+    "subtype": "init",
+    "model": "claude-fable-5",
+}), flush=True)
+print(json.dumps({
+    "type": "assistant",
+    "message": {
+        "model": "claude-opus-5",
+        "content": [{"type": "text", "text": "substituted"}],
+    },
+}), flush=True)
+time.sleep(60)
+""",
+    )
+
+    started = time.monotonic()
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="claude",
+            model="claude-fable-5",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=10,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.02,
+        ),
+    )
+
+    assert time.monotonic() - started < 2
+    assert state["status"] == "provider_error"
+    assert state["model_mismatch"] == {
+        "requested_model": "claude-fable-5",
+        "observed_model": "claude-opus-5",
+        "source": "assistant.message.model",
+        "provider_event_index": 2,
+    }
+    assert "substituted model 'claude-opus-5'" in state["failure"]
+    attempt = state["attempts"][0]
+    assert attempt["status"] == "failed"
+    assert attempt["forced_termination_reason"] == "model_mismatch"
+    assert attempt["observed_models"] == [
+        {
+            "model": "claude-opus-5",
+            "source": "assistant.message.model",
+            "provider_event_index": 2,
+        }
+    ]
+
+
 def test_nonfinal_success_cannot_consume_finalization_window(
     tmp_path: Path,
 ) -> None:
