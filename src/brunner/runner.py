@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -25,13 +26,29 @@ from brunner.providers import (
     ProviderSettings,
     get_provider,
 )
+from brunner.submission import validate_submission
 from brunner.trial import load_trial_identity
+from brunner.timing import (
+    ACTIVITY_LOG_ENV,
+    TimingRecorder,
+    active_activity_keys,
+    build_time_accounting,
+    epoch_to_iso,
+)
 from brunner.usage import read_json_records
 
 
 PROVIDER_FINAL_STATUSES = frozenset({"complete", "partial", "failed"})
 PIPELINE_TERMINAL_STATUSES = frozenset(
     {*PROVIDER_FINAL_STATUSES, "provider_error", "timeout"}
+)
+PROTECTED_CONTROL_PATHS = (
+    "metadata",
+    "backend",
+    "evaluation",
+    "assessments",
+    "usage",
+    "status.json",
 )
 
 
@@ -112,24 +129,61 @@ def finalization_prompt(contract: OutputContract) -> str:
     )
 
 
-def terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
+def process_group_alive(process_group_id: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group_id, 0)
     except ProcessLookupError:
-        return
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_process(
+    process: subprocess.Popen[str],
+    *,
+    term_wait_seconds: float = 5,
+    kill_wait_seconds: float = 2,
+) -> bool:
+    process_group_id = process.pid
+    process.poll()
+    if not process_group_alive(process_group_id):
+        return False
     try:
-        process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        if process.poll() is not None:
+            return False
+        process.terminate()
+    term_deadline = time.monotonic() + term_wait_seconds
+    while time.monotonic() < term_deadline:
+        process.poll()
+        if not process_group_alive(process_group_id):
+            break
+        time.sleep(0.05)
+    process.poll()
+    if process_group_alive(process_group_id):
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            if process.poll() is None:
+                process.kill()
+        kill_deadline = time.monotonic() + kill_wait_seconds
+        while time.monotonic() < kill_deadline:
+            process.poll()
+            if not process_group_alive(process_group_id):
+                break
+            time.sleep(0.05)
+    if process.poll() is None:
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
             pass
+    return True
 
 
 def pump_stream(
@@ -147,6 +201,77 @@ def pump_stream(
             on_line(line)
 
 
+def snapshot_control_plane(
+    trial: Path,
+    *,
+    reject_symlinks: bool = True,
+) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for relative in PROTECTED_CONTROL_PATHS:
+        root = trial / relative
+        if root.is_symlink():
+            if reject_symlinks:
+                raise RuntimeError(
+                    f"runner-owned path is a symlink: {root}"
+                )
+            snapshot[relative] = (
+                b"symlink\0" + os.readlink(root).encode()
+            )
+            continue
+        if root.is_file():
+            snapshot[relative] = root.read_bytes()
+            continue
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                if reject_symlinks:
+                    raise RuntimeError(
+                        f"runner-owned path contains a symlink: {path}"
+                    )
+                snapshot[path.relative_to(trial).as_posix()] = (
+                    b"symlink\0" + os.readlink(path).encode()
+                )
+                continue
+            if path.is_file():
+                snapshot[path.relative_to(trial).as_posix()] = (
+                    path.read_bytes()
+                )
+    return snapshot
+
+
+def restore_control_plane(
+    trial: Path,
+    expected: dict[str, bytes],
+) -> list[str]:
+    observed = snapshot_control_plane(
+        trial,
+        reject_symlinks=False,
+    )
+    changed = sorted(
+        name
+        for name in set(expected) | set(observed)
+        if expected.get(name) != observed.get(name)
+    )
+    if not changed:
+        return []
+    for relative in PROTECTED_CONTROL_PATHS:
+        path = trial / relative
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+        if Path(relative).suffix != ".json":
+            path.mkdir(parents=True, exist_ok=True)
+    for name, content in expected.items():
+        path = trial / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".restore.tmp")
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    return changed
+
+
 def run_attempt(
     *,
     adapter: ProviderAdapter,
@@ -161,20 +286,66 @@ def run_attempt(
     deadline_epoch: float,
     stop_requested: threading.Event,
     terminal_exit_grace_seconds: float,
+    soft_deadline_epoch: float | None = None,
+    external_activity_path: Path | None = None,
+    attempt_number: int = 1,
+    timing_recorder: TimingRecorder | None = None,
+    terminal_success_ready: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     terminal_seen = threading.Event()
     terminal_succeeded = threading.Event()
+    terminal_exit_ready = threading.Event()
     observed_response: dict[str, Any] | None = None
     observation_lock = threading.Lock()
+    activity_lock = threading.Lock()
+    active_provider_activities: set[str] = set()
+    provider_event_index = 0
+    prompt_delivery_errors: list[str] = []
+    prompt_delivery_done = threading.Event()
 
     def inspect_line(line: str) -> None:
-        nonlocal observed_response
+        nonlocal observed_response, provider_event_index
+        recorded_epoch = time.time()
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             return
         if not isinstance(record, dict):
             return
+        provider_event_index += 1
+        if timing_recorder is not None:
+            item = record.get("item")
+            timing_recorder.emit(
+                "provider_event_received",
+                epoch_seconds=recorded_epoch,
+                attempt=attempt_number,
+                provider_event_index=provider_event_index,
+                provider_event_type=record.get("type"),
+                provider_item_type=(
+                    item.get("type") if isinstance(item, dict) else None
+                ),
+            )
+        for activity in adapter.activity_observations(record):
+            with activity_lock:
+                if activity.phase == "start":
+                    active_provider_activities.add(
+                        activity.activity_id
+                    )
+                elif activity.phase == "end":
+                    active_provider_activities.discard(
+                        activity.activity_id
+                    )
+            if timing_recorder is not None:
+                timing_recorder.emit(
+                    "activity",
+                    epoch_seconds=recorded_epoch,
+                    phase=activity.phase,
+                    category=activity.category,
+                    activity_id=activity.activity_id,
+                    label=activity.label,
+                    source="provider",
+                    attempt=attempt_number,
+                )
         observation = adapter.observe_record(record)
         with observation_lock:
             if observation.final_response is not None:
@@ -182,7 +353,20 @@ def run_attempt(
         if observation.terminal:
             if observation.succeeded:
                 terminal_succeeded.set()
+                if terminal_success_ready is None:
+                    terminal_exit_ready.set()
+            else:
+                terminal_exit_ready.set()
             terminal_seen.set()
+
+    def active_work() -> bool:
+        with activity_lock:
+            if active_provider_activities:
+                return True
+        return bool(
+            external_activity_path is not None
+            and active_activity_keys(external_activity_path)
+        )
 
     with (
         attempt_events.open("w") as attempt_stdout,
@@ -190,17 +374,39 @@ def run_attempt(
         combined_events.open("a") as combined_stdout,
         combined_stderr.open("a") as combined_error,
     ):
-        process = subprocess.Popen(
-            list(command),
-            cwd=workspace,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=workspace,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as error:
+            launch_error = f"{type(error).__name__}: {error}"
+            message = f"provider launch failed: {launch_error}\n"
+            attempt_error.write(message)
+            attempt_error.flush()
+            combined_error.write(message)
+            combined_error.flush()
+            return {
+                "return_code": 127,
+                "provider_return_code": 127,
+                "terminal_result_seen": False,
+                "terminal_result_succeeded": False,
+                "terminal_exit_ready": False,
+                "lingering_processes_terminated": False,
+                "forced_termination_reason": None,
+                "active_work_terminated": False,
+                "soft_deadline_activity_seen": False,
+                "launch_error": launch_error,
+                "prompt_delivery_error": None,
+                "observed_response": None,
+            }
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -225,48 +431,143 @@ def run_attempt(
         )
         stdout_thread.start()
         stderr_thread.start()
-        try:
-            process.stdin.write(prompt)
-            process.stdin.close()
-        except BrokenPipeError:
-            try:
-                process.stdin.close()
-            except BrokenPipeError:
-                pass
 
-        terminal_seen_at = None
+        def deliver_prompt() -> None:
+            try:
+                process.stdin.write(prompt)
+                process.stdin.flush()
+            except (OSError, ValueError) as error:
+                prompt_delivery_errors.append(
+                    f"{type(error).__name__}: {error}"
+                )
+            finally:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+                prompt_delivery_done.set()
+
+        prompt_thread = threading.Thread(
+            target=deliver_prompt,
+            daemon=True,
+        )
+        prompt_thread.start()
+
+        terminal_idle_since = None
+        leader_exited_idle_since = None
+        soft_deadline_activity_seen = False
+        soft_deadline_idle_since = None
         lingering_processes_terminated = False
-        while process.poll() is None:
-            if terminal_seen.is_set():
-                if terminal_seen_at is None:
-                    terminal_seen_at = time.monotonic()
+        forced_termination_reason = None
+        active_work_terminated = False
+        while process_group_alive(process.pid):
+            work_is_active = active_work()
+            now_epoch = time.time()
+            now_monotonic = time.monotonic()
+            if (
+                terminal_seen.is_set()
+                and terminal_succeeded.is_set()
+                and not terminal_exit_ready.is_set()
+                and terminal_success_ready is not None
+                and terminal_success_ready()
+            ):
+                terminal_exit_ready.set()
+            if (
+                prompt_delivery_errors
+                and process.poll() is None
+                and not terminal_seen.is_set()
+            ):
+                terminate_process(process)
+                forced_termination_reason = "prompt_delivery_error"
+                break
+            if terminal_exit_ready.is_set():
+                if work_is_active:
+                    terminal_idle_since = None
+                elif terminal_idle_since is None:
+                    terminal_idle_since = now_monotonic
                 elif (
-                    time.monotonic() - terminal_seen_at
+                    now_monotonic - terminal_idle_since
                     >= terminal_exit_grace_seconds
                 ):
                     terminate_process(process)
                     lingering_processes_terminated = True
+                    forced_termination_reason = "terminal_exit_grace"
                     break
-            if stop_requested.is_set() or time.time() >= deadline_epoch:
+            if process.poll() is not None and not terminal_exit_ready.is_set():
+                if work_is_active:
+                    leader_exited_idle_since = None
+                elif leader_exited_idle_since is None:
+                    leader_exited_idle_since = now_monotonic
+                elif (
+                    now_monotonic - leader_exited_idle_since
+                    >= terminal_exit_grace_seconds
+                ):
+                    terminate_process(process)
+                    lingering_processes_terminated = True
+                    forced_termination_reason = "orphaned_process_group"
+                    break
+            if stop_requested.is_set():
+                active_work_terminated = work_is_active
                 terminate_process(process)
+                forced_termination_reason = "stop_requested"
                 break
-            wait_seconds = 1.0
-            if terminal_seen_at is not None:
+            if now_epoch >= deadline_epoch:
+                active_work_terminated = work_is_active
+                terminate_process(process)
+                forced_termination_reason = "hard_deadline"
+                break
+            if (
+                soft_deadline_epoch is not None
+                and now_epoch >= soft_deadline_epoch
+                and not terminal_exit_ready.is_set()
+            ):
+                if work_is_active:
+                    soft_deadline_activity_seen = True
+                    soft_deadline_idle_since = None
+                else:
+                    if soft_deadline_idle_since is None:
+                        soft_deadline_idle_since = now_monotonic
+                    if (
+                        now_monotonic - soft_deadline_idle_since
+                        >= terminal_exit_grace_seconds
+                    ):
+                        terminate_process(process)
+                        forced_termination_reason = "soft_deadline"
+                        break
+            wait_seconds = 0.1
+            if terminal_idle_since is not None:
                 remaining = terminal_exit_grace_seconds - (
-                    time.monotonic() - terminal_seen_at
+                    now_monotonic - terminal_idle_since
+                )
+                wait_seconds = min(wait_seconds, max(0.0, remaining))
+            if soft_deadline_idle_since is not None:
+                remaining = terminal_exit_grace_seconds - (
+                    now_monotonic - soft_deadline_idle_since
                 )
                 wait_seconds = min(wait_seconds, max(0.0, remaining))
             stop_requested.wait(wait_seconds)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        prompt_thread.join(timeout=1)
+        if not prompt_delivery_done.is_set() and not prompt_delivery_errors:
+            prompt_delivery_errors.append(
+                "prompt delivery thread did not stop after provider exit"
+            )
         stdout_thread.join(timeout=10)
         stderr_thread.join(timeout=10)
 
     provider_return_code = (
         process.returncode if process.returncode is not None else 124
     )
-    if terminal_succeeded.is_set():
+    if terminal_succeeded.is_set() and not active_work_terminated:
         return_code = 0
     elif terminal_seen.is_set():
         return_code = provider_return_code or 1
+    elif forced_termination_reason is not None:
+        return_code = provider_return_code or 124
     else:
         return_code = provider_return_code
     return {
@@ -274,7 +575,15 @@ def run_attempt(
         "provider_return_code": provider_return_code,
         "terminal_result_seen": terminal_seen.is_set(),
         "terminal_result_succeeded": terminal_succeeded.is_set(),
+        "terminal_exit_ready": terminal_exit_ready.is_set(),
         "lingering_processes_terminated": lingering_processes_terminated,
+        "forced_termination_reason": forced_termination_reason,
+        "active_work_terminated": active_work_terminated,
+        "soft_deadline_activity_seen": soft_deadline_activity_seen,
+        "launch_error": None,
+        "prompt_delivery_error": (
+            prompt_delivery_errors[0] if prompt_delivery_errors else None
+        ),
         "observed_response": observed_response,
     }
 
@@ -358,7 +667,7 @@ def load_final_response(
     *,
     observed_response: object,
     attempt_events: Path,
-    final_paths: tuple[Path, ...],
+    final_output_path: Path,
 ) -> dict[str, Any] | None:
     response = _valid_response(observed_response, contract)
     if response is not None:
@@ -377,16 +686,34 @@ def load_final_response(
                 response = _valid_response(decoded, contract)
                 if response is not None:
                     return response
-    for path in final_paths:
-        if not path.is_file():
-            continue
+    if final_output_path.is_file():
         try:
-            value = json.loads(path.read_text())
+            value = json.loads(final_output_path.read_text())
         except json.JSONDecodeError:
-            continue
-        response = _valid_response(value, contract)
-        if response is not None:
-            return response
+            pass
+        else:
+            response = _valid_response(value, contract)
+            if response is not None:
+                return response
+    return None
+
+
+def submission_validation_error(
+    workspace: Path,
+    contract: OutputContract,
+    response: dict[str, Any],
+) -> str | None:
+    if response["status"] == "failed":
+        return None
+    try:
+        submission = validate_submission(workspace, contract)
+        if submission.run_status != response:
+            raise ContractError(
+                "run status does not match the current provider final "
+                "response"
+            )
+    except (ContractError, OSError) as error:
+        return str(error)
     return None
 
 
@@ -398,19 +725,33 @@ def write_terminal_artifacts(
     created_epoch = float(state.get("created_epoch", time.time()))
     deadline_epoch = float(state["deadline_epoch"])
     last_attempt = state["attempts"][-1] if state["attempts"] else {}
+    external_events = (
+        trial / "workspace/.brunner/activity-events.jsonl"
+    )
+    legacy_external_events = trial / "timing/external-events.jsonl"
+    if not external_events.is_file() and legacy_external_events.is_file():
+        external_events = legacy_external_events
+    accounting = build_time_accounting(
+        state,
+        events_path=trial / "timing/events.jsonl",
+        external_events_path=external_events,
+    )
+    write_json_atomic(trial / "timing/accounting.json", accounting)
     write_json_atomic(
         trial / "timing/goal.json",
         {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "started_at": state["created_at"],
             "ended_at": state.get("completed_at", utc_now()),
-            "elapsed_seconds": max(0.0, time.time() - created_epoch),
+            "elapsed_seconds": accounting["summary"]["wall_seconds"],
             "timeout_seconds": max(0.0, deadline_epoch - created_epoch),
             "status": state["status"],
             "return_code": last_attempt.get("return_code"),
             "attempt_count": len(state["attempts"]),
             "failure": state.get("failure"),
             "finalization_started_at": state.get("finalization_started_at"),
+            "accounting_path": "timing/accounting.json",
+            "accounting": accounting["summary"],
         },
     )
     records = read_json_records(trial / "transcript/events.jsonl")
@@ -459,8 +800,15 @@ def _run_configured_trial(
     transcript = trial / "transcript"
     attempts_root = transcript / "attempts"
     provider_home = trial / "provider-home"
-    for path in (transcript, attempts_root, provider_home):
+    timing_root = trial / "timing"
+    for path in (transcript, attempts_root, provider_home, timing_root):
         path.mkdir(parents=True, exist_ok=True)
+    timing_events = timing_root / "events.jsonl"
+    external_timing_events = (
+        workspace / ".brunner/activity-events.jsonl"
+    )
+    external_timing_events.parent.mkdir(parents=True, exist_ok=True)
+    timing_recorder = TimingRecorder(timing_events)
     state_path = trial / "status.json"
     state = load_state(
         state_path,
@@ -474,29 +822,33 @@ def _run_configured_trial(
     if state["status"] in PIPELINE_TERMINAL_STATUSES:
         write_terminal_artifacts(trial, state, adapter)
         return state
+    (transcript / "final.json").unlink(missing_ok=True)
 
     run_environment = os.environ.copy()
     run_environment.update(environment or {})
     run_environment.update(settings.extra_environment)
     run_environment["HOME"] = str(provider_home)
     run_environment["CODEX_HOME"] = str(provider_home / "codex")
+    run_environment[ACTIVITY_LOG_ENV] = str(external_timing_events)
     Path(run_environment["CODEX_HOME"]).mkdir(parents=True, exist_ok=True)
     stop_requested = stop_requested or threading.Event()
     retry_seconds = runtime.retry_initial_seconds
     work_deadline = state["deadline_epoch"] - runtime.finalization_seconds
     combined_events = transcript / "events.jsonl"
     combined_stderr = transcript / "stderr.log"
+    timing_recorder.emit("runner_started", status=state["status"])
 
     while time.time() < state["deadline_epoch"] and not stop_requested.is_set():
         finalizing = bool(state.get("finalization_started"))
-        attempt_deadline = state["deadline_epoch"] if finalizing else work_deadline
-        if time.time() >= attempt_deadline:
+        phase_deadline = state["deadline_epoch"] if finalizing else work_deadline
+        if time.time() >= phase_deadline:
             if finalizing:
                 break
             state["finalization_started"] = True
             state["finalization_started_at"] = utc_now()
             state["status"] = "finalizing"
             state.pop("next_retry_seconds", None)
+            timing_recorder.emit("finalization_started")
             write_json_atomic(state_path, state)
             retry_seconds = runtime.retry_initial_seconds
             continue
@@ -505,18 +857,20 @@ def _run_configured_trial(
         attempt_prefix = attempts_root / f"{attempt_number:04d}"
         attempt_events = attempt_prefix.with_suffix(".events.jsonl")
         attempt_stderr = attempt_prefix.with_suffix(".stderr.log")
+        attempt_final = attempt_prefix.with_suffix(".final.json")
         resume_session = bool(state["session_started"])
         context = ProviderRunContext(
             workspace=workspace,
             transcript_dir=transcript,
             final_schema_path=workspace / "schema/final-response.schema.json",
-            final_output_path=transcript / "final.json",
+            final_output_path=attempt_final,
             persist_session=True,
             resume_session=resume_session,
             session_id=state["session_id"],
             executable=executable,
         )
         provider_command = adapter.build_command(settings, context)
+        attempt_started_epoch = time.time()
         attempt = {
             "number": attempt_number,
             "status": "running",
@@ -525,13 +879,20 @@ def _run_configured_trial(
                 if finalizing
                 else ("resume" if resume_session else "initial")
             ),
-            "started_at": utc_now(),
+            "started_at": epoch_to_iso(attempt_started_epoch),
             "events": str(attempt_events.relative_to(trial)),
             "stderr": str(attempt_stderr.relative_to(trial)),
+            "final_output": str(attempt_final.relative_to(trial)),
         }
         state["attempts"].append(attempt)
         state["status"] = "finalizing" if finalizing else "running"
         write_json_atomic(state_path, state)
+        timing_recorder.emit(
+            "attempt_started",
+            epoch_seconds=attempt_started_epoch,
+            attempt=attempt_number,
+            mode=attempt["mode"],
+        )
         if finalizing:
             prompt = finalization_prompt(contract)
         elif resume_session:
@@ -545,6 +906,28 @@ def _run_configured_trial(
             **run_environment,
             **provider_command.environment,
         }
+        protected_control_plane = snapshot_control_plane(trial)
+
+        def terminal_success_ready() -> bool:
+            try:
+                response = load_final_response(
+                    contract,
+                    observed_response=None,
+                    attempt_events=attempt_events,
+                    final_output_path=attempt_final,
+                )
+            except OSError:
+                return False
+            return bool(
+                response is not None
+                and submission_validation_error(
+                    workspace,
+                    contract,
+                    response,
+                )
+                is None
+            )
+
         outcome = run_attempt(
             adapter=adapter,
             command=provider_command.command,
@@ -555,10 +938,45 @@ def _run_configured_trial(
             attempt_stderr=attempt_stderr,
             combined_events=combined_events,
             combined_stderr=combined_stderr,
-            deadline_epoch=attempt_deadline,
+            deadline_epoch=state["deadline_epoch"],
             stop_requested=stop_requested,
             terminal_exit_grace_seconds=runtime.provider_exit_grace_seconds,
+            soft_deadline_epoch=(None if finalizing else work_deadline),
+            external_activity_path=external_timing_events,
+            attempt_number=attempt_number,
+            timing_recorder=timing_recorder,
+            terminal_success_ready=terminal_success_ready,
         )
+        control_plane_changes = restore_control_plane(
+            trial,
+            protected_control_plane,
+        )
+        if control_plane_changes:
+            attempt.update(
+                {
+                    key: value
+                    for key, value in outcome.items()
+                    if key != "observed_response"
+                }
+            )
+            attempt_ended = timing_recorder.emit(
+                "attempt_ended",
+                attempt=attempt_number,
+                return_code=1,
+            )
+            attempt["ended_at"] = attempt_ended["recorded_at"]
+            attempt["status"] = "failed"
+            attempt["control_plane_changes"] = control_plane_changes
+            attempt["failure"] = (
+                "agent modified runner-owned control files: "
+                + ", ".join(control_plane_changes)
+            )
+            state["status"] = "provider_error"
+            state["failure"] = attempt["failure"]
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
         attempt.update(
             {
                 key: value
@@ -566,11 +984,14 @@ def _run_configured_trial(
                 if key != "observed_response"
             }
         )
-        attempt["ended_at"] = utc_now()
+        attempt_ended = timing_recorder.emit(
+            "attempt_ended",
+            attempt=attempt_number,
+            return_code=outcome["return_code"],
+        )
+        attempt["ended_at"] = attempt_ended["recorded_at"]
         return_code = int(outcome["return_code"])
         attempt["status"] = "complete" if return_code == 0 else "failed"
-        if attempt_events.stat().st_size:
-            state["session_started"] = True
 
         records = read_json_records(attempt_events)
         stderr = (
@@ -578,32 +999,76 @@ def _run_configured_trial(
             if attempt_stderr.is_file()
             else ""
         )
+        resume_unavailable = (
+            resume_session
+            and adapter.resume_is_unavailable(records, stderr)
+        )
+        if resume_unavailable:
+            state["session_started"] = False
+            attempt["session_reset"] = True
+        elif records:
+            state["session_started"] = True
+
+        launch_error = outcome.get("launch_error")
+        if launch_error is not None:
+            attempt["status"] = "failed"
+            attempt["failure"] = f"provider launch failed: {launch_error}"
+            state["status"] = "provider_error"
+            state["failure"] = attempt["failure"]
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
+
         failure = adapter.classify_failure(records, stderr)
         if failure is not None:
             attempt["failure"] = failure.summary
             attempt["api_status"] = failure.api_status
             attempt["failure_reason"] = failure.reason
+            attempt["wait_category"] = failure.wait_category
+            attempt["retry_at_epoch"] = failure.retry_at_epoch
 
         final_response = None
-        if return_code == 0:
+        if return_code == 0 and outcome["terminal_result_succeeded"]:
             final_response = load_final_response(
                 contract,
                 observed_response=outcome["observed_response"],
                 attempt_events=attempt_events,
-                final_paths=(
-                    transcript / "final.json",
-                    workspace / contract.run_status_path,
-                ),
+                final_output_path=attempt_final,
             )
             if final_response is None:
                 attempt["status"] = "failed"
                 attempt["failure"] = (
-                    "provider returned no valid structured final response"
+                    "provider returned no valid current structured final "
+                    "response"
                 )
             else:
-                attempt["status"] = final_response["status"]
-                attempt["provider_status"] = final_response["status"]
-                write_json_atomic(transcript / "final.json", final_response)
+                provider_status = str(final_response["status"])
+                attempt["provider_status"] = provider_status
+                validation_error = submission_validation_error(
+                    workspace,
+                    contract,
+                    final_response,
+                )
+                if validation_error is not None:
+                    attempt["status"] = "failed"
+                    attempt["submission_validation_error"] = validation_error
+                    attempt["failure"] = (
+                        "provider final response did not have a valid "
+                        f"matching submission: {validation_error}"
+                    )
+                    final_response = None
+                if final_response is not None:
+                    attempt["status"] = provider_status
+                    write_json_atomic(
+                        transcript / "final.json",
+                        final_response,
+                    )
+        elif return_code == 0:
+            attempt["status"] = "failed"
+            attempt["failure"] = (
+                "provider exited without a successful terminal event"
+            )
 
         if final_response is not None:
             state["status"] = str(final_response["status"])
@@ -613,7 +1078,11 @@ def _run_configured_trial(
             write_terminal_artifacts(trial, state, adapter)
             return state
 
-        if failure is not None and failure.terminal:
+        if (
+            failure is not None
+            and failure.terminal
+            and not resume_unavailable
+        ):
             state["status"] = "provider_error"
             state["failure"] = failure.summary
             state["completed_at"] = utc_now()
@@ -621,30 +1090,80 @@ def _run_configured_trial(
             write_terminal_artifacts(trial, state, adapter)
             return state
 
-        if resume_session and adapter.resume_is_unavailable(stderr):
-            state["session_started"] = False
         if stop_requested.is_set():
             state["status"] = "interrupted"
             state["completed_at"] = utc_now()
             write_json_atomic(state_path, state)
             write_terminal_artifacts(trial, state, adapter)
             return state
-        if time.time() >= attempt_deadline:
+        if time.time() >= phase_deadline:
             continue
         state["status"] = "retrying"
-        state["next_retry_seconds"] = retry_seconds
-        write_json_atomic(state_path, state)
+        wait_category = (
+            failure.wait_category
+            if failure is not None and failure.wait_category
+            else "runner_retry_wait"
+        )
+        now = time.time()
+        requested_wait = 0.0 if resume_unavailable else retry_seconds
+        if (
+            failure is not None
+            and wait_category == "subscription_wait"
+            and failure.retry_at_epoch is not None
+        ):
+            requested_wait = max(0.0, failure.retry_at_epoch - now)
         wait_seconds = min(
-            retry_seconds,
-            max(0.0, attempt_deadline - time.time()),
+            requested_wait,
+            max(0.0, phase_deadline - time.time()),
+        )
+        state["next_retry_seconds"] = wait_seconds
+        state["next_retry_category"] = wait_category
+        write_json_atomic(state_path, state)
+        retry_activity_id = f"retry-{attempt_number}"
+        timing_recorder.emit(
+            "activity",
+            phase="start",
+            category=wait_category,
+            activity_id=retry_activity_id,
+            label=(
+                "provider subscription boundary"
+                if wait_category == "subscription_wait"
+                else "runner retry backoff"
+            ),
+            source="runner",
+            attempt=attempt_number,
         )
         if stop_requested.wait(wait_seconds):
+            timing_recorder.emit(
+                "activity",
+                phase="end",
+                category=wait_category,
+                activity_id=retry_activity_id,
+                source="runner",
+                attempt=attempt_number,
+            )
             state["status"] = "interrupted"
             state["completed_at"] = utc_now()
             write_json_atomic(state_path, state)
             write_terminal_artifacts(trial, state, adapter)
             return state
-        retry_seconds = min(retry_seconds * 2, runtime.retry_max_seconds)
+        timing_recorder.emit(
+            "activity",
+            phase="end",
+            category=wait_category,
+            activity_id=retry_activity_id,
+            source="runner",
+            attempt=attempt_number,
+        )
+        if resume_unavailable:
+            retry_seconds = runtime.retry_initial_seconds
+        elif wait_category == "runner_retry_wait":
+            retry_seconds = min(
+                retry_seconds * 2,
+                runtime.retry_max_seconds,
+            )
+        else:
+            retry_seconds = runtime.retry_initial_seconds
 
     state["status"] = "timeout" if not stop_requested.is_set() else "interrupted"
     if state["status"] == "timeout":

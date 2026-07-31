@@ -6,12 +6,14 @@ from typing import Any
 
 from brunner.errors import ConfigurationError
 from brunner.providers.base import (
+    ProviderActivity,
     ProviderCommand,
     ProviderFailure,
     ProviderObservation,
     ProviderRunContext,
     ProviderSettings,
     error_text,
+    record_strings,
     response_from_record,
     validate_effort,
 )
@@ -20,11 +22,12 @@ from brunner.providers.codex import (
     TERMINAL_ERROR_FRAGMENTS,
     TERMINAL_HTTP_STATUSES,
 )
-from brunner.usage import normalized_usage, sum_usage
+from brunner.usage import normalize_claude_usage, sum_usage
 
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CLAUDE_DISALLOWED_TOOLS = ("WebSearch", "WebFetch")
+CLAUDE_WORKSPACE_TOOLS = ("Bash", "Edit", "Write", "Read", "Glob", "Grep")
 
 
 class ClaudeAdapter:
@@ -65,14 +68,51 @@ class ClaudeAdapter:
             "--verbose",
             "--output-format",
             "stream-json",
-            "--dangerously-skip-permissions",
             "--disallowedTools",
             ",".join(CLAUDE_DISALLOWED_TOOLS),
             "--no-chrome",
             "--disable-slash-commands",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
             "--model",
             settings.model,
+            "--settings",
+            json.dumps(
+                {
+                    "sandbox": {
+                        "enabled": True,
+                        "autoAllowBashIfSandboxed": True,
+                        "allowUnsandboxedCommands": False,
+                        "failIfUnavailable": True,
+                        "filesystem": {
+                            "allowWrite": [str(context.workspace)],
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            ),
         ]
+        if context.read_only:
+            command.extend(
+                (
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    "Read,Glob,Grep",
+                )
+            )
+        else:
+            command.extend(
+                (
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    ",".join(CLAUDE_WORKSPACE_TOOLS),
+                )
+            )
         if settings.effort is not None:
             command.extend(("--effort", settings.effort))
         command.extend(("--json-schema", schema))
@@ -103,19 +143,57 @@ class ClaudeAdapter:
             final_response=final_response,
         )
 
+    def activity_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderActivity, ...]:
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return ()
+        content = message.get("content")
+        if not isinstance(content, list):
+            return ()
+        observations = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if record.get("type") == "assistant" and item.get("type") == (
+                "tool_use"
+            ):
+                activity_id = item.get("id")
+                phase = "start"
+                label = item.get("name")
+            elif record.get("type") == "user" and item.get("type") == (
+                "tool_result"
+            ):
+                activity_id = item.get("tool_use_id")
+                phase = "end"
+                label = None
+            else:
+                continue
+            if isinstance(activity_id, str):
+                observations.append(
+                    ProviderActivity(
+                        activity_id=activity_id,
+                        phase=phase,
+                        label=str(label) if label is not None else None,
+                    )
+                )
+        return tuple(observations)
+
     def parse_usage(
         self,
         records: list[dict[str, Any]],
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         values = [
-            normalized_usage(record["usage"])
+            normalize_claude_usage(record["usage"])
             for record in records
             if record.get("type") == "result"
             and isinstance(record.get("usage"), dict)
         ]
         if not values:
             raise ValueError("no Claude usage found")
-        return sum_usage(values)
+        return sum_usage(values, provider=self.name)
 
     def classify_failure(
         self,
@@ -126,28 +204,52 @@ class ClaudeAdapter:
         terminal = False
         api_status = None
         reason = None
+        wait_category = None
+        retry_at_epoch = None
         for record in reversed(records):
             status = record.get("api_error_status")
             if isinstance(status, int) and api_status is None:
                 api_status = status
             rate_limit = record.get("rate_limit_info")
-            if isinstance(rate_limit, dict) and reason is None:
-                value = rate_limit.get("overageDisabledReason")
-                if isinstance(value, str):
-                    reason = value
+            rejected_rate_limit = (
+                isinstance(rate_limit, dict)
+                and rate_limit.get("status") == "rejected"
+            )
+            if isinstance(rate_limit, dict):
+                if reason is None:
+                    value = rate_limit.get("overageDisabledReason")
+                    if isinstance(value, str):
+                        reason = value
+                if retry_at_epoch is None:
+                    reset = (
+                        rate_limit.get("resetsAt")
+                        or rate_limit.get("resetAt")
+                        or rate_limit.get("resets_at")
+                    )
+                    if isinstance(reset, (int, float)):
+                        retry_at_epoch = float(reset)
+                if (
+                    rejected_rate_limit
+                    and isinstance(reason, str)
+                    and reason.startswith("org_level_disabled")
+                ):
+                    wait_category = "subscription_wait"
             text = error_text(record)
             lowered = text.lower()
             is_error = (
                 record.get("is_error") is True
                 or bool(record.get("error"))
-                or record.get("type") in {"error", "rate_limit_event"}
+                or record.get("type") == "error"
+                or (
+                    record.get("type") == "rate_limit_event"
+                    and rejected_rate_limit
+                )
                 or status is not None
             )
             if is_error and text and not summary:
                 summary = text
             if is_error and (
                 status in TERMINAL_HTTP_STATUSES
-                or reason == "org_level_disabled_until"
                 or any(fragment in lowered for fragment in TERMINAL_ERROR_FRAGMENTS)
             ):
                 terminal = True
@@ -158,8 +260,23 @@ class ClaudeAdapter:
             terminal=terminal,
             api_status=api_status,
             reason=reason,
+            wait_category=wait_category,
+            retry_at_epoch=retry_at_epoch,
         )
 
-    def resume_is_unavailable(self, stderr: str) -> bool:
-        lowered = stderr.lower()
+    def resume_is_unavailable(
+        self,
+        records: list[dict[str, Any]],
+        stderr: str,
+    ) -> bool:
+        lowered = "\n".join(
+            (
+                stderr,
+                *(
+                    text
+                    for record in records
+                    for text in record_strings(record)
+                ),
+            )
+        ).lower()
         return any(fragment in lowered for fragment in RETRYABLE_RESUME_ERRORS)

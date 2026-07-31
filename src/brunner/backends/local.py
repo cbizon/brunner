@@ -16,6 +16,7 @@ from brunner.backends.base import (
     BackendHandle,
     BackendSnapshot,
     WorkloadSpec,
+    backend_registry_key,
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import BackendRequestError
@@ -41,7 +42,7 @@ class LocalBackend:
 
     def __init__(self, *, max_parallel: int | None = None) -> None:
         self.max_parallel = max_parallel or max(1, os.cpu_count() or 1)
-        self._handles: dict[str, BackendHandle] = {}
+        self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     @staticmethod
     def _root(trial: Path) -> Path:
@@ -69,7 +70,9 @@ class LocalBackend:
                 raise BackendRequestError(
                     "local backend state belongs to another workload"
                 )
-            self._handles[workload.workload_id] = handle
+            self._handles[
+                backend_registry_key(workload.workload_id, workload.trial)
+            ] = handle
             return handle
 
         stdout_path = root / "stdout.log"
@@ -127,7 +130,9 @@ class LocalBackend:
                 f"could not start local workload: {error}"
             ) from error
         threading.Thread(target=worker.wait, daemon=True).start()
-        self._handles[workload.workload_id] = handle
+        self._handles[
+            backend_registry_key(workload.workload_id, workload.trial)
+        ] = handle
         return handle
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:

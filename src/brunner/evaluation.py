@@ -371,6 +371,20 @@ def evaluate_trial(
             traceback_path=str(error_path.relative_to(trial)),
         )
         write_json_atomic(results_path, result)
+    from brunner.assessment import run_assessments
+
+    assessment_index = run_assessments(
+        definition,
+        contract,
+        trial,
+        result,
+    )
+    result["assessment_status"] = assessment_index["status"]
+    result["required_assessments_complete"] = assessment_index[
+        "required_assessments_complete"
+    ]
+    result["assessments"] = assessment_index["assessments"]
+    write_json_atomic(results_path, result)
     from brunner.report import write_run_report
 
     write_run_report(trial, results_path.with_name("run-report.html"))

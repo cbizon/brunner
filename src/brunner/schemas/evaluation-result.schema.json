@@ -49,6 +49,24 @@
     },
     "error": {
       "type": "object"
+    },
+    "assessment_status": {
+      "enum": [
+        "not_configured",
+        "complete",
+        "partial",
+        "failed",
+        "skipped"
+      ]
+    },
+    "required_assessments_complete": {
+      "type": "boolean"
+    },
+    "assessments": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
     }
   }
 }

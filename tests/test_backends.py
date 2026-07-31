@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from brunner.backends import LocalBackend, WorkloadSpec
+from brunner.backends import BackendHandle, LocalBackend, WorkloadSpec
+from brunner.backends.base import native_resource_name
 from brunner.backends.container import ContainerBackend
 from brunner.backends.kubernetes import (
     KubernetesBackend,
     KubernetesProfile,
+    ReaderMountError,
     render_helper_pod,
     render_job,
     render_pvc,
 )
 from brunner.definition import ArtifactPolicy
-from brunner.errors import BackendConnectivityError
+from brunner.errors import BackendConnectivityError, BackendRequestError
 
 
 ROOT = Path(__file__).parents[1]
@@ -137,6 +140,64 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert expression["values"] == ["node-a"]
 
 
+def test_native_resource_names_do_not_collapse_caller_ids(
+    tmp_path: Path,
+) -> None:
+    trial_a = tmp_path / "campaign-a" / "trial"
+    trial_b = tmp_path / "campaign-b" / "trial"
+
+    names = {
+        native_resource_name("A B", trial_a),
+        native_resource_name("a-b", trial_a),
+        native_resource_name("foo_bar", trial_a),
+        native_resource_name("foo-bar", trial_a),
+        native_resource_name("x" * 80 + "a", trial_a),
+        native_resource_name("x" * 80 + "b", trial_a),
+        native_resource_name("same-id", trial_a),
+        native_resource_name("same-id", trial_b),
+    }
+
+    assert len(names) == 8
+    assert all(len(name) <= 63 for name in names)
+
+
+def test_backend_registry_keeps_same_id_from_different_trials(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(max_parallel=2)
+    handles = []
+    for campaign in ("campaign-a", "campaign-b"):
+        trial = tmp_path / campaign / "same-id"
+        (trial / "workspace").mkdir(parents=True)
+        handles.append(
+            backend.submit(
+                WorkloadSpec(
+                    workload_id="same-id",
+                    trial=trial,
+                    command=(
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(0.3)",
+                    ),
+                    timeout_seconds=2,
+                )
+            )
+        )
+
+    capacity = backend.capacity()
+
+    assert capacity.running + capacity.pending == 2
+    assert capacity.available == 0
+    for handle in handles:
+        deadline = time.monotonic() + 2
+        while (
+            not backend.inspect(handle).terminal
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        backend.cleanup(handle)
+
+
 @pytest.mark.parametrize("backend_type", ["container", "kubernetes"])
 def test_runtime_connectivity_failures_are_distinct(
     tmp_path: Path,
@@ -158,3 +219,153 @@ def test_runtime_connectivity_failures_are_distinct(
 
     with pytest.raises(BackendConnectivityError):
         backend.capacity()
+
+
+def test_kubernetes_dns_failure_is_connectivity_error() -> None:
+    backend = KubernetesBackend(KubernetesProfile())
+
+    error = backend._error(
+        ("get", "jobs"),
+        1,
+        b"",
+        b"Unable to connect to the server: dial tcp: no such host",
+    )
+
+    assert isinstance(error, BackendConnectivityError)
+
+
+def test_kubernetes_warning_events_tolerate_null_optional_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    payload = {
+        "items": [
+            {
+                "type": "Warning",
+                "reason": "FailedMount",
+                "message": "storage aggregate is offline",
+                "series": None,
+                "metadata": None,
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        ),
+    )
+
+    warnings = backend._warning_events("reader", "reader-uid")
+
+    assert warnings == (
+        "FailedMount: storage aggregate is offline",
+    )
+
+
+def test_kubernetes_snapshot_includes_pending_pvc_warning_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        if kind == "pvc":
+            return {
+                "metadata": {"uid": "claim-uid"},
+                "status": {"phase": "Pending"},
+            }
+        if kind == "job":
+            return {"status": {}}
+        if kind == "pods":
+            return {"items": []}
+        raise AssertionError((kind, name, kwargs))
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_warning_events",
+        lambda name, uid: (
+            "ProvisioningFailed: containing aggregate is not online",
+        ),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "pending"
+    assert any(
+        "ProvisioningFailed: containing aggregate is not online" in warning
+        for warning in snapshot.warnings
+    )
+
+
+def test_artifact_reader_failure_includes_kubernetes_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        )
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    monkeypatch.setattr(backend, "_apply", lambda resource: None)
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_pod",
+        lambda name, timeout: (_ for _ in ()).throw(
+            BackendRequestError("reader did not become ready")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda *args, **kwargs: {
+            "metadata": {"uid": "reader-uid"},
+            "spec": {"nodeName": "node-a"},
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_warning_events",
+        lambda name, uid: (
+            "FailedMount: storage aggregate is offline",
+        ),
+    )
+    monkeypatch.setattr(backend, "_delete", lambda kind, name: None)
+
+    with pytest.raises(
+        ReaderMountError,
+        match="FailedMount: storage aggregate is offline",
+    ):
+        backend._reader(handle, 1, ())

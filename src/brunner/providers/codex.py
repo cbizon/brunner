@@ -6,16 +6,18 @@ from typing import Any
 
 from brunner.errors import ConfigurationError
 from brunner.providers.base import (
+    ProviderActivity,
     ProviderCommand,
     ProviderFailure,
     ProviderObservation,
     ProviderRunContext,
     ProviderSettings,
     error_text,
+    record_strings,
     response_from_record,
     validate_effort,
 )
-from brunner.usage import normalized_usage, sum_usage
+from brunner.usage import normalize_codex_usage, sum_usage
 
 
 CODEX_DISABLED_FEATURES = (
@@ -46,6 +48,15 @@ TERMINAL_ERROR_FRAGMENTS = (
     "model_not_found",
 )
 TERMINAL_HTTP_STATUSES = frozenset({400, 401, 403, 404})
+CODEX_TOOL_ITEM_TYPES = frozenset(
+    {
+        "command_execution",
+        "computer_tool_call",
+        "file_change",
+        "mcp_tool_call",
+        "web_search",
+    }
+)
 
 
 class CodexAdapter:
@@ -92,7 +103,6 @@ class CodexAdapter:
                     f"{json.dumps(os.environ['PATH'])}"
                 ),
                 "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
                 *[
                     argument
                     for feature in CODEX_DISABLED_FEATURES
@@ -106,6 +116,10 @@ class CodexAdapter:
                 settings.model,
             ]
         )
+        if context.read_only:
+            command.extend(("--sandbox", "read-only"))
+        else:
+            command.extend(("--sandbox", "workspace-write"))
         if settings.effort is not None:
             command.extend(
                 ("-c", f"model_reasoning_effort={json.dumps(settings.effort)}")
@@ -155,10 +169,34 @@ class CodexAdapter:
             return ProviderObservation(terminal=True, succeeded=False)
         return ProviderObservation(final_response=response_from_record(record))
 
+    def activity_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderActivity, ...]:
+        event_type = record.get("type")
+        if event_type not in {"item.started", "item.completed"}:
+            return ()
+        item = record.get("item")
+        if not isinstance(item, dict) or item.get("type") not in (
+            CODEX_TOOL_ITEM_TYPES
+        ):
+            return ()
+        activity_id = item.get("id")
+        if not isinstance(activity_id, str):
+            return ()
+        label = item.get("command") or item.get("type")
+        return (
+            ProviderActivity(
+                activity_id=activity_id,
+                phase="start" if event_type == "item.started" else "end",
+                label=str(label),
+            ),
+        )
+
     def parse_usage(
         self,
         records: list[dict[str, Any]],
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         per_turn = []
         cumulative = []
         for record in records:
@@ -167,7 +205,7 @@ class CodexAdapter:
                 continue
             usage = payload.get("usage")
             if isinstance(usage, dict):
-                selected = normalized_usage(usage)
+                selected = normalize_codex_usage(usage)
                 if (
                     record.get("type") in {"turn.completed", "turn_completed"}
                     or payload.get("type")
@@ -178,16 +216,16 @@ class CodexAdapter:
                     cumulative.append(selected)
             total_usage = payload.get("total_token_usage")
             if isinstance(total_usage, dict):
-                cumulative.append(normalized_usage(total_usage))
+                cumulative.append(normalize_codex_usage(total_usage))
             info = payload.get("info")
             if isinstance(info, dict):
                 total_usage = info.get("total_token_usage")
                 if isinstance(total_usage, dict):
-                    cumulative.append(normalized_usage(total_usage))
+                    cumulative.append(normalize_codex_usage(total_usage))
         selected = per_turn if per_turn else cumulative[-1:]
         if not selected:
             raise ValueError("no Codex usage found")
-        return sum_usage(selected)
+        return sum_usage(selected, provider=self.name)
 
     def classify_failure(
         self,
@@ -198,28 +236,52 @@ class CodexAdapter:
         terminal = False
         api_status = None
         reason = None
+        wait_category = None
+        retry_at_epoch = None
         for record in reversed(records):
             status = record.get("api_error_status")
             if isinstance(status, int) and api_status is None:
                 api_status = status
             rate_limit = record.get("rate_limit_info")
-            if isinstance(rate_limit, dict) and reason is None:
-                value = rate_limit.get("overageDisabledReason")
-                if isinstance(value, str):
-                    reason = value
+            rejected_rate_limit = (
+                isinstance(rate_limit, dict)
+                and rate_limit.get("status") == "rejected"
+            )
+            if isinstance(rate_limit, dict):
+                if reason is None:
+                    value = rate_limit.get("overageDisabledReason")
+                    if isinstance(value, str):
+                        reason = value
+                if retry_at_epoch is None:
+                    reset = (
+                        rate_limit.get("resetsAt")
+                        or rate_limit.get("resetAt")
+                        or rate_limit.get("resets_at")
+                    )
+                    if isinstance(reset, (int, float)):
+                        retry_at_epoch = float(reset)
+                if (
+                    rejected_rate_limit
+                    and isinstance(reason, str)
+                    and reason.startswith("org_level_disabled")
+                ):
+                    wait_category = "subscription_wait"
             text = error_text(record)
             lowered = text.lower()
             is_error = (
                 record.get("is_error") is True
                 or bool(record.get("error"))
-                or record.get("type") in {"error", "turn.failed", "rate_limit_event"}
+                or record.get("type") in {"error", "turn.failed"}
+                or (
+                    record.get("type") == "rate_limit_event"
+                    and rejected_rate_limit
+                )
                 or status is not None
             )
             if is_error and text and not summary:
                 summary = text
             if is_error and (
                 status in TERMINAL_HTTP_STATUSES
-                or reason == "org_level_disabled_until"
                 or any(fragment in lowered for fragment in TERMINAL_ERROR_FRAGMENTS)
             ):
                 terminal = True
@@ -230,8 +292,23 @@ class CodexAdapter:
             terminal=terminal,
             api_status=api_status,
             reason=reason,
+            wait_category=wait_category,
+            retry_at_epoch=retry_at_epoch,
         )
 
-    def resume_is_unavailable(self, stderr: str) -> bool:
-        lowered = stderr.lower()
+    def resume_is_unavailable(
+        self,
+        records: list[dict[str, Any]],
+        stderr: str,
+    ) -> bool:
+        lowered = "\n".join(
+            (
+                stderr,
+                *(
+                    text
+                    for record in records
+                    for text in record_strings(record)
+                ),
+            )
+        ).lower()
         return any(fragment in lowered for fragment in RETRYABLE_RESUME_ERRORS)

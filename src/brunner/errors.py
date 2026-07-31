@@ -48,3 +48,7 @@ class IntegrityError(BrunnerError):
 
 class EvaluationError(BrunnerError):
     """Trusted evaluation failed."""
+
+
+class AssessmentError(BrunnerError):
+    """A trusted post-evaluation assessment failed."""

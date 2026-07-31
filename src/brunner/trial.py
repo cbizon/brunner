@@ -20,6 +20,7 @@ TRIAL_DIRECTORIES = (
     "usage",
     "timing",
     "evaluation",
+    "assessments",
     "backend",
 )
 
@@ -83,6 +84,10 @@ def write_trial_metadata(
             "brunner_version": __version__,
             "contract_sha256": contract.sha256,
             "challenge_sha256": staged.challenge_sha256,
+            "assessment_contracts": [
+                assessment.contract_manifest()
+                for assessment in definition.assessments
+            ],
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
@@ -107,6 +112,9 @@ def write_trial_metadata(
                 ),
                 "provider_exit_grace_seconds": (
                     definition.runtime.provider_exit_grace_seconds
+                ),
+                "backend_shutdown_grace_seconds": (
+                    definition.runtime.backend_shutdown_grace_seconds
                 ),
             },
         },

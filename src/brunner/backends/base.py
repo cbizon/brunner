@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,6 +19,34 @@ BACKEND_PHASES = frozenset(
         "cleaned",
     }
 )
+
+
+def native_resource_name(
+    workload_id: str,
+    trial: Path,
+    *,
+    suffix: str = "",
+    max_length: int = 63,
+) -> str:
+    identity = (
+        f"{workload_id}\0{trial.resolve()}".encode()
+    )
+    digest = hashlib.sha256(identity).hexdigest()[:10]
+    normalized = re.sub(
+        r"[^a-z0-9-]+",
+        "-",
+        workload_id.lower(),
+    ).strip("-") or "trial"
+    reserved = len("brunner--") + len(digest) + len(suffix)
+    prefix = normalized[: max(1, max_length - reserved)].rstrip("-")
+    return f"brunner-{prefix}-{digest}{suffix}"
+
+
+def backend_registry_key(
+    workload_id: str,
+    trial: Path,
+) -> tuple[str, str]:
+    return workload_id, str(trial.resolve())
 
 
 @dataclass(frozen=True)
