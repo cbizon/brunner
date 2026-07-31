@@ -93,6 +93,9 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     evaluation = subparsers.add_parser("trial-evaluate")
     evaluation.add_argument("trial", type=_path)
 
+    assessment = subparsers.add_parser("trial-assess")
+    assessment.add_argument("trial", type=_path)
+
     local = subparsers.add_parser("local-run")
     local.add_argument("tests_root", type=_path)
     _add_provider_arguments(local)
@@ -141,6 +144,9 @@ def _runtime(
         retry_initial_seconds=defaults.retry_initial_seconds,
         retry_max_seconds=defaults.retry_max_seconds,
         provider_exit_grace_seconds=defaults.provider_exit_grace_seconds,
+        backend_shutdown_grace_seconds=(
+            defaults.backend_shutdown_grace_seconds
+        ),
     )
 
 
@@ -198,6 +204,41 @@ def execute(
         )
     if args.command == "trial-evaluate":
         return evaluate_trial(definition, contract, args.trial)
+    if args.command == "trial-assess":
+        from brunner.assessment import run_assessments
+        from brunner.io import load_json_object, write_json_atomic
+        from brunner.report import write_run_report
+
+        results_path = (
+            args.trial / definition.evaluation.results_path
+        )
+        if not results_path.is_file():
+            raise FileNotFoundError(
+                "deterministic evaluation result does not exist: "
+                f"{results_path}"
+            )
+        evaluation_result = load_json_object(results_path)
+        assessment_index = run_assessments(
+            definition,
+            contract,
+            args.trial,
+            evaluation_result,
+        )
+        evaluation_result["assessment_status"] = assessment_index[
+            "status"
+        ]
+        evaluation_result["required_assessments_complete"] = (
+            assessment_index["required_assessments_complete"]
+        )
+        evaluation_result["assessments"] = assessment_index[
+            "assessments"
+        ]
+        write_json_atomic(results_path, evaluation_result)
+        write_run_report(
+            args.trial,
+            results_path.with_name("run-report.html"),
+        )
+        return assessment_index
     if args.command == "local-run":
         identity = TrialIdentity(
             test_id=args.test_id or new_test_id(args.provider),

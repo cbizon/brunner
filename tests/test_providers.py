@@ -52,6 +52,28 @@ def test_codex_adapter_disables_external_tools(tmp_path: Path) -> None:
     )
     assert 'model_reasoning_effort="high"' in command
     assert "--ephemeral" in command
+    sandbox_index = command.index("--sandbox")
+    assert command[sandbox_index + 1] == "workspace-write"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
+def test_codex_adapter_can_run_in_read_only_mode(tmp_path: Path) -> None:
+    selected = context(tmp_path)
+    selected = ProviderRunContext(
+        **{
+            **selected.__dict__,
+            "read_only": True,
+        }
+    )
+
+    command = CodexAdapter().build_command(
+        ProviderSettings(provider="codex", model="test-model"),
+        selected,
+    ).command
+
+    assert "--sandbox" in command
+    assert "read-only" in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
 def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
@@ -68,6 +90,39 @@ def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
     assert "WebSearch,WebFetch" in command
     assert "--no-chrome" in command
     assert "--no-session-persistence" in command
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in command
+    assert command[command.index("--mcp-config") + 1] == (
+        '{"mcpServers":{}}'
+    )
+    assert "--dangerously-skip-permissions" not in command
+    assert "dontAsk" in command
+    settings = json.loads(command[command.index("--settings") + 1])
+    assert settings["sandbox"]["enabled"] is True
+    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["failIfUnavailable"] is True
+
+
+def test_claude_adapter_limits_read_only_reviewer_tools(
+    tmp_path: Path,
+) -> None:
+    selected = context(tmp_path)
+    selected = ProviderRunContext(
+        **{
+            **selected.__dict__,
+            "read_only": True,
+        }
+    )
+
+    command = ClaudeAdapter().build_command(
+        ProviderSettings(provider="claude", model="claude-test"),
+        selected,
+    ).command
+
+    assert "--permission-mode" in command
+    assert "dontAsk" in command
+    assert "Read,Glob,Grep" in command
+    assert "--dangerously-skip-permissions" not in command
 
 
 def test_provider_effort_can_be_limited_by_runtime_configuration(
@@ -115,3 +170,56 @@ def test_claude_credit_failure_is_terminal_but_rate_limit_is_retryable() -> None
 
     assert terminal is not None and terminal.terminal is True
     assert retryable is not None and retryable.terminal is False
+
+
+def test_claude_subscription_boundary_exposes_reset_time() -> None:
+    failure = ClaudeAdapter().classify_failure(
+        [
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "resetsAt": 1785265200,
+                    "overageDisabledReason": "org_level_disabled",
+                },
+            }
+        ],
+        "",
+    )
+
+    assert failure is not None
+    assert failure.terminal is False
+    assert failure.wait_category == "subscription_wait"
+    assert failure.retry_at_epoch == 1785265200
+
+
+def test_provider_activity_observations_normalize_tool_lifecycles() -> None:
+    codex_start = CodexAdapter().activity_observations(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "item-1",
+                "type": "command_execution",
+                "command": "python simulate.py",
+            },
+        }
+    )
+    claude_end = ClaudeAdapter().activity_observations(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert codex_start[0].phase == "start"
+    assert codex_start[0].category == "foreground_tool"
+    assert codex_start[0].activity_id == "item-1"
+    assert claude_end[0].phase == "end"
+    assert claude_end[0].activity_id == "tool-1"

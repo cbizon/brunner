@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brunner.dev/schemas/assessment-result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "assessment_id",
+    "status",
+    "required",
+    "method",
+    "contract",
+    "input",
+    "reports",
+    "started_at",
+    "ended_at",
+    "elapsed_seconds"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "assessment_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": ["complete", "failed", "skipped"]
+    },
+    "required": {
+      "type": "boolean"
+    },
+    "method": {
+      "type": "object"
+    },
+    "contract": {
+      "type": "object"
+    },
+    "input": {
+      "type": ["object", "null"]
+    },
+    "output": {
+      "type": "object"
+    },
+    "reports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "media_type"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "media_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string"
+          },
+          "primary": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "usage": {
+      "type": "object"
+    },
+    "identity_blinding": {
+      "type": "object"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "elapsed_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "skip_reason": {
+      "type": "string"
+    },
+    "error": {
+      "type": "object"
+    }
+  }
+}

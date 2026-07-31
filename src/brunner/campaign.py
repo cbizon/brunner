@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -22,11 +21,12 @@ from brunner.errors import (
     ArtifactTransferError,
     BackendConnectivityError,
     BackendError,
+    BrunnerError,
+    IntegrityError,
 )
 from brunner.evaluation import evaluate_trial
 from brunner.io import write_json_atomic
-from brunner.providers import ProviderSettings
-from brunner.trial import TrialIdentity, create_trial
+from brunner.trial import TrialIdentity, create_trial, load_trial_identity
 
 
 WorkloadFactory = Callable[
@@ -50,38 +50,48 @@ def _slug(value: str) -> str:
     return normalized or "trial"
 
 
-def _canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
+def _load_optional_object(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 @dataclass(frozen=True)
 class CampaignTrial:
+    test_id: str
     provider: str
     model: str
     effort: str | None = None
-    replicate: int = 1
     environment_keys: tuple[str, ...] = ()
 
     def validate(self) -> None:
+        if not self.test_id.strip():
+            raise ValueError("campaign trial test_id cannot be empty")
+        test_path = Path(self.test_id)
+        if (
+            test_path.is_absolute()
+            or test_path.name != self.test_id
+            or self.test_id in {".", ".."}
+        ):
+            raise ValueError(
+                "campaign trial test_id must be one safe path segment"
+            )
         if not self.provider.strip():
             raise ValueError("campaign trial provider cannot be empty")
         if not self.model.strip():
             raise ValueError("campaign trial model cannot be empty")
-        if self.replicate < 1:
-            raise ValueError("campaign replicate must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "test_id": self.test_id,
             "provider": self.provider,
             "model": self.model,
             "effort": self.effort,
-            "replicate": self.replicate,
-            "environment_keys": list(self.environment_keys),
+            "environment_keys": sorted(set(self.environment_keys)),
         }
 
 
@@ -102,8 +112,16 @@ class CampaignPlan:
             raise ValueError("campaign must contain at least one trial")
         if self.max_parallel < 1:
             raise ValueError("campaign max_parallel must be positive")
+        identities: dict[str, dict[str, Any]] = {}
         for trial in self.trials:
             trial.validate()
+            current = trial.to_dict()
+            previous = identities.setdefault(trial.test_id, current)
+            if previous != current:
+                raise ValueError(
+                    f"campaign trial test_id is reused with conflicting "
+                    f"configuration: {trial.test_id}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -117,46 +135,6 @@ class CampaignPlan:
                 self.included_artifact_groups
             ),
         }
-
-
-def expand_matrix(
-    *,
-    providers: tuple[ProviderSettings, ...],
-    replicates: int = 1,
-) -> tuple[CampaignTrial, ...]:
-    if replicates < 1:
-        raise ValueError("replicates must be positive")
-    return tuple(
-        CampaignTrial(
-            provider=settings.provider,
-            model=settings.model,
-            effort=settings.effort,
-            replicate=replicate,
-        )
-        for settings in providers
-        for replicate in range(1, replicates + 1)
-    )
-
-
-def trial_id(campaign_id: str, trial: CampaignTrial) -> str:
-    identity = {
-        "provider": trial.provider,
-        "model": trial.model,
-        "effort": trial.effort,
-        "replicate": trial.replicate,
-    }
-    suffix = _canonical_digest(identity)[:8]
-    effort = trial.effort or "default"
-    prefix = "-".join(
-        (
-            _slug(campaign_id),
-            _slug(trial.provider),
-            _slug(trial.model),
-            _slug(effort),
-            f"r{trial.replicate:02d}",
-        )
-    )
-    return f"{prefix[:80].rstrip('-')}-{suffix}"
 
 
 def default_workload_factory(
@@ -194,7 +172,10 @@ def default_workload_factory(
         workload_id=trial.name,
         trial=trial,
         command=tuple(command),
-        timeout_seconds=definition.runtime.timeout_seconds,
+        timeout_seconds=(
+            definition.runtime.timeout_seconds
+            + definition.runtime.backend_shutdown_grace_seconds
+        ),
         environment={
             key: os.environ[key]
             for key in campaign_trial.environment_keys
@@ -240,10 +221,11 @@ class CampaignRunner:
         if self.state_path.is_file():
             state = json.loads(self.state_path.read_text())
             expected = {
+                "campaign_id": self.plan.campaign_id,
                 "benchmark_id": self.definition.benchmark_id,
                 "benchmark_version": self.definition.version,
                 "contract_sha256": self.contract.sha256,
-                "plan_sha256": _canonical_digest(self.plan.to_dict()),
+                "backend": self.backend.name,
             }
             mismatches = {
                 key: {"expected": value, "actual": state.get(key)}
@@ -254,62 +236,187 @@ class CampaignRunner:
                 raise RuntimeError(
                     f"campaign identity changed: {mismatches}"
                 )
+            state["schema_version"] = "2.0"
+            state.pop("plan_sha256", None)
+            state.setdefault("trials", [])
+            state.setdefault("events", [])
+            recovered = self._recover_in_progress_phases(state)
+            added = self._sync_plan_trials(state)
+            if added or recovered:
+                state["status"] = "running"
+            self._save(state)
             return state
 
-        entries = []
-        tests_root = self.root / "trials"
-        tests_root.mkdir()
-        for campaign_trial in self.plan.trials:
-            identifier = trial_id(
-                self.plan.campaign_id,
-                campaign_trial,
-            )
-            trial = create_trial(
-                self.definition,
-                self.contract,
-                tests_root,
-                TrialIdentity(
-                    test_id=identifier,
-                    provider=campaign_trial.provider,
-                    model=campaign_trial.model,
-                    effort=campaign_trial.effort,
-                ),
-            )
-            entries.append(
-                {
-                    "test_id": identifier,
-                    "trial": str(trial),
-                    "provider": campaign_trial.provider,
-                    "model": campaign_trial.model,
-                    "effort": campaign_trial.effort,
-                    "replicate": campaign_trial.replicate,
-                    "environment_keys": list(
-                        campaign_trial.environment_keys
-                    ),
-                    "phase": "pending",
-                    "outcome": None,
-                    "attempts": {
-                        "submission": 0,
-                        "collection": 0,
-                    },
-                }
-            )
         state = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "campaign_id": self.plan.campaign_id,
             "benchmark_id": self.definition.benchmark_id,
             "benchmark_version": self.definition.version,
             "contract_sha256": self.contract.sha256,
-            "plan_sha256": _canonical_digest(self.plan.to_dict()),
             "backend": self.backend.name,
             "status": "running",
             "created_at": _now(),
             "updated_at": _now(),
-            "trials": entries,
+            "trials": [],
             "events": [],
         }
+        self._sync_plan_trials(state)
         self._save(state)
         return state
+
+    def _recover_in_progress_phases(
+        self,
+        state: dict[str, Any],
+    ) -> int:
+        recovered = 0
+        for entry in state.get("trials", []):
+            phase = entry.get("phase")
+            if phase == "collecting":
+                entry["phase"] = "collection_pending"
+                entry["collection_warning"] = (
+                    "collection was interrupted before completion"
+                )
+            elif phase == "evaluating":
+                entry["phase"] = "evaluation_pending"
+                entry["evaluation_error"] = (
+                    "evaluation was interrupted before completion"
+                )
+            else:
+                continue
+            self._event(
+                state,
+                "phase_recovered",
+                f"recovered interrupted {phase} phase",
+                test_id=entry.get("test_id"),
+            )
+            recovered += 1
+        return recovered
+
+    def _sync_plan_trials(self, state: dict[str, Any]) -> int:
+        entries = {
+            str(entry["test_id"]): entry
+            for entry in state.get("trials", [])
+            if isinstance(entry, dict) and "test_id" in entry
+        }
+        tests_root = self.root / "trials"
+        tests_root.mkdir(parents=True, exist_ok=True)
+        added = 0
+        seen = set()
+        for campaign_trial in self.plan.trials:
+            if campaign_trial.test_id in seen:
+                continue
+            seen.add(campaign_trial.test_id)
+            existing = entries.get(campaign_trial.test_id)
+            expected = {
+                "provider": campaign_trial.provider,
+                "model": campaign_trial.model,
+                "effort": campaign_trial.effort,
+                "environment_keys": sorted(
+                    set(campaign_trial.environment_keys)
+                ),
+            }
+            if existing is not None:
+                actual = {
+                    "provider": existing.get("provider"),
+                    "model": existing.get("model"),
+                    "effort": existing.get("effort"),
+                    "environment_keys": sorted(
+                        set(existing.get("environment_keys", ()))
+                    ),
+                }
+                mismatches = {
+                    key: {
+                        "expected": value,
+                        "actual": actual[key],
+                    }
+                    for key, value in expected.items()
+                    if actual[key] != value
+                }
+                if mismatches:
+                    raise RuntimeError(
+                        "campaign trial identity changed for "
+                        f"{campaign_trial.test_id}: {mismatches}"
+                    )
+                continue
+            trial_path = tests_root / campaign_trial.test_id
+            if trial_path.exists():
+                identity = load_trial_identity(trial_path)
+                metadata = _load_optional_object(
+                    trial_path / "metadata/manifest.json"
+                )
+                if metadata is None:
+                    raise RuntimeError(
+                        "existing trial directory has no valid metadata: "
+                        f"{trial_path}"
+                    )
+                recovered = {
+                    "test_id": identity.test_id,
+                    "provider": identity.provider,
+                    "model": identity.model,
+                    "effort": identity.effort,
+                    "benchmark_id": metadata.get("benchmark_id"),
+                    "benchmark_version": metadata.get(
+                        "benchmark_version"
+                    ),
+                    "contract_sha256": metadata.get("contract_sha256"),
+                }
+                recovery_expected = {
+                    "test_id": campaign_trial.test_id,
+                    "provider": campaign_trial.provider,
+                    "model": campaign_trial.model,
+                    "effort": campaign_trial.effort,
+                    "benchmark_id": self.definition.benchmark_id,
+                    "benchmark_version": self.definition.version,
+                    "contract_sha256": self.contract.sha256,
+                }
+                recovery_mismatches = {
+                    key: {
+                        "expected": value,
+                        "actual": recovered.get(key),
+                    }
+                    for key, value in recovery_expected.items()
+                    if recovered.get(key) != value
+                }
+                if recovery_mismatches:
+                    raise RuntimeError(
+                        "existing trial directory conflicts with campaign "
+                        f"trial {campaign_trial.test_id}: "
+                        f"{recovery_mismatches}"
+                    )
+                trial = trial_path
+            else:
+                trial = create_trial(
+                    self.definition,
+                    self.contract,
+                    tests_root,
+                    TrialIdentity(
+                        test_id=campaign_trial.test_id,
+                        provider=campaign_trial.provider,
+                        model=campaign_trial.model,
+                        effort=campaign_trial.effort,
+                    ),
+                )
+            entry = {
+                "test_id": campaign_trial.test_id,
+                "trial": str(trial),
+                **expected,
+                "phase": "pending",
+                "outcome": None,
+                "attempts": {
+                    "submission": 0,
+                    "collection": 0,
+                },
+            }
+            state["trials"].append(entry)
+            entries[campaign_trial.test_id] = entry
+            self._event(
+                state,
+                "trial_added",
+                "campaign trial added",
+                test_id=campaign_trial.test_id,
+            )
+            added += 1
+        return added
 
     def _save(self, state: dict[str, Any]) -> None:
         state["updated_at"] = _now()
@@ -356,10 +463,10 @@ class CampaignRunner:
         entry: dict[str, Any],
     ) -> CampaignTrial:
         return CampaignTrial(
+            test_id=str(entry["test_id"]),
             provider=str(entry["provider"]),
             model=str(entry["model"]),
             effort=entry.get("effort"),
-            replicate=int(entry["replicate"]),
             environment_keys=tuple(
                 entry.get("environment_keys", ())
             ),
@@ -372,45 +479,101 @@ class CampaignRunner:
         handle: BackendHandle,
         backend_phase: str,
     ) -> None:
-        entry["phase"] = "collecting"
-        entry["attempts"]["collection"] += 1
-        self._save(state)
         destination = self.root / "collected" / entry["test_id"]
-        try:
-            collection = self.backend.collect(
-                handle,
-                destination,
-                self.definition.artifacts,
-                included_groups=self.plan.included_artifact_groups,
-            )
-        except BackendConnectivityError:
-            raise
-        except (ArtifactTransferError, BackendError, OSError) as error:
+        entry["backend_phase"] = backend_phase
+        if entry["phase"] != "evaluation_pending":
+            entry["phase"] = "collecting"
+            entry["attempts"]["collection"] += 1
+            self._save(state)
+            try:
+                collection = self.backend.collect(
+                    handle,
+                    destination,
+                    self.definition.artifacts,
+                    included_groups=self.plan.included_artifact_groups,
+                )
+            except BackendConnectivityError:
+                raise
+            except (
+                ArtifactTransferError,
+                BackendError,
+                IntegrityError,
+                OSError,
+            ) as error:
+                entry["phase"] = "collection_failed"
+                entry["collection_error"] = str(error)
+                self._event(
+                    state,
+                    "collection_failed",
+                    str(error),
+                    test_id=entry["test_id"],
+                )
+                self._save(state)
+                return
+            entry["collection"] = {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in collection.items()
+            }
+            entry["collected_trial"] = str(destination)
+            entry.pop("collection_error", None)
+            entry.pop("collection_warning", None)
+        elif not destination.is_dir():
             entry["phase"] = "collection_failed"
-            entry["collection_error"] = str(error)
+            entry["collection_error"] = (
+                "collected trial is missing after interrupted evaluation"
+            )
+            self._save(state)
+            return
+        entry["phase"] = "evaluating"
+        self._save(state)
+        try:
+            evaluation = evaluate_trial(
+                self.definition,
+                self.contract,
+                destination,
+            )
+        except (
+            BrunnerError,
+            json.JSONDecodeError,
+            OSError,
+            ValueError,
+        ) as error:
+            entry["phase"] = "attention_required"
+            entry["evaluation_error"] = str(error)
             self._event(
                 state,
-                "collection_failed",
+                "evaluation_failed",
                 str(error),
                 test_id=entry["test_id"],
             )
             self._save(state)
             return
-        entry["collection"] = {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in collection.items()
-        }
-        entry["collected_trial"] = str(destination)
-        entry.pop("collection_error", None)
-        entry["phase"] = "evaluating"
-        self._save(state)
-        evaluation = evaluate_trial(
-            self.definition,
-            self.contract,
-            destination,
+        usage = _load_optional_object(destination / "usage/usage.json")
+        timing = _load_optional_object(
+            destination / "timing/accounting.json"
         )
+        if usage is not None:
+            entry["usage"] = {
+                key: usage.get(key)
+                for key in (
+                    "logical_input_tokens",
+                    "uncached_input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "total_tokens",
+                )
+            }
+        if timing is not None and isinstance(timing.get("summary"), dict):
+            entry["timing"] = dict(timing["summary"])
         entry["evaluation"] = {
             "status": evaluation["status"],
+            "assessment_status": evaluation["assessment_status"],
+            "required_assessments_complete": evaluation[
+                "required_assessments_complete"
+            ],
+            "assessments": evaluation["assessments"],
             "results": str(
                 destination / self.definition.evaluation.results_path
             ),
@@ -421,11 +584,12 @@ class CampaignRunner:
                 ).with_name("run-report.html")
             ),
         }
-        entry["backend_phase"] = backend_phase
+        entry.pop("evaluation_error", None)
         entry["outcome"] = (
             "succeeded"
             if backend_phase == "succeeded"
             and evaluation["status"] == "complete"
+            and evaluation["required_assessments_complete"]
             else "failed"
         )
         entry["phase"] = "cleanup_pending"
@@ -468,7 +632,8 @@ class CampaignRunner:
                 "submitted",
                 "pending",
                 "running",
-                "collection_failed",
+                "collection_pending",
+                "evaluation_pending",
                 "cleanup_pending",
             }:
                 continue
@@ -497,7 +662,21 @@ class CampaignRunner:
                     test_id=entry["test_id"],
                 )
                 continue
-            if entry["phase"] == "collection_failed":
+            if entry["phase"] == "collection_pending":
+                backend_phase = str(
+                    entry.get("backend_phase", "failed")
+                )
+                try:
+                    self._collect_and_evaluate(
+                        state,
+                        entry,
+                        handle,
+                        backend_phase,
+                    )
+                except BackendConnectivityError as error:
+                    return self._pause_connectivity(state, error)
+                continue
+            if entry["phase"] == "evaluation_pending":
                 backend_phase = str(
                     entry.get("backend_phase", "failed")
                 )
@@ -559,6 +738,7 @@ class CampaignRunner:
                 "submitted",
                 "pending",
                 "running",
+                "collection_pending",
                 "collecting",
                 "evaluating",
                 "cleanup_pending",
@@ -572,17 +752,18 @@ class CampaignRunner:
             except BackendConnectivityError as error:
                 return self._pause_connectivity(state, error)
             except BackendError as error:
-                state["status"] = "attention_required"
+                state["scheduler_error"] = str(error)
                 self._event(
                     state,
                     "capacity_failed",
                     str(error),
                 )
-                self._save(state)
-                return state
-            available = available_by_plan
-            if capacity.available is not None:
-                available = min(available, capacity.available)
+                available = 0
+            else:
+                state.pop("scheduler_error", None)
+                available = available_by_plan
+                if capacity.available is not None:
+                    available = min(available, capacity.available)
             for entry in state["trials"]:
                 if available <= 0:
                     break
@@ -627,10 +808,28 @@ class CampaignRunner:
         if phases == {"complete"}:
             state["status"] = "complete"
             state["completed_at"] = _now()
+            state["has_attention"] = False
+        elif phases & {
+            "pending",
+            "submitted",
+            "running",
+            "collection_pending",
+            "collecting",
+            "evaluation_pending",
+            "evaluating",
+            "cleanup_pending",
+        }:
+            state["status"] = "running"
+            state["has_attention"] = bool(
+                phases & {"attention_required", "collection_failed"}
+                or state.get("scheduler_error")
+            )
         elif phases & {"attention_required", "collection_failed"}:
             state["status"] = "attention_required"
+            state["has_attention"] = True
         else:
             state["status"] = "running"
+            state["has_attention"] = False
         self._save(state)
         return state
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from brunner.backends import LocalBackend, WorkloadSpec
+from brunner.backends.base import native_resource_name
 from brunner.backends.container import ContainerBackend
 from brunner.backends.kubernetes import (
     KubernetesBackend,
@@ -135,6 +136,64 @@ def test_kubernetes_resources_preserve_secret_boundary(
     ]["nodeSelectorTerms"][0]["matchExpressions"][0]
     assert expression["operator"] == "NotIn"
     assert expression["values"] == ["node-a"]
+
+
+def test_native_resource_names_do_not_collapse_caller_ids(
+    tmp_path: Path,
+) -> None:
+    trial_a = tmp_path / "campaign-a" / "trial"
+    trial_b = tmp_path / "campaign-b" / "trial"
+
+    names = {
+        native_resource_name("A B", trial_a),
+        native_resource_name("a-b", trial_a),
+        native_resource_name("foo_bar", trial_a),
+        native_resource_name("foo-bar", trial_a),
+        native_resource_name("x" * 80 + "a", trial_a),
+        native_resource_name("x" * 80 + "b", trial_a),
+        native_resource_name("same-id", trial_a),
+        native_resource_name("same-id", trial_b),
+    }
+
+    assert len(names) == 8
+    assert all(len(name) <= 63 for name in names)
+
+
+def test_backend_registry_keeps_same_id_from_different_trials(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(max_parallel=2)
+    handles = []
+    for campaign in ("campaign-a", "campaign-b"):
+        trial = tmp_path / campaign / "same-id"
+        (trial / "workspace").mkdir(parents=True)
+        handles.append(
+            backend.submit(
+                WorkloadSpec(
+                    workload_id="same-id",
+                    trial=trial,
+                    command=(
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(0.3)",
+                    ),
+                    timeout_seconds=2,
+                )
+            )
+        )
+
+    capacity = backend.capacity()
+
+    assert capacity.running + capacity.pending == 2
+    assert capacity.available == 0
+    for handle in handles:
+        deadline = time.monotonic() + 2
+        while (
+            not backend.inspect(handle).terminal
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        backend.cleanup(handle)
 
 
 @pytest.mark.parametrize("backend_type", ["container", "kubernetes"])

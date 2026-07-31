@@ -1,4 +1,5 @@
 from brunner.providers.base import (
+    ProviderActivity,
     ProviderAdapter,
     ProviderCommand,
     ProviderFailure,
@@ -26,6 +27,7 @@ def get_provider(name: str) -> ProviderAdapter:
 __all__ = [
     "ClaudeAdapter",
     "CodexAdapter",
+    "ProviderActivity",
     "ProviderAdapter",
     "ProviderCommand",
     "ProviderFailure",

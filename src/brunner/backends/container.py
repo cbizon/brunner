@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,8 @@ from brunner.backends.base import (
     BackendHandle,
     BackendSnapshot,
     WorkloadSpec,
+    backend_registry_key,
+    native_resource_name,
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
@@ -29,12 +30,6 @@ CONNECTIVITY_FRAGMENTS = (
     "connection refused",
 )
 
-
-def _safe_name(value: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-.")
-    return ("brunner-" + normalized.lower())[:63]
-
-
 class ContainerBackend:
     name = "container"
 
@@ -48,7 +43,7 @@ class ContainerBackend:
         self.runtime = runtime
         self.max_parallel = max_parallel
         self.command_timeout_seconds = command_timeout_seconds
-        self._handles: dict[str, BackendHandle] = {}
+        self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     def _runtime_error(
         self,
@@ -97,7 +92,10 @@ class ContainerBackend:
             raise BackendRequestError(
                 "container workloads require an image"
             )
-        name = _safe_name(workload.workload_id)
+        name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+        )
         state_path = workload.trial / "backend/container.json"
         if state_path.is_file():
             state = json.loads(state_path.read_text())
@@ -108,7 +106,9 @@ class ContainerBackend:
                 trial=workload.trial.resolve(),
                 metadata={"name": str(state["name"])},
             )
-            self._handles[workload.workload_id] = handle
+            self._handles[
+                backend_registry_key(workload.workload_id, workload.trial)
+            ] = handle
             return handle
         arguments = [
             "run",
@@ -158,7 +158,9 @@ class ContainerBackend:
                 "name": name,
             },
         )
-        self._handles[workload.workload_id] = handle
+        self._handles[
+            backend_registry_key(workload.workload_id, workload.trial)
+        ] = handle
         return handle
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:

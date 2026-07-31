@@ -47,6 +47,9 @@ def main() -> None:
             provider_exit_grace_seconds=(
                 defaults.provider_exit_grace_seconds
             ),
+            backend_shutdown_grace_seconds=(
+                defaults.backend_shutdown_grace_seconds
+            ),
         )
     state = run_staged_trial(
         args.trial,

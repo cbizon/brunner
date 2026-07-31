@@ -20,17 +20,30 @@ def _json_block(value: object) -> str:
 def write_run_report(trial: Path, output: Path) -> Path:
     metadata = _load_optional(trial / "metadata/manifest.json") or {}
     status = _load_optional(trial / "status.json") or {}
-    timing = _load_optional(trial / "timing/goal.json")
+    timing = _load_optional(trial / "timing/accounting.json")
+    if timing is None:
+        timing = _load_optional(trial / "timing/goal.json")
     usage = _load_optional(trial / "usage/usage.json")
     evaluation = _load_optional(trial / "evaluation/results.json") or {}
     attempts = status.get("attempts", [])
-    reports = evaluation.get("reports", [])
+    assessments = [
+        assessment
+        for assessment in evaluation.get("assessments", [])
+        if isinstance(assessment, dict)
+    ]
+    reports = list(evaluation.get("reports", []))
+    for assessment in assessments:
+        reports.extend(assessment.get("reports", []))
     links = []
+    seen_reports = set()
     for report in reports:
         if not isinstance(report, dict) or not isinstance(
             report.get("path"), str
         ):
             continue
+        if report["path"] in seen_reports:
+            continue
+        seen_reports.add(report["path"])
         label = report.get("title") or report["path"]
         relative = Path(report["path"])
         try:
@@ -44,6 +57,41 @@ def write_run_report(trial: Path, output: Path) -> Path:
         links.append(
             f'<li><a href="{html.escape(href.as_posix())}">'
             f"{html.escape(str(label))}</a></li>"
+        )
+    assessment_rows = []
+    for assessment in assessments:
+        method = assessment.get("method", {})
+        method_label = method.get("kind", "")
+        if method_label == "reviewer":
+            method_label = (
+                f"{method.get('provider', '')}/"
+                f"{method.get('model', '')}"
+            )
+        assessment_links = []
+        for report in assessment.get("reports", []):
+            if not isinstance(report, dict) or not isinstance(
+                report.get("path"), str
+            ):
+                continue
+            report_path = trial / report["path"]
+            try:
+                href = report_path.relative_to(output.parent)
+            except ValueError:
+                continue
+            assessment_links.append(
+                f'<a href="{html.escape(href.as_posix())}">'
+                f"{html.escape(str(report.get('title') or 'report'))}</a>"
+            )
+        error = assessment.get("error", {})
+        assessment_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(assessment.get('assessment_id', '')))}</td>"
+            f"<td>{html.escape(str(assessment.get('status', '')))}</td>"
+            f"<td>{html.escape(str(assessment.get('required', False)))}</td>"
+            f"<td>{html.escape(str(method_label))}</td>"
+            f"<td>{' · '.join(assessment_links)}</td>"
+            f"<td>{html.escape(str(error.get('message', '')))}</td>"
+            "</tr>"
         )
     attempt_rows = "".join(
         "<tr>"
@@ -94,9 +142,14 @@ a {{ color:var(--green); }}
 <div class="fact">Model<strong>{html.escape(str(metadata.get("model", "")))}</strong></div>
 <div class="fact">Status<strong>{html.escape(str(status.get("status", "")))}</strong></div>
 <div class="fact">Evaluation<strong>{html.escape(str(evaluation.get("status", "")))}</strong></div>
+<div class="fact">Assessments<strong>{html.escape(str(evaluation.get("assessment_status", "not_configured")))}</strong></div>
 </div>
 <h2>Benchmark reports</h2>
 <section><ul>{''.join(links) or '<li>No benchmark-specific reports.</li>'}</ul></section>
+<h2>Assessments</h2>
+<table><thead><tr><th>ID</th><th>Status</th><th>Required</th>
+<th>Method</th><th>Reports</th><th>Issue</th></tr></thead>
+<tbody>{''.join(assessment_rows) or '<tr><td colspan="6">No assessments configured.</td></tr>'}</tbody></table>
 <h2>Attempts</h2>
 <table><thead><tr><th>#</th><th>Mode</th><th>Status</th><th>Exit</th><th>Failure</th></tr></thead>
 <tbody>{attempt_rows}</tbody></table>

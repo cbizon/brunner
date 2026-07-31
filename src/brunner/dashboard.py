@@ -18,6 +18,12 @@ def _relative_link(output: Path, value: str | None) -> str:
     return relative.as_posix()
 
 
+def _seconds(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return ""
+    return f"{value:.1f}"
+
+
 def write_campaign_dashboard(
     state: dict[str, Any],
     output: Path,
@@ -47,6 +53,26 @@ def write_campaign_dashboard(
             if report
             else ""
         )
+        assessment_links = []
+        for assessment in evaluation.get("assessments", []):
+            if not isinstance(assessment, dict):
+                continue
+            for assessment_report in assessment.get("reports", []):
+                if not isinstance(assessment_report, dict):
+                    continue
+                href = _relative_link(
+                    output,
+                    str(
+                        Path(trial.get("collected_trial", ""))
+                        / str(assessment_report.get("path", ""))
+                    ),
+                )
+                if not href:
+                    continue
+                assessment_links.append(
+                    f'<a href="{html.escape(href)}">'
+                    f"{html.escape(str(assessment.get('assessment_id', 'review')))}</a>"
+                )
         snapshot = trial.get("backend_snapshot", {})
         warning = (
             trial.get("error")
@@ -54,6 +80,8 @@ def write_campaign_dashboard(
             or trial.get("cleanup_error")
             or ""
         )
+        usage = trial.get("usage", {})
+        timing = trial.get("timing", {})
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(trial.get('test_id', '')))}</td>"
@@ -62,8 +90,15 @@ def write_campaign_dashboard(
             f"<td>{html.escape(str(trial.get('effort') or 'default'))}</td>"
             f"<td>{html.escape(str(trial.get('phase', '')))}</td>"
             f"<td>{html.escape(str(trial.get('outcome') or ''))}</td>"
+            f"<td>{html.escape(str(evaluation.get('assessment_status') or ''))}</td>"
+            f"<td>{html.escape(str(usage.get('total_tokens') or ''))}</td>"
+            f"<td>{_seconds(timing.get('wall_seconds'))}</td>"
+            f"<td>{_seconds(timing.get('agent_active_seconds'))}</td>"
+            f"<td>{_seconds(timing.get('external_wait_seconds'))}</td>"
+            f"<td>{_seconds(timing.get('subscription_wait_seconds'))}</td>"
             f"<td>{html.escape(str(snapshot.get('node') or ''))}</td>"
             f"<td>{report_cell}</td>"
+            f"<td>{' · '.join(assessment_links)}</td>"
             f"<td>{html.escape(str(warning))}</td>"
             "</tr>"
         )
@@ -116,7 +151,10 @@ a {{ color:var(--green); font-weight:bold; }}
 <div class="cards">{cards}</div>
 <div class="table"><table>
 <thead><tr><th>Trial</th><th>Provider</th><th>Model</th><th>Effort</th>
-<th>Phase</th><th>Outcome</th><th>Node</th><th>Report</th><th>Issue</th>
+<th>Phase</th><th>Outcome</th><th>Assessment</th><th>Tokens</th>
+<th>Wall s</th><th>Agent s</th><th>External wait s</th>
+<th>Subscription wait s</th><th>Node</th>
+<th>Report</th><th>Assessment reports</th><th>Issue</th>
 </tr></thead><tbody>{''.join(rows)}</tbody>
 </table></div>
 <h2>Recent events</h2>

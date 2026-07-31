@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 brunner = "brunner.cli:main"
+brunner-activity = "brunner.activity_cli:main"
 brunner-agent = "brunner.agent_cli:main"
 
 [dependency-groups]
@@ -24,9 +25,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/brunner"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/brunner/schemas" = "brunner/schemas"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

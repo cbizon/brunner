@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -22,6 +21,8 @@ from brunner.backends.base import (
     BackendHandle,
     BackendSnapshot,
     WorkloadSpec,
+    backend_registry_key,
+    native_resource_name,
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
@@ -53,13 +54,6 @@ class ReaderMountError(BackendRequestError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _safe_name(value: str, *, suffix: str = "") -> str:
-    normalized = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
-    base = f"brunner-{normalized}"[: 63 - len(suffix)].rstrip("-")
-    return base + suffix
-
 
 @dataclass(frozen=True)
 class KubernetesProfile:
@@ -275,7 +269,7 @@ class KubernetesBackend:
     ) -> None:
         self.profile = profile
         self.kubectl = kubectl
-        self._handles: dict[str, BackendHandle] = {}
+        self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     def _error(
         self,
@@ -426,7 +420,11 @@ class KubernetesBackend:
         image: str,
         labels: dict[str, str],
     ) -> None:
-        pod_name = _safe_name(workload.workload_id, suffix="-stage")
+        pod_name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+            suffix="-stage",
+        )
         self._apply(
             render_helper_pod(
                 pod_name,
@@ -473,11 +471,20 @@ class KubernetesBackend:
                 trial=workload.trial.resolve(),
                 metadata=dict(state["metadata"]),
             )
-            self._handles[workload.workload_id] = handle
+            self._handles[
+                backend_registry_key(workload.workload_id, workload.trial)
+            ] = handle
             return handle
 
-        job_name = _safe_name(workload.workload_id)
-        claim_name = _safe_name(workload.workload_id, suffix="-data")
+        job_name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+        )
+        claim_name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+            suffix="-data",
+        )
         labels = {
             "app.kubernetes.io/name": "brunner",
             "dev.brunner/workload": job_name,
@@ -512,7 +519,9 @@ class KubernetesBackend:
                 **handle.to_dict(),
             },
         )
-        self._handles[workload.workload_id] = handle
+        self._handles[
+            backend_registry_key(workload.workload_id, workload.trial)
+        ] = handle
         return handle
 
     def _pod_for_handle(
@@ -645,8 +654,9 @@ class KubernetesBackend:
                 "Kubernetes artifact collection requires "
                 "artifact_reader_image"
             )
-        name = _safe_name(
+        name = native_resource_name(
             handle.workload_id,
+            handle.trial,
             suffix=f"-reader-{attempt}",
         )
         labels = {

@@ -34,6 +34,7 @@ class ProviderRunContext:
     resume_session: bool
     session_id: str | None
     executable: str | None = None
+    read_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,11 +52,21 @@ class ProviderObservation:
 
 
 @dataclass(frozen=True)
+class ProviderActivity:
+    activity_id: str
+    phase: str
+    category: str = "foreground_tool"
+    label: str | None = None
+
+
+@dataclass(frozen=True)
 class ProviderFailure:
     summary: str
     terminal: bool
     api_status: int | None = None
     reason: str | None = None
+    wait_category: str | None = None
+    retry_at_epoch: float | None = None
 
 
 class ProviderAdapter(Protocol):
@@ -79,10 +90,15 @@ class ProviderAdapter(Protocol):
         record: dict[str, Any],
     ) -> ProviderObservation: ...
 
+    def activity_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderActivity, ...]: ...
+
     def parse_usage(
         self,
         records: list[dict[str, Any]],
-    ) -> dict[str, int]: ...
+    ) -> dict[str, Any]: ...
 
     def classify_failure(
         self,
