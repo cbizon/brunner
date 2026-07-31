@@ -25,7 +25,7 @@ from brunner.hashing import sha256_file, sha256_tree
 from brunner.io import load_json_object, write_json_atomic
 from brunner.providers import ProviderRunContext, get_provider
 from brunner.providers.base import response_from_record
-from brunner.runner import run_attempt
+from brunner.runner import model_mismatch_message, run_attempt
 from brunner.usage import read_json_records
 
 
@@ -663,6 +663,7 @@ def _run_reviewer(
                 stop_requested=threading.Event(),
                 terminal_exit_grace_seconds=5,
                 terminal_success_ready=terminal_success_ready,
+                requested_model=settings.model,
             )
             attempt: dict[str, Any] = {
                 "number": number,
@@ -699,6 +700,13 @@ def _run_reviewer(
             launch_error = outcome.get("launch_error")
             if launch_error is not None:
                 last_error = f"reviewer launch failed: {launch_error}"
+                attempt["status"] = "failed"
+                attempt["failure"] = last_error
+                attempts.append(attempt)
+                break
+            model_mismatch = outcome.get("model_mismatch")
+            if isinstance(model_mismatch, dict):
+                last_error = model_mismatch_message(model_mismatch)
                 attempt["status"] = "failed"
                 attempt["failure"] = last_error
                 attempts.append(attempt)

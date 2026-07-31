@@ -291,20 +291,25 @@ def run_attempt(
     attempt_number: int = 1,
     timing_recorder: TimingRecorder | None = None,
     terminal_success_ready: Callable[[], bool] | None = None,
+    requested_model: str | None = None,
 ) -> dict[str, Any]:
     terminal_seen = threading.Event()
     terminal_succeeded = threading.Event()
     terminal_exit_ready = threading.Event()
     observed_response: dict[str, Any] | None = None
     observation_lock = threading.Lock()
+    model_lock = threading.Lock()
     activity_lock = threading.Lock()
+    observed_models: list[dict[str, Any]] = []
+    observed_model_keys: set[tuple[str, str]] = set()
+    model_mismatch: dict[str, Any] | None = None
     active_provider_activities: set[str] = set()
     provider_event_index = 0
     prompt_delivery_errors: list[str] = []
     prompt_delivery_done = threading.Event()
 
     def inspect_line(line: str) -> None:
-        nonlocal observed_response, provider_event_index
+        nonlocal model_mismatch, observed_response, provider_event_index
         recorded_epoch = time.time()
         try:
             record = json.loads(line)
@@ -325,6 +330,46 @@ def run_attempt(
                     item.get("type") if isinstance(item, dict) else None
                 ),
             )
+        for model_observation in adapter.model_observations(record):
+            key = (
+                model_observation.model,
+                model_observation.source,
+            )
+            matches = bool(
+                requested_model is None
+                or adapter.models_match(
+                    requested_model,
+                    model_observation.model,
+                )
+            )
+            with model_lock:
+                if key not in observed_model_keys:
+                    observed_model_keys.add(key)
+                    observed_models.append(
+                        {
+                            "model": model_observation.model,
+                            "source": model_observation.source,
+                            "provider_event_index": provider_event_index,
+                        }
+                    )
+                if not matches and model_mismatch is None:
+                    model_mismatch = {
+                        "requested_model": requested_model,
+                        "observed_model": model_observation.model,
+                        "source": model_observation.source,
+                        "provider_event_index": provider_event_index,
+                    }
+            if timing_recorder is not None:
+                timing_recorder.emit(
+                    "provider_model_observed",
+                    epoch_seconds=recorded_epoch,
+                    attempt=attempt_number,
+                    provider_event_index=provider_event_index,
+                    requested_model=requested_model,
+                    observed_model=model_observation.model,
+                    source=model_observation.source,
+                    matches=matches,
+                )
         for activity in adapter.activity_observations(record):
             with activity_lock:
                 if activity.phase == "start":
@@ -405,6 +450,9 @@ def run_attempt(
                 "soft_deadline_activity_seen": False,
                 "launch_error": launch_error,
                 "prompt_delivery_error": None,
+                "requested_model": requested_model,
+                "observed_models": [],
+                "model_mismatch": None,
                 "observed_response": None,
             }
         assert process.stdin is not None
@@ -464,6 +512,13 @@ def run_attempt(
             work_is_active = active_work()
             now_epoch = time.time()
             now_monotonic = time.monotonic()
+            with model_lock:
+                mismatched_model = model_mismatch is not None
+            if mismatched_model:
+                active_work_terminated = work_is_active
+                terminate_process(process)
+                forced_termination_reason = "model_mismatch"
+                break
             if (
                 terminal_seen.is_set()
                 and terminal_succeeded.is_set()
@@ -562,7 +617,14 @@ def run_attempt(
     provider_return_code = (
         process.returncode if process.returncode is not None else 124
     )
-    if terminal_succeeded.is_set() and not active_work_terminated:
+    with model_lock:
+        final_observed_models = list(observed_models)
+        final_model_mismatch = (
+            dict(model_mismatch) if model_mismatch is not None else None
+        )
+    if final_model_mismatch is not None:
+        return_code = provider_return_code or 1
+    elif terminal_succeeded.is_set() and not active_work_terminated:
         return_code = 0
     elif terminal_seen.is_set():
         return_code = provider_return_code or 1
@@ -584,8 +646,19 @@ def run_attempt(
         "prompt_delivery_error": (
             prompt_delivery_errors[0] if prompt_delivery_errors else None
         ),
+        "requested_model": requested_model,
+        "observed_models": final_observed_models,
+        "model_mismatch": final_model_mismatch,
         "observed_response": observed_response,
     }
+
+
+def model_mismatch_message(mismatch: dict[str, Any]) -> str:
+    return (
+        f"provider substituted model {mismatch.get('observed_model')!r} "
+        f"for requested model {mismatch.get('requested_model')!r} "
+        f"at {mismatch.get('source') or 'an unknown event source'}"
+    )
 
 
 def load_state(
@@ -946,6 +1019,7 @@ def _run_configured_trial(
             attempt_number=attempt_number,
             timing_recorder=timing_recorder,
             terminal_success_ready=terminal_success_ready,
+            requested_model=settings.model,
         )
         control_plane_changes = restore_control_plane(
             trial,
@@ -1015,6 +1089,18 @@ def _run_configured_trial(
             attempt["failure"] = f"provider launch failed: {launch_error}"
             state["status"] = "provider_error"
             state["failure"] = attempt["failure"]
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
+
+        model_mismatch = outcome.get("model_mismatch")
+        if isinstance(model_mismatch, dict):
+            attempt["status"] = "failed"
+            attempt["failure"] = model_mismatch_message(model_mismatch)
+            state["status"] = "provider_error"
+            state["failure"] = attempt["failure"]
+            state["model_mismatch"] = model_mismatch
             state["completed_at"] = utc_now()
             write_json_atomic(state_path, state)
             write_terminal_artifacts(trial, state, adapter)

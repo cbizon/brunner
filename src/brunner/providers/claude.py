@@ -9,6 +9,7 @@ from brunner.providers.base import (
     ProviderActivity,
     ProviderCommand,
     ProviderFailure,
+    ProviderModelObservation,
     ProviderObservation,
     ProviderRunContext,
     ProviderSettings,
@@ -141,6 +142,42 @@ class ClaudeAdapter:
             terminal=True,
             succeeded=succeeded,
             final_response=final_response,
+        )
+
+    def model_observations(
+        self,
+        record: dict[str, Any],
+    ) -> tuple[ProviderModelObservation, ...]:
+        if (
+            record.get("type") != "assistant"
+            or record.get("parent_tool_use_id") not in {None, ""}
+        ):
+            return ()
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return ()
+        model = message.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return ()
+        return (
+            ProviderModelObservation(
+                model=model.strip(),
+                source="assistant.message.model",
+            ),
+        )
+
+    def models_match(
+        self,
+        requested: str,
+        observed: str,
+    ) -> bool:
+        requested_parts = _model_parts(requested)
+        observed_parts = _model_parts(observed)
+        if requested_parts and requested_parts[-1] == "latest":
+            requested_parts = requested_parts[:-1]
+        return bool(
+            requested_parts
+            and observed_parts[: len(requested_parts)] == requested_parts
         )
 
     def activity_observations(
@@ -280,3 +317,10 @@ class ClaudeAdapter:
             )
         ).lower()
         return any(fragment in lowered for fragment in RETRYABLE_RESUME_ERRORS)
+
+
+def _model_parts(value: str) -> tuple[str, ...]:
+    normalized = value.strip().lower().replace("_", "-")
+    if normalized.startswith("claude-"):
+        normalized = normalized.removeprefix("claude-")
+    return tuple(part for part in normalized.split("-") if part)
