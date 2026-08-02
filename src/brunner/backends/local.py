@@ -27,6 +27,9 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+LAUNCH_GRACE_SECONDS = 60.0
+
+
 def _is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -51,6 +54,39 @@ class LocalBackend:
     @classmethod
     def _state_path(cls, trial: Path) -> Path:
         return cls._root(trial) / "state.json"
+
+    @classmethod
+    def _launcher_path(cls, trial: Path) -> Path:
+        # Kept separate from state.json: the worker owns that file and would
+        # otherwise race the launcher's write.
+        return cls._root(trial) / "launcher.json"
+
+    @classmethod
+    def _launcher(cls, trial: Path) -> dict[str, Any]:
+        path = cls._launcher_path(trial)
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _watch_launcher(
+        cls,
+        worker: subprocess.Popen[bytes],
+        trial: Path,
+    ) -> None:
+        return_code = worker.wait()
+        launcher = cls._launcher(trial)
+        launcher.update(
+            {
+                "exit_code": return_code,
+                "exited_at": _now(),
+            }
+        )
+        write_json_atomic(cls._launcher_path(trial), launcher)
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         workload.validate()
@@ -107,14 +143,18 @@ class LocalBackend:
             "--",
             *workload.command,
         )
+        worker_log = root / "worker.log"
         try:
-            worker = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # Never DEVNULL: a worker that dies before it can record its own
+            # state (import failure, OOM) leaves this log as the only evidence.
+            with worker_log.open("wb") as worker_output:
+                worker = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=worker_output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
         except OSError as error:
             state = json.loads(state_path.read_text())
             state.update(
@@ -129,11 +169,94 @@ class LocalBackend:
             raise BackendRequestError(
                 f"could not start local workload: {error}"
             ) from error
-        threading.Thread(target=worker.wait, daemon=True).start()
+        write_json_atomic(
+            self._launcher_path(workload.trial),
+            {
+                "schema_version": "1.0",
+                "launcher_pid": worker.pid,
+                "started_at": _now(),
+                "log": str(worker_log),
+            },
+        )
+        threading.Thread(
+            target=self._watch_launcher,
+            args=(worker, workload.trial),
+            daemon=True,
+        ).start()
         self._handles[
             backend_registry_key(workload.workload_id, workload.trial)
         ] = handle
         return handle
+
+    def _startup_failure(
+        self,
+        trial: Path,
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Detect a worker that will never reach a terminal state.
+
+        The worker records ``worker_pid`` only after the interpreter has booted
+        and imported brunner. If it dies before that, the state file still says
+        ``pending`` with no PID, and without this check the trial stays pending
+        forever.
+        """
+        worker_pid = state.get("worker_pid")
+        if isinstance(worker_pid, int):
+            if _is_alive(worker_pid):
+                return None
+            return {
+                "reason": "WorkerLost",
+                "message": (
+                    "local backend worker exited without recording "
+                    "terminal state"
+                ),
+            }
+        launcher = self._launcher(trial)
+        exit_code = launcher.get("exit_code")
+        if isinstance(exit_code, int):
+            return {
+                "reason": "WorkerStartFailed",
+                "message": (
+                    f"local backend worker exited with code {exit_code} "
+                    "before it started the workload; see "
+                    f"{self._root(trial) / 'worker.log'}"
+                ),
+                "exit_code": exit_code,
+            }
+        launcher_pid = launcher.get("launcher_pid")
+        if isinstance(launcher_pid, int) and not _is_alive(launcher_pid):
+            return {
+                "reason": "WorkerStartFailed",
+                "message": (
+                    "local backend worker vanished before it started the "
+                    f"workload; see {self._root(trial) / 'worker.log'}"
+                ),
+            }
+        if launcher_pid is None:
+            # The launcher record is written just after the worker starts, so
+            # a missing one is only conclusive once that window has passed.
+            if self._submitted_seconds_ago(state) > LAUNCH_GRACE_SECONDS:
+                return {
+                    "reason": "WorkerMissing",
+                    "message": (
+                        "local backend state exists but no worker was ever "
+                        "launched for it"
+                    ),
+                }
+        return None
+
+    @staticmethod
+    def _submitted_seconds_ago(state: dict[str, Any]) -> float:
+        submitted_at = state.get("submitted_at")
+        if not submitted_at:
+            return float("inf")
+        try:
+            submitted = datetime.fromisoformat(str(submitted_at))
+        except ValueError:
+            return float("inf")
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - submitted).total_seconds()
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
         state_path = self._state_path(handle.trial)
@@ -145,16 +268,14 @@ class LocalBackend:
             )
         state = json.loads(state_path.read_text())
         phase = str(state.get("phase", "unknown"))
-        worker_pid = state.get("worker_pid") or state.get("launcher_pid")
-        if phase in {"pending", "running"} and isinstance(worker_pid, int):
-            if not _is_alive(worker_pid):
+        if phase in {"pending", "running"}:
+            failure = self._startup_failure(handle.trial, state)
+            if failure is not None:
                 phase = "failed"
                 state.update(
                     {
                         "phase": phase,
-                        "reason": "WorkerLost",
-                        "message": "local backend worker exited without "
-                        "recording terminal state",
+                        **failure,
                         "finished_at": _now(),
                     }
                 )
@@ -204,13 +325,18 @@ class LocalBackend:
             return
         state = json.loads(state_path.read_text())
         if state.get("phase") in {"pending", "running"}:
-            for key in ("workload_pid", "worker_pid", "launcher_pid"):
-                pid = state.get(key)
+            launcher = self._launcher(handle.trial)
+            candidates = (
+                state.get("workload_pid"),
+                state.get("worker_pid"),
+                launcher.get("launcher_pid"),
+            )
+            for pid in candidates:
                 if not isinstance(pid, int) or not _is_alive(pid):
                     continue
                 try:
                     os.killpg(pid, signal.SIGTERM)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
         state.update(
             {

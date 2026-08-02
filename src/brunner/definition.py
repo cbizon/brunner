@@ -9,6 +9,7 @@ from typing import Any
 from brunner.errors import ConfigurationError
 from brunner.hashing import sha256_file, sha256_tree
 from brunner.providers.base import ProviderSettings
+from brunner.timing import DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS
 
 
 def _relative_path(value: str, *, field_name: str) -> str:
@@ -434,6 +435,11 @@ class RuntimeDefaults:
     retry_max_seconds: float = 15 * 60
     provider_exit_grace_seconds: float = 60
     backend_shutdown_grace_seconds: float = 2 * 60
+    max_attempts: int = 50
+    max_activity_interval_seconds: float | None = (
+        DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS
+    )
+    submission_poll_seconds: float = 2.0
 
     def validate(self) -> None:
         if self.timeout_seconds <= 0:
@@ -455,6 +461,21 @@ class RuntimeDefaults:
         if self.backend_shutdown_grace_seconds <= 0:
             raise ConfigurationError(
                 "backend shutdown grace period must be positive"
+            )
+        if self.max_attempts < 1:
+            raise ConfigurationError(
+                "runtime max_attempts must be positive"
+            )
+        if (
+            self.max_activity_interval_seconds is not None
+            and self.max_activity_interval_seconds <= 0
+        ):
+            raise ConfigurationError(
+                "max_activity_interval_seconds must be positive or None"
+            )
+        if self.submission_poll_seconds < 0:
+            raise ConfigurationError(
+                "submission_poll_seconds cannot be negative"
             )
 
 

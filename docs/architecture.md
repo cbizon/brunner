@@ -219,6 +219,28 @@ Undeclared orphan process groups are terminated and reaped before the attempt
 returns, so artifact collection cannot race a leftover child process or a
 child that writes files after the provider leader exits.
 
+Liveness is never inferred from bookkeeping alone. A declared interval defers
+the soft deadline only while it is credibly open: Brunner ignores starts from
+earlier attempts, releases intervals whose holding process has exited, and
+caps any interval at `max_activity_interval_seconds`. Released intervals are
+recorded as `activity_interval_stale` timing events. The open-interval set is
+maintained incrementally from bytes appended to the activity log, so polling
+cost does not grow with the length of the run. Revalidating the submission
+after a successful terminal event is throttled to
+`submission_poll_seconds`, because that check rehashes every artifact and
+would otherwise run on every poll and delay deadline enforcement.
+
+Once the provider leader is reaped its PID can be recycled, so Brunner stops
+signalling the recorded process group `ORPHAN_SWEEP_MAX_SECONDS` after the
+leader exits rather than trusting the PID indefinitely. Stream pumps that stay
+blocked on a pipe inherited by a grandchild are unblocked by closing the pipe,
+and any output that arrives after the logs close is counted rather than lost
+to an exception inside a daemon thread.
+
+A trial stops after `max_attempts` provider invocations. Without that bound a
+provider that fails immediately would retry for the whole trial window and
+bury the original failure.
+
 Rejected subscription boundaries are distinct from ordinary retry backoff.
 When a provider exposes a reset epoch, Brunner waits directly for that
 boundary and records the interval as `subscription_wait`.
@@ -239,7 +261,12 @@ submit -> inspect -> logs -> collect -> cleanup
                    capacity
 ```
 
-`LocalBackend` launches a detached state-writing worker. `ContainerBackend`
+`LocalBackend` launches a detached state-writing worker. The worker can only
+record its own PID after its interpreter has started, so the launcher records
+`launcher.json` with its process ID and eventual exit code, and captures the
+worker's output to `backend/local/worker.log`. A worker that dies before it
+takes ownership of the state file is therefore reported as failed instead of
+leaving the trial pending forever. `ContainerBackend`
 bind-mounts the trial into an OCI runtime. `KubernetesBackend` creates a PVC,
 stages the trial through a helper pod, creates a Job, and recovers files
 through reader pods.
@@ -280,6 +307,13 @@ Campaign reconciliation:
 - Retries interrupted artifact transfers with a bounded, configurable policy
 - Keeps integrity and evaluation failures durable instead of retrying them
 - Continues healthy running or pending trials when another needs attention
+- Flags a trial the backend still reports as pending or running past
+  `trial_timeout_seconds`, which defaults to the backend workload deadline
+  plus `trial_timeout_margin_seconds`
+- Stops waiting on an unreachable backend after `max_pause_seconds` instead of
+  polling a disconnected backend indefinitely
+- Bounds evaluation with `evaluation_timeout_seconds`; reconciliation is
+  sequential, so an unbounded evaluator would block every other trial
 - Does not clean up when recovery fails
 - Runs trusted evaluation after verified collection
 - Runs configured assessments after deterministic evaluation

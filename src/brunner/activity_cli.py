@@ -53,6 +53,7 @@ def execute(argv: Sequence[str] | None = None) -> int:
         args.activity_id,
         label=args.label,
         log_path=args.log,
+        guard_pid=True,
     )
     try:
         return subprocess.run(program, check=False).returncode

@@ -103,6 +103,8 @@ def build_definition() -> BenchmarkDefinition:
             timeout_seconds=6 * 60 * 60,
             finalization_seconds=15 * 60,
             backend_shutdown_grace_seconds=2 * 60,
+            max_attempts=50,
+            max_activity_interval_seconds=6 * 60 * 60,
         ),
     )
 ```
@@ -357,6 +359,33 @@ its exit grace starts.
 Undeclared child processes are reaped as an orphaned process group before the
 attempt returns.
 
+An interval that is never closed cannot hold the trial open indefinitely.
+Brunner releases it when:
+
+- it was started by an earlier attempt, whose process group is already gone;
+- the process holding it open has exited; or
+- it has run longer than `RuntimeDefaults.max_activity_interval_seconds`
+  (six hours by default).
+
+Prefer the forms that let Brunner check the second rule, because they survive
+a benchmark crash:
+
+```python
+with activity("background_job", "case-a"):   # holds the interval
+    run_simulation()
+```
+
+```sh
+brunner-activity run background_job case-a -- python simulate.py
+```
+
+A bare `brunner-activity start` exits immediately, so its PID proves nothing
+about the work. That form is still supported, but a missing `end` is caught
+only by the maximum-interval rule. Raise
+`max_activity_interval_seconds` for benchmarks with legitimately longer single
+intervals, or set it to `None` to rely on the hard deadline alone. Released
+intervals appear as `activity_interval_stale` events in `timing/events.jsonl`.
+
 ## Output Contract
 
 Use the submission schema for manifest structure and artifact entries for
@@ -546,6 +575,23 @@ shows those warnings with live elapsed time.
 workload deadline, leaving time for terminal state and accounting artifacts
 to be written after the agent deadline. Keep it positive and large enough for
 the selected backend to stop and persist the runner cleanly.
+
+Campaigns bound the states a stuck backend can hide in:
+
+| Setting | Purpose | Default |
+| --- | --- | --- |
+| `trial_timeout_seconds` | Flags a trial the backend still reports pending or running | Backend workload deadline plus `trial_timeout_margin_seconds` |
+| `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
+| `max_pause_seconds` | Stops waiting on an unreachable backend | 1 hour |
+| `evaluation_timeout_seconds` | Caps evaluation, which runs inline | Benchmark evaluation timeout |
+
+Reconciliation is sequential, so an evaluator that hangs blocks every other
+trial in the campaign until its timeout expires. Set
+`evaluation_timeout_seconds` to something much smaller than
+`EvaluationDefinition.timeout_seconds` when a campaign has many trials.
+Exceeding `trial_timeout_seconds` or `max_pause_seconds` moves the campaign to
+`attention_required` rather than cancelling anything, so no remote workload is
+destroyed on a slow but healthy run.
 
 ## CLI
 

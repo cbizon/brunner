@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -369,3 +370,122 @@ def test_artifact_reader_failure_includes_kubernetes_warning(
         match="FailedMount: storage aggregate is offline",
     ):
         backend._reader(handle, 1, ())
+
+
+def test_local_backend_detects_worker_that_never_started(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    backend = LocalBackend()
+    # A worker command that dies before it can record worker_pid: this used to
+    # leave the trial reporting "pending" forever.
+    handle = backend.submit(
+        WorkloadSpec(
+            workload_id="broken",
+            trial=trial,
+            command=(sys.executable, "-c", "raise SystemExit(9)"),
+            timeout_seconds=30,
+        )
+    )
+    state_path = trial / "backend/local/state.json"
+    state = json.loads(state_path.read_text())
+    state.pop("worker_pid", None)
+    state["phase"] = "pending"
+    state_path.write_text(json.dumps(state))
+    launcher_path = trial / "backend/local/launcher.json"
+    launcher = json.loads(launcher_path.read_text())
+    launcher["exit_code"] = 9
+    launcher_path.write_text(json.dumps(launcher))
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.reason == "WorkerStartFailed"
+
+
+def test_local_backend_records_launcher_pid_and_worker_log(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    backend = LocalBackend()
+    backend.submit(
+        WorkloadSpec(
+            workload_id="logged",
+            trial=trial,
+            command=(sys.executable, "-c", "pass"),
+            timeout_seconds=30,
+        )
+    )
+
+    launcher = json.loads(
+        (trial / "backend/local/launcher.json").read_text()
+    )
+
+    assert isinstance(launcher["launcher_pid"], int)
+    assert (trial / "backend/local/worker.log").is_file()
+
+
+def test_local_backend_tolerates_worker_still_starting(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    root = trial / "backend/local"
+    root.mkdir(parents=True)
+    # State written by submit() but neither the worker nor the launcher record
+    # has landed yet: that window must not be reported as a failure.
+    (root / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "backend": "local",
+                "workload_id": "starting",
+                "phase": "pending",
+                "submitted_at": datetime.now(UTC).isoformat(),
+            }
+        )
+    )
+    backend = LocalBackend()
+    handle = BackendHandle(
+        backend="local",
+        workload_id="starting",
+        native_id="starting",
+        trial=trial,
+    )
+
+    assert backend.inspect(handle).phase == "pending"
+
+
+def test_local_backend_reports_worker_that_never_launched(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    root = trial / "backend/local"
+    root.mkdir(parents=True)
+    stale = datetime.now(UTC) - timedelta(seconds=600)
+    (root / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "backend": "local",
+                "workload_id": "orphan",
+                "phase": "pending",
+                "submitted_at": stale.isoformat(),
+            }
+        )
+    )
+    backend = LocalBackend()
+    handle = BackendHandle(
+        backend="local",
+        workload_id="orphan",
+        native_id="orphan",
+        trial=trial,
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.reason == "WorkerMissing"

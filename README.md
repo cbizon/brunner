@@ -132,6 +132,15 @@ valid, preventing premature termination while final artifacts are still being
 written without allowing a nonfinal event to consume the reserved finalization
 window.
 
+A declared interval only defers the deadline while it is credibly still open.
+Brunner releases an interval whose start belongs to an earlier attempt, whose
+holding process has exited, or that has outlived
+`RuntimeDefaults.max_activity_interval_seconds`. Without those rules a single
+unmatched `start` would suppress finalization for the rest of the trial. The
+`activity` context manager and `brunner-activity run` record the holding
+process so it can be checked; a bare `brunner-activity start` cannot be
+checked that way and is bounded only by the maximum interval.
+
 When a provider exposes the model that produced a primary response, Brunner
 verifies it against the requested model. A provider-side substitution, such
 as a safety downgrade from Fable to Opus, terminates the attempt as

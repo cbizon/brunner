@@ -205,8 +205,21 @@ def evaluate_trial(
     definition: BenchmarkDefinition,
     contract: OutputContract,
     trial: Path,
+    *,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
+    """Run trusted evaluation.
+
+    ``timeout_seconds`` overrides the benchmark's own evaluation timeout. A
+    campaign uses it to bound a wedged evaluator, which would otherwise block
+    every other trial for the benchmark's full timeout.
+    """
     trial = trial.resolve()
+    evaluation_timeout = (
+        definition.evaluation.timeout_seconds
+        if timeout_seconds is None
+        else min(timeout_seconds, definition.evaluation.timeout_seconds)
+    )
     results_path = trial / definition.evaluation.results_path
     results_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path = results_path.with_name("evaluator.stdout.log")
@@ -271,9 +284,7 @@ def evaluate_trial(
                     definition.reference.validate_command,
                     cwd=definition.reference.root,
                     environment=environment,
-                    timeout_seconds=(
-                        definition.evaluation.timeout_seconds
-                    ),
+                    timeout_seconds=evaluation_timeout,
                     stdout_path=results_path.with_name(
                         "reference-validator.stdout.log"
                     ),
@@ -296,7 +307,7 @@ def evaluate_trial(
             command,
             cwd=cwd,
             environment=process_environment,
-            timeout_seconds=definition.evaluation.timeout_seconds,
+            timeout_seconds=evaluation_timeout,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )

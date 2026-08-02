@@ -29,6 +29,8 @@ packages = ["src/brunner"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Tests import the bundled example benchmarks from the repository root.
+pythonpath = ["."]
 
 [tool.coverage.run]
 branch = true

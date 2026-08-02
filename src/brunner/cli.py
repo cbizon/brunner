@@ -147,6 +147,11 @@ def _runtime(
         backend_shutdown_grace_seconds=(
             defaults.backend_shutdown_grace_seconds
         ),
+        max_attempts=defaults.max_attempts,
+        max_activity_interval_seconds=(
+            defaults.max_activity_interval_seconds
+        ),
+        submission_poll_seconds=defaults.submission_poll_seconds,
     )
 
 
