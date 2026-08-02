@@ -106,6 +106,10 @@ class CampaignPlan:
     included_artifact_groups: frozenset[str] = frozenset()
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
+    trial_timeout_seconds: float | None = None
+    trial_timeout_margin_seconds: float = 5 * 60
+    max_pause_seconds: float | None = 60 * 60
+    evaluation_timeout_seconds: float | None = None
 
     def validate(self) -> None:
         if not self.campaign_id.strip():
@@ -121,6 +125,28 @@ class CampaignPlan:
         if self.collection_max_attempts < 1:
             raise ValueError(
                 "campaign collection_max_attempts must be positive"
+            )
+        if (
+            self.trial_timeout_seconds is not None
+            and self.trial_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "campaign trial_timeout_seconds must be positive or None"
+            )
+        if self.trial_timeout_margin_seconds < 0:
+            raise ValueError(
+                "campaign trial_timeout_margin_seconds cannot be negative"
+            )
+        if self.max_pause_seconds is not None and self.max_pause_seconds <= 0:
+            raise ValueError(
+                "campaign max_pause_seconds must be positive or None"
+            )
+        if (
+            self.evaluation_timeout_seconds is not None
+            and self.evaluation_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "campaign evaluation_timeout_seconds must be positive or None"
             )
         identities: dict[str, dict[str, Any]] = {}
         for trial in self.trials:
@@ -146,6 +172,12 @@ class CampaignPlan:
             ),
             "collection_retry_seconds": self.collection_retry_seconds,
             "collection_max_attempts": self.collection_max_attempts,
+            "trial_timeout_seconds": self.trial_timeout_seconds,
+            "trial_timeout_margin_seconds": (
+                self.trial_timeout_margin_seconds
+            ),
+            "max_pause_seconds": self.max_pause_seconds,
+            "evaluation_timeout_seconds": self.evaluation_timeout_seconds,
         }
 
 
@@ -462,13 +494,64 @@ class CampaignRunner:
     ) -> dict[str, Any]:
         state["status"] = "paused_backend_connectivity"
         state["pause_reason"] = str(error)
+        paused_since = state.get("paused_since")
+        if not paused_since:
+            paused_since = _now()
+            state["paused_since"] = paused_since
         self._event(
             state,
             "backend_connectivity",
             str(error),
         )
+        if self.plan.max_pause_seconds is not None:
+            try:
+                since = datetime.fromisoformat(str(paused_since))
+            except ValueError:
+                since = datetime.now(UTC)
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=UTC)
+            paused_seconds = (datetime.now(UTC) - since).total_seconds()
+            if paused_seconds > self.plan.max_pause_seconds:
+                # A campaign that waits forever looks identical to one that is
+                # working; surface it instead.
+                state["status"] = "attention_required"
+                state["has_attention"] = True
+                state["pause_reason"] = (
+                    f"backend unreachable for {paused_seconds:.0f}s: {error}"
+                )
+                self._event(
+                    state,
+                    "backend_connectivity_timeout",
+                    state["pause_reason"],
+                )
         self._save(state)
         return state
+
+    def _trial_timeout_seconds(self) -> float:
+        if self.plan.trial_timeout_seconds is not None:
+            return self.plan.trial_timeout_seconds
+        # Default to the backend's own workload deadline plus a margin: past
+        # that point the backend itself is stuck, so nothing else will stop it.
+        runtime = self.definition.runtime
+        return (
+            runtime.timeout_seconds
+            + runtime.backend_shutdown_grace_seconds
+            + self.plan.trial_timeout_margin_seconds
+        )
+
+    def _overdue_seconds(self, entry: dict[str, Any]) -> float | None:
+        submitted_at = entry.get("submitted_at")
+        if not submitted_at:
+            return None
+        try:
+            submitted = datetime.fromisoformat(str(submitted_at))
+        except ValueError:
+            return None
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - submitted).total_seconds()
+        limit = self._trial_timeout_seconds()
+        return elapsed if elapsed > limit else None
 
     def _campaign_trial(
         self,
@@ -578,6 +661,7 @@ class CampaignRunner:
                 self.definition,
                 self.contract,
                 destination,
+                timeout_seconds=self.plan.evaluation_timeout_seconds,
             )
         except (
             BrunnerError,
@@ -658,6 +742,7 @@ class CampaignRunner:
             return
         entry["phase"] = "complete"
         entry["completed_at"] = _now()
+        entry["backend_workload_live"] = False
         entry.pop("cleanup_error", None)
         self._event(
             state,
@@ -702,6 +787,7 @@ class CampaignRunner:
                     continue
                 entry["phase"] = "complete"
                 entry["completed_at"] = _now()
+                entry["backend_workload_live"] = False
                 entry.pop("cleanup_error", None)
                 self._event(
                     state,
@@ -777,8 +863,26 @@ class CampaignRunner:
                 )
                 continue
             entry["backend_snapshot"] = snapshot.to_dict()
+            entry["backend_workload_live"] = snapshot.phase in {
+                "pending",
+                "running",
+            }
             if snapshot.phase in {"pending", "running"}:
                 entry["phase"] = snapshot.phase
+                overdue = self._overdue_seconds(entry)
+                if overdue is not None:
+                    entry["phase"] = "attention_required"
+                    entry["error"] = (
+                        f"backend still reports {snapshot.phase} "
+                        f"{overdue:.0f}s after submission, past the "
+                        f"{self._trial_timeout_seconds():.0f}s limit"
+                    )
+                    self._event(
+                        state,
+                        "trial_overdue",
+                        entry["error"],
+                        test_id=entry["test_id"],
+                    )
                 continue
             if snapshot.phase in {"succeeded", "failed"}:
                 log_path = Path(entry["trial"]) / "backend/workload.log"
@@ -810,18 +914,25 @@ class CampaignRunner:
                     f"{snapshot.reason or snapshot.message or ''}"
                 )
 
+        # A trial needing attention normally frees its slot, but not while the
+        # backend still reports its workload as pending or running: an overdue
+        # trial is still consuming a real slot, and releasing it would let the
+        # campaign exceed max_parallel.
         active = sum(
             bool(entry.get("handle"))
-            and entry["phase"] in {
-                "submitted",
-                "pending",
-                "running",
-                "collection_pending",
-                "collection_retry_wait",
-                "collecting",
-                "evaluating",
-                "cleanup_pending",
-            }
+            and (
+                entry["phase"] in {
+                    "submitted",
+                    "pending",
+                    "running",
+                    "collection_pending",
+                    "collection_retry_wait",
+                    "collecting",
+                    "evaluating",
+                    "cleanup_pending",
+                }
+                or bool(entry.get("backend_workload_live"))
+            )
             for entry in state["trials"]
         )
         available_by_plan = max(0, self.plan.max_parallel - active)
@@ -910,6 +1021,9 @@ class CampaignRunner:
         else:
             state["status"] = "running"
             state["has_attention"] = False
+        # Reaching here means no step paused, so the pause clock resets. It
+        # must not reset on every attempt, or the pause timeout never fires.
+        state.pop("paused_since", None)
         self._save(state)
         return state
 

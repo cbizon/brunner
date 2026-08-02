@@ -440,6 +440,7 @@ def _run_prepare_command(
     input_path: Path,
     benchmark_input_path: Path,
     environment: dict[str, str],
+    timeout_seconds: float,
 ) -> dict[str, Any] | None:
     if not assessment.prepare_command:
         return None
@@ -447,7 +448,7 @@ def _run_prepare_command(
         assessment.prepare_command,
         cwd=assessment.root,
         environment=environment,
-        timeout_seconds=assessment.timeout_seconds,
+        timeout_seconds=timeout_seconds,
         stdout_path=work_root / "prepare.stdout.log",
         stderr_path=work_root / "prepare.stderr.log",
     )
@@ -558,6 +559,7 @@ def _run_reviewer(
     work_root: Path,
     output_path: Path,
     schema: dict[str, Any],
+    timeout_seconds: float,
 ) -> tuple[list[dict[str, Any]], dict[str, int] | None]:
     assert assessment.reviewer is not None
     adapter = get_provider(assessment.reviewer.provider)
@@ -603,7 +605,7 @@ def _run_reviewer(
             if transcript.exists():
                 shutil.copytree(transcript, destination)
 
-        deadline = time.time() + assessment.timeout_seconds
+        deadline = time.time() + timeout_seconds
         retry_seconds = assessment.retry_initial_seconds
         attempts = []
         prompt = _reviewer_prompt(assessment, isolated_workspace)
@@ -612,7 +614,7 @@ def _run_reviewer(
             if time.time() >= deadline:
                 last_error = (
                     "assessment reviewer exceeded "
-                    f"{assessment.timeout_seconds} seconds"
+                    f"{timeout_seconds} seconds"
                 )
                 break
             events = attempts_root / f"{number:04d}.events.jsonl"
@@ -1019,8 +1021,21 @@ def run_assessment(
     assessment: AssessmentDefinition,
     trial: Path,
     evaluation: dict[str, Any],
+    *,
+    deadline_epoch: float | None = None,
 ) -> dict[str, Any]:
     trial = trial.resolve()
+
+    def assessment_timeout() -> float:
+        # Share one budget with the rest of evaluation so a chain of
+        # assessments cannot outlive the caller's deadline.
+        if deadline_epoch is None:
+            return assessment.timeout_seconds
+        return min(
+            assessment.timeout_seconds,
+            max(0.0, deadline_epoch - time.time()),
+        )
+
     work_root = trial / "assessments" / assessment.assessment_id
     work_root.mkdir(parents=True, exist_ok=True)
     result_path = work_root / "result.json"
@@ -1088,6 +1103,7 @@ def run_assessment(
             input_path=input_path,
             benchmark_input_path=benchmark_input_path,
             environment=environment,
+            timeout_seconds=assessment_timeout(),
         )
         if benchmark_input is not None:
             dossier["benchmark_input"] = benchmark_input
@@ -1113,6 +1129,7 @@ def run_assessment(
                     work_root=work_root,
                     output_path=output_path,
                     schema=schema,
+                    timeout_seconds=assessment_timeout(),
                 )
             except ReviewerAssessmentError as error:
                 attempts = error.attempts
@@ -1123,7 +1140,7 @@ def run_assessment(
                 assessment.command,
                 cwd=assessment.root,
                 environment=environment,
-                timeout_seconds=assessment.timeout_seconds,
+                timeout_seconds=assessment_timeout(),
                 stdout_path=work_root / "assessment.stdout.log",
                 stderr_path=work_root / "assessment.stderr.log",
             )
@@ -1152,7 +1169,7 @@ def run_assessment(
                 assessment.render_command,
                 cwd=assessment.root,
                 environment=environment,
-                timeout_seconds=assessment.timeout_seconds,
+                timeout_seconds=assessment_timeout(),
                 stdout_path=work_root / "render.stdout.log",
                 stderr_path=work_root / "render.stderr.log",
             )
@@ -1242,6 +1259,8 @@ def run_assessments(
     contract: OutputContract,
     trial: Path,
     evaluation: dict[str, Any],
+    *,
+    deadline_epoch: float | None = None,
 ) -> dict[str, Any]:
     results = [
         run_assessment(
@@ -1250,6 +1269,7 @@ def run_assessments(
             assessment,
             trial,
             evaluation,
+            deadline_epoch=deadline_epoch,
         )
         for assessment in definition.assessments
     ]

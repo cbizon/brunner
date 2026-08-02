@@ -30,8 +30,9 @@ from brunner.submission import validate_submission
 from brunner.trial import load_trial_identity
 from brunner.timing import (
     ACTIVITY_LOG_ENV,
+    DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS,
+    ActivityTracker,
     TimingRecorder,
-    active_activity_keys,
     build_time_accounting,
     epoch_to_iso,
 )
@@ -42,6 +43,8 @@ PROVIDER_FINAL_STATUSES = frozenset({"complete", "partial", "failed"})
 PIPELINE_TERMINAL_STATUSES = frozenset(
     {*PROVIDER_FINAL_STATUSES, "provider_error", "timeout"}
 )
+STREAM_DRAIN_SECONDS = 5.0
+STREAM_CLOSE_SECONDS = 2.0
 PROTECTED_CONTROL_PATHS = (
     "metadata",
     "backend",
@@ -186,19 +189,59 @@ def terminate_process(
     return True
 
 
+class StreamSink:
+    """Serialize writes to the attempt and combined logs.
+
+    A pump thread can outlive ``run_attempt`` when a grandchild inherited the
+    pipe, so writes have to be refused once the files close rather than raising
+    inside a daemon thread and silently dropping the rest of the stream.
+    """
+
+    def __init__(
+        self,
+        attempt_output: IO[str],
+        combined_output: IO[str],
+    ) -> None:
+        self._lock = threading.Lock()
+        self._closed = False
+        self._attempt = attempt_output
+        self._combined = combined_output
+        self.dropped_lines = 0
+
+    def write(self, line: str) -> None:
+        with self._lock:
+            if self._closed:
+                self.dropped_lines += 1
+                return
+            try:
+                self._attempt.write(line)
+                self._attempt.flush()
+                self._combined.write(line)
+                self._combined.flush()
+            except (OSError, ValueError):
+                self._closed = True
+                self.dropped_lines += 1
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+
 def pump_stream(
     source: IO[str],
-    attempt_output: IO[str],
-    combined_output: IO[str],
+    sink: StreamSink,
     on_line: Callable[[str], None] | None = None,
 ) -> None:
-    for line in source:
-        attempt_output.write(line)
-        attempt_output.flush()
-        combined_output.write(line)
-        combined_output.flush()
-        if on_line is not None:
-            on_line(line)
+    try:
+        for line in source:
+            sink.write(line)
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:  # noqa: BLE001 - never kill the pump
+                    pass
+    except (OSError, ValueError):
+        return
 
 
 def snapshot_control_plane(
@@ -292,6 +335,11 @@ def run_attempt(
     timing_recorder: TimingRecorder | None = None,
     terminal_success_ready: Callable[[], bool] | None = None,
     requested_model: str | None = None,
+    attempt_start_epoch: float | None = None,
+    max_activity_interval_seconds: float | None = (
+        DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS
+    ),
+    submission_poll_seconds: float = 2.0,
 ) -> dict[str, Any]:
     terminal_seen = threading.Event()
     terminal_succeeded = threading.Event()
@@ -376,9 +424,16 @@ def run_attempt(
                     active_provider_activities.add(
                         activity.activity_id
                     )
+                    provider_activity_started[activity.activity_id] = (
+                        recorded_epoch
+                    )
                 elif activity.phase == "end":
                     active_provider_activities.discard(
                         activity.activity_id
+                    )
+                    provider_activity_started.pop(
+                        activity.activity_id,
+                        None,
                     )
             if timing_recorder is not None:
                 timing_recorder.emit(
@@ -404,13 +459,36 @@ def run_attempt(
                 terminal_exit_ready.set()
             terminal_seen.set()
 
+    activity_tracker = (
+        ActivityTracker(
+            external_activity_path,
+            since_epoch=attempt_start_epoch,
+            max_interval_seconds=max_activity_interval_seconds,
+        )
+        if external_activity_path is not None
+        else None
+    )
+    provider_activity_started: dict[str, float] = {}
+
     def active_work() -> bool:
         with activity_lock:
             if active_provider_activities:
-                return True
+                if max_activity_interval_seconds is None:
+                    return True
+                now = time.time()
+                expired = {
+                    activity_id
+                    for activity_id in active_provider_activities
+                    if now - provider_activity_started.get(activity_id, now)
+                    > max_activity_interval_seconds
+                }
+                # A provider that never emits the matching tool-end event must
+                # not hold the attempt open for the rest of the trial.
+                active_provider_activities.difference_update(expired)
+                if active_provider_activities:
+                    return True
         return bool(
-            external_activity_path is not None
-            and active_activity_keys(external_activity_path)
+            activity_tracker is not None and activity_tracker.active()
         )
 
     with (
@@ -450,6 +528,9 @@ def run_attempt(
                 "soft_deadline_activity_seen": False,
                 "launch_error": launch_error,
                 "prompt_delivery_error": None,
+                "stream_pump_incomplete": False,
+                "dropped_output_lines": 0,
+                "stale_activity_intervals": [],
                 "requested_model": requested_model,
                 "observed_models": [],
                 "model_mismatch": None,
@@ -458,12 +539,13 @@ def run_attempt(
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
+        stdout_sink = StreamSink(attempt_stdout, combined_stdout)
+        stderr_sink = StreamSink(attempt_error, combined_error)
         stdout_thread = threading.Thread(
             target=pump_stream,
             args=(
                 process.stdout,
-                attempt_stdout,
-                combined_stdout,
+                stdout_sink,
                 inspect_line,
             ),
             daemon=True,
@@ -472,8 +554,7 @@ def run_attempt(
             target=pump_stream,
             args=(
                 process.stderr,
-                attempt_error,
-                combined_error,
+                stderr_sink,
             ),
             daemon=True,
         )
@@ -508,6 +589,7 @@ def run_attempt(
         lingering_processes_terminated = False
         forced_termination_reason = None
         active_work_terminated = False
+        next_submission_poll = 0.0
         while process_group_alive(process.pid):
             work_is_active = active_work()
             now_epoch = time.time()
@@ -524,9 +606,15 @@ def run_attempt(
                 and terminal_succeeded.is_set()
                 and not terminal_exit_ready.is_set()
                 and terminal_success_ready is not None
-                and terminal_success_ready()
+                and now_monotonic >= next_submission_poll
             ):
-                terminal_exit_ready.set()
+                # Revalidating the submission rehashes every artifact, so it
+                # must not run on every 100ms tick.
+                next_submission_poll = (
+                    now_monotonic + submission_poll_seconds
+                )
+                if terminal_success_ready():
+                    terminal_exit_ready.set()
             if (
                 prompt_delivery_errors
                 and process.poll() is None
@@ -611,8 +699,28 @@ def run_attempt(
             prompt_delivery_errors.append(
                 "prompt delivery thread did not stop after provider exit"
             )
-        stdout_thread.join(timeout=10)
-        stderr_thread.join(timeout=10)
+        stdout_thread.join(timeout=STREAM_DRAIN_SECONDS)
+        stderr_thread.join(timeout=STREAM_DRAIN_SECONDS)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            # A grandchild that inherited the pipe (and its own session) can
+            # keep the read blocked forever. Force EOF so the pumps exit
+            # instead of leaving daemon threads writing into files we are
+            # about to close.
+            for stream in (process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            stdout_thread.join(timeout=STREAM_CLOSE_SECONDS)
+            stderr_thread.join(timeout=STREAM_CLOSE_SECONDS)
+        stream_pump_incomplete = (
+            stdout_thread.is_alive() or stderr_thread.is_alive()
+        )
+        stdout_sink.close()
+        stderr_sink.close()
+        dropped_output_lines = (
+            stdout_sink.dropped_lines + stderr_sink.dropped_lines
+        )
 
     provider_return_code = (
         process.returncode if process.returncode is not None else 124
@@ -643,6 +751,13 @@ def run_attempt(
         "active_work_terminated": active_work_terminated,
         "soft_deadline_activity_seen": soft_deadline_activity_seen,
         "launch_error": None,
+        "stream_pump_incomplete": stream_pump_incomplete,
+        "dropped_output_lines": dropped_output_lines,
+        "stale_activity_intervals": (
+            activity_tracker.stale_intervals()
+            if activity_tracker is not None
+            else []
+        ),
         "prompt_delivery_error": (
             prompt_delivery_errors[0] if prompt_delivery_errors else None
         ),
@@ -927,6 +1042,18 @@ def _run_configured_trial(
             continue
 
         attempt_number = len(state["attempts"]) + 1
+        if attempt_number > runtime.max_attempts:
+            # A provider that fails immediately would otherwise retry for the
+            # whole trial window and bury the original failure.
+            state["status"] = "provider_error"
+            state["failure"] = (
+                f"provider did not succeed within {runtime.max_attempts} "
+                "attempts"
+            )
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
         attempt_prefix = attempts_root / f"{attempt_number:04d}"
         attempt_events = attempt_prefix.with_suffix(".events.jsonl")
         attempt_stderr = attempt_prefix.with_suffix(".stderr.log")
@@ -1020,7 +1147,18 @@ def _run_configured_trial(
             timing_recorder=timing_recorder,
             terminal_success_ready=terminal_success_ready,
             requested_model=settings.model,
+            attempt_start_epoch=attempt_started_epoch,
+            max_activity_interval_seconds=(
+                runtime.max_activity_interval_seconds
+            ),
+            submission_poll_seconds=runtime.submission_poll_seconds,
         )
+        for stale in outcome.get("stale_activity_intervals", ()):
+            timing_recorder.emit(
+                "activity_interval_stale",
+                attempt=attempt_number,
+                **stale,
+            )
         control_plane_changes = restore_control_plane(
             trial,
             protected_control_plane,

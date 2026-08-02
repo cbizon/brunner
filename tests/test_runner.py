@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1247,3 +1248,137 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     assert metadata_path.read_bytes() == original_metadata
     assert agent_run_path.read_bytes() == original_agent_run
     assert not backend_rogue_path.exists()
+
+
+def _leaked_activity(
+    path: Path,
+    *,
+    epoch: float,
+    guard_pid: int | None = None,
+) -> None:
+    value: dict[str, object] = {
+        "schema_version": "1.0",
+        "event": "activity",
+        "phase": "start",
+        "category": "background_job",
+        "activity_id": "sim-1",
+        "source": "benchmark",
+        "epoch_seconds": epoch,
+    }
+    if guard_pid is not None:
+        value["guard_pid"] = guard_pid
+    path.write_text(json.dumps(value) + "\n")
+
+
+def _soft_deadline_attempt(
+    tmp_path: Path,
+    activity_log: Path,
+    **kwargs: object,
+) -> dict[str, object]:
+    return run_attempt(
+        adapter=CodexAdapter(),
+        command=(sys.executable, "-c", "import time; time.sleep(30)"),
+        workspace=tmp_path,
+        environment=os.environ.copy(),
+        prompt="",
+        attempt_events=tmp_path / "events.jsonl",
+        attempt_stderr=tmp_path / "stderr.log",
+        combined_events=tmp_path / "combined.jsonl",
+        combined_stderr=tmp_path / "combined.stderr.log",
+        deadline_epoch=time.time() + 20,
+        soft_deadline_epoch=time.time() - 1,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.2,
+        external_activity_path=activity_log,
+        **kwargs,
+    )
+
+
+def test_leaked_activity_from_earlier_attempt_does_not_block_deadline(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    _leaked_activity(log, epoch=time.time() - 100)
+
+    outcome = _soft_deadline_attempt(
+        tmp_path,
+        log,
+        attempt_start_epoch=time.time() - 10,
+    )
+
+    assert outcome["forced_termination_reason"] == "soft_deadline"
+
+
+def test_leaked_activity_with_dead_guard_does_not_block_deadline(
+    tmp_path: Path,
+) -> None:
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    log = tmp_path / "activity.jsonl"
+    _leaked_activity(log, epoch=time.time() - 100, guard_pid=finished.pid)
+
+    outcome = _soft_deadline_attempt(tmp_path, log)
+
+    assert outcome["forced_termination_reason"] == "soft_deadline"
+    assert outcome["stale_activity_intervals"]
+
+
+def test_leaked_activity_past_maximum_does_not_block_deadline(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    _leaked_activity(log, epoch=time.time() - 100)
+
+    outcome = _soft_deadline_attempt(
+        tmp_path,
+        log,
+        max_activity_interval_seconds=50,
+    )
+
+    assert outcome["forced_termination_reason"] == "soft_deadline"
+
+
+def test_live_guarded_activity_still_defers_soft_deadline(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    _leaked_activity(log, epoch=time.time() - 100, guard_pid=os.getpid())
+
+    started = time.monotonic()
+    outcome = _soft_deadline_attempt(tmp_path, log)
+
+    # Declared work held by a live process must still survive the soft
+    # deadline, up to the hard deadline.
+    assert outcome["forced_termination_reason"] == "hard_deadline"
+    assert time.monotonic() - started > 5
+
+
+def test_trial_stops_after_max_attempts(tmp_path: Path) -> None:
+    contract = load_output_contract(EXAMPLE_ROOT / "output-contract.json")
+    trial = create_trial(
+        definition(),
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("attempt-cap", "codex", "model-a", None),
+    )
+    failing = tmp_path / "failing-provider"
+    _write_executable(failing, "exit 3\n")
+
+    state = run_trial(
+        definition(),
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="model-a"),
+        runtime=RuntimeDefaults(
+            timeout_seconds=120,
+            finalization_seconds=60,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+            max_attempts=3,
+        ),
+        executable=str(failing),
+    )
+
+    assert state["status"] == "provider_error"
+    assert "3 attempts" in state["failure"]
+    assert len(state["attempts"]) == 3

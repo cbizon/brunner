@@ -127,6 +127,13 @@ def write_trial_metadata(
                 "backend_shutdown_grace_seconds": (
                     definition.runtime.backend_shutdown_grace_seconds
                 ),
+                "max_attempts": definition.runtime.max_attempts,
+                "max_activity_interval_seconds": (
+                    definition.runtime.max_activity_interval_seconds
+                ),
+                "submission_poll_seconds": (
+                    definition.runtime.submission_poll_seconds
+                ),
             },
         },
     )

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -576,7 +577,7 @@ def test_required_assessment_failure_marks_campaign_trial_failed(
 
     monkeypatch.setattr(
         "brunner.campaign.evaluate_trial",
-        lambda *args: {
+        lambda *args, **kwargs: {
             "status": "complete",
             "assessment_status": "failed",
             "required_assessments_complete": False,
@@ -936,3 +937,160 @@ def test_attention_on_one_trial_does_not_block_pending_submission(
     assert state["has_attention"] is True
     assert by_id["needs-attention"]["phase"] == "attention_required"
     assert by_id["next-run"]["phase"] == "submitted"
+
+
+class StuckBackend(ImmediateBackend):
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        return BackendSnapshot(phase="running")
+
+
+def test_campaign_flags_trial_that_never_leaves_running(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="stuck",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("stuck-a", "codex", "model-a"),),
+            trial_timeout_seconds=0.05,
+        ),
+        StuckBackend(),
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+    assert state["trials"][0]["phase"] == "submitted"
+
+    time.sleep(0.1)
+    state = runner.advance()
+
+    assert state["trials"][0]["phase"] == "attention_required"
+    assert "still reports running" in state["trials"][0]["error"]
+    assert state["status"] == "attention_required"
+
+
+def test_campaign_running_trial_within_timeout_is_not_flagged(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="patient",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("patient-a", "codex", "model-a"),),
+            trial_timeout_seconds=600,
+        ),
+        StuckBackend(),
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    state = runner.advance()
+
+    assert state["trials"][0]["phase"] == "running"
+    assert state["status"] == "running"
+
+
+def test_campaign_gives_up_after_prolonged_connectivity_loss(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="offline-limit",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("offline-a", "codex", "model-a"),),
+            max_pause_seconds=0.05,
+        ),
+        OfflineBackend(),
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+    assert state["status"] == "paused_backend_connectivity"
+
+    time.sleep(0.1)
+    state = runner.advance()
+
+    assert state["status"] == "attention_required"
+    assert "unreachable" in state["pause_reason"]
+
+
+def test_campaign_pause_clock_resets_after_connectivity_returns(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = FlakyConnectivityBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="recovered",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("recovered-a", "codex", "model-a"),),
+            max_pause_seconds=600,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+    assert state["status"] == "paused_backend_connectivity"
+    assert state["paused_since"]
+
+    state = runner.run(poll_seconds=0.01)
+
+    assert "paused_since" not in state
+
+
+def test_overdue_trial_keeps_holding_its_backend_slot(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = StuckBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="capacity",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("stuck-a", "codex", "model-a"),
+                CampaignTrial("next-run", "codex", "model-a"),
+            ),
+            max_parallel=1,
+            trial_timeout_seconds=0.05,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    time.sleep(0.1)
+    state = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in state["trials"]}
+
+    # The overdue workload is still running on the backend, so the second
+    # trial must not be submitted on top of it.
+    assert by_id["stuck-a"]["phase"] == "attention_required"
+    assert by_id["next-run"]["phase"] == "pending"
+    assert len(backend.handles) == 1

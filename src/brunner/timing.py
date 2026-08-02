@@ -15,6 +15,7 @@ ACTIVITY_LOG_ENV = "BRUNNER_ACTIVITY_LOG"
 EXTERNAL_ACTIVITY_CATEGORIES = frozenset(
     {"background_job", "external_wait"}
 )
+DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS = 6 * 60 * 60
 EXCLUSIVE_CATEGORIES = (
     "subscription_wait",
     "runner_retry_wait",
@@ -89,7 +90,16 @@ def record_activity(
     *,
     label: str | None = None,
     log_path: Path | None = None,
+    guard_pid: bool = False,
 ) -> dict[str, Any]:
+    """Append one activity event.
+
+    ``guard_pid`` marks the calling process as holding the interval open for
+    its whole lifetime. Only set it from wrappers that outlive the declared
+    work (the ``activity`` context manager and ``brunner-activity run``); a
+    bare ``brunner-activity start`` exits immediately, so its PID says
+    nothing about whether the work is still running.
+    """
     if phase not in {"start", "end"}:
         raise ValueError("activity phase must be 'start' or 'end'")
     if category not in EXTERNAL_ACTIVITY_CATEGORIES:
@@ -117,6 +127,8 @@ def record_activity(
         "epoch_seconds": epoch,
         "pid": os.getpid(),
     }
+    if guard_pid and phase == "start":
+        value["guard_pid"] = os.getpid()
     _append_external_event(selected, value)
     return value
 
@@ -135,6 +147,7 @@ def activity(
         activity_id,
         label=label,
         log_path=log_path,
+        guard_pid=True,
     )
     try:
         yield
@@ -170,6 +183,197 @@ def read_timing_events(*paths: Path) -> list[dict[str, Any]]:
             int(value.get("sequence", 0)),
         ),
     )
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+@dataclass(frozen=True)
+class OpenActivity:
+    key: tuple[str, str, str]
+    epoch_seconds: float
+    guard_pid: int | None
+    label: str | None
+
+
+class ActivityTracker:
+    """Incrementally track which declared activity intervals are still open.
+
+    The activity log is append-only and shared by every attempt in a trial, so
+    re-reading it on each poll is quadratic over a long run. This reads only
+    bytes appended since the last refresh.
+
+    An open interval only counts as live work when it is not *stale*. An
+    interval is stale when the process that promised to hold it open has died,
+    when it started before the current attempt (nothing survives an attempt --
+    the runner reaps the process group), or when it has outlived
+    ``max_interval_seconds``. Without those rules a single unmatched ``start``
+    suppresses the soft deadline and the terminal exit grace for the rest of
+    the trial.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        since_epoch: float | None = None,
+        max_interval_seconds: float | None = (
+            DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS
+        ),
+    ) -> None:
+        self.path = path
+        self.since_epoch = since_epoch
+        self.max_interval_seconds = max_interval_seconds
+        self._offset = 0
+        self._buffer = ""
+        self._identity: tuple[int, int] | None = None
+        self._open: dict[tuple[str, str, str], list[OpenActivity]] = {}
+        self._stale: dict[
+            tuple[tuple[str, str, str], float],
+            dict[str, Any],
+        ] = {}
+
+    def _reset(self) -> None:
+        self._offset = 0
+        self._buffer = ""
+        self._open.clear()
+
+    def _consume(self, line: str) -> None:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(value, dict) or value.get("event") != "activity":
+            return
+        epoch = value.get("epoch_seconds")
+        category = value.get("category")
+        activity_id = value.get("activity_id")
+        source = value.get("source", "benchmark")
+        if not isinstance(epoch, (int, float)):
+            return
+        if not all(
+            isinstance(item, str)
+            for item in (source, category, activity_id)
+        ):
+            return
+        key = (str(source), str(category), str(activity_id))
+        phase = value.get("phase")
+        if phase == "end":
+            if self._open.get(key):
+                # Close the most recent start. A leaked start for a reused
+                # activity ID would otherwise swallow this end and leave the
+                # freshly completed interval looking active.
+                self._open[key].pop()
+                if not self._open[key]:
+                    del self._open[key]
+            return
+        if phase != "start":
+            return
+        if (
+            self.since_epoch is not None
+            and float(epoch) < self.since_epoch
+        ):
+            # Belongs to an earlier attempt whose process group is gone.
+            return
+        guard = value.get("guard_pid")
+        self._open.setdefault(key, []).append(
+            OpenActivity(
+                key=key,
+                epoch_seconds=float(epoch),
+                guard_pid=guard if isinstance(guard, int) else None,
+                label=(
+                    value.get("label")
+                    if isinstance(value.get("label"), str)
+                    else None
+                ),
+            )
+        )
+
+    def refresh(self) -> None:
+        try:
+            status = self.path.stat()
+        except OSError:
+            return
+        size = status.st_size
+        identity = (status.st_dev, status.st_ino)
+        if self._identity is not None and identity != self._identity:
+            # Replaced rather than appended to; a same-size replacement would
+            # otherwise look like no change at all.
+            self._reset()
+        elif size < self._offset:
+            self._reset()
+        self._identity = identity
+        if size == self._offset:
+            return
+        try:
+            with self.path.open("r", errors="replace") as stream:
+                stream.seek(self._offset)
+                chunk = stream.read()
+                self._offset = stream.tell()
+        except OSError:
+            return
+        self._buffer += chunk
+        *lines, self._buffer = self._buffer.split("\n")
+        for line in lines:
+            if line.strip():
+                self._consume(line)
+
+    def _is_stale(self, item: OpenActivity, now: float) -> str | None:
+        if item.guard_pid is not None and not pid_alive(item.guard_pid):
+            return "guard process exited without ending the interval"
+        if (
+            self.max_interval_seconds is not None
+            and now - item.epoch_seconds > self.max_interval_seconds
+        ):
+            return (
+                "interval exceeded "
+                f"{self.max_interval_seconds} seconds without ending"
+            )
+        return None
+
+    def active(self, *, now: float | None = None) -> set[tuple[str, str, str]]:
+        self.refresh()
+        current = time.time() if now is None else now
+        live: set[tuple[str, str, str]] = set()
+        for key in list(self._open):
+            remaining = []
+            for item in self._open[key]:
+                reason = self._is_stale(item, current)
+                if reason is None:
+                    remaining.append(item)
+                    live.add(key)
+                    continue
+                # Drop it rather than leaving it in the queue, where a later
+                # end event for a reused ID could pair with it.
+                self._stale.setdefault(
+                    (key, item.epoch_seconds),
+                    {
+                        "source": key[0],
+                        "category": key[1],
+                        "activity_id": key[2],
+                        "label": item.label,
+                        "started_at": epoch_to_iso(item.epoch_seconds),
+                        "released_at": epoch_to_iso(current),
+                        "reason": reason,
+                    },
+                )
+            if remaining:
+                self._open[key] = remaining
+            else:
+                del self._open[key]
+        return live
+
+    def stale_intervals(self) -> list[dict[str, Any]]:
+        return list(self._stale.values())
 
 
 def active_activity_keys(path: Path) -> set[tuple[str, str, str]]:
@@ -235,6 +439,22 @@ def _duration(intervals: list[tuple[float, float]]) -> float:
     return sum(end - start for start, end in _merge_intervals(intervals))
 
 
+def _matching_release(
+    releases: list[dict[str, Any]],
+    started_epoch: float,
+) -> dict[str, Any] | None:
+    """Take the release recorded for this particular start, if any.
+
+    Releases carry the start time they refer to, so a reused activity ID does
+    not let one start consume another's release.
+    """
+    for index, release in enumerate(releases):
+        recorded = _iso_to_epoch(release.get("started_at"))
+        if recorded is None or abs(recorded - started_epoch) < 0.001:
+            return releases.pop(index)
+    return None
+
+
 def _pair_activity_events(
     events: list[dict[str, Any]],
     *,
@@ -244,6 +464,21 @@ def _pair_activity_events(
     open_events: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     intervals = []
     limitations = []
+    # The runner releases intervals it judged stale. Accounting must end them
+    # where they were released, not run them to the end of the trial.
+    released: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for event in events:
+        if event.get("event") != "activity_interval_stale":
+            continue
+        category = event.get("category")
+        activity_id = event.get("activity_id")
+        source = str(event.get("source", "benchmark"))
+        if not isinstance(category, str) or not isinstance(activity_id, str):
+            continue
+        released.setdefault(
+            (source, category, activity_id),
+            [],
+        ).append(event)
     for event in events:
         if event.get("event") != "activity":
             continue
@@ -287,10 +522,20 @@ def _pair_activity_events(
             }
         )
     for (source, category, activity_id), starts in open_events.items():
+        pending_releases = list(
+            released.get((source, category, activity_id), ())
+        )
         for start_event in starts:
+            started_epoch = float(start_event["epoch_seconds"])
+            release = _matching_release(pending_releases, started_epoch)
+            stop_epoch = (
+                float(release["epoch_seconds"])
+                if release is not None
+                else wall_end
+            )
             clipped = _clip_interval(
-                float(start_event["epoch_seconds"]),
-                wall_end,
+                started_epoch,
+                stop_epoch,
                 wall_start,
                 wall_end,
             )
@@ -312,9 +557,18 @@ def _pair_activity_events(
                     "_end": end,
                 }
             )
-            limitations.append(
-                f"unmatched activity start: {source}/{category}/{activity_id}"
-            )
+            if release is not None:
+                intervals[-1]["released"] = True
+                intervals[-1]["release_reason"] = release.get("reason")
+                limitations.append(
+                    f"released stale activity: {source}/{category}/"
+                    f"{activity_id}: {release.get('reason')}"
+                )
+            else:
+                limitations.append(
+                    "unmatched activity start: "
+                    f"{source}/{category}/{activity_id}"
+                )
     return intervals, limitations
 
 

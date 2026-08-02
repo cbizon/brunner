@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -8,6 +10,8 @@ import pytest
 
 from brunner.activity_cli import execute as execute_activity
 from brunner.timing import (
+    ActivityTracker,
+    _pair_activity_events,
     build_time_accounting,
     epoch_to_iso,
     record_activity,
@@ -244,3 +248,263 @@ def test_activity_cli_wraps_external_wait_command(tmp_path: Path) -> None:
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert return_code == 0
     assert [record["phase"] for record in records] == ["start", "end"]
+
+
+def _activity_line(
+    phase: str,
+    epoch: float,
+    *,
+    activity_id: str = "sim-1",
+    guard_pid: int | None = None,
+) -> str:
+    value: dict[str, object] = {
+        "schema_version": "1.0",
+        "event": "activity",
+        "phase": phase,
+        "category": "background_job",
+        "activity_id": activity_id,
+        "source": "benchmark",
+        "epoch_seconds": epoch,
+    }
+    if guard_pid is not None:
+        value["guard_pid"] = guard_pid
+    return json.dumps(value) + "\n"
+
+
+def _dead_pid() -> int:
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait()
+    return process.pid
+
+
+def test_activity_tracker_pairs_start_and_end(tmp_path: Path) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log)
+
+    assert tracker.active(now=110.0)
+
+    log.write_text(
+        _activity_line("start", 100.0) + _activity_line("end", 120.0)
+    )
+    assert not tracker.active(now=130.0)
+
+
+def test_activity_tracker_reads_only_appended_bytes(tmp_path: Path) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log)
+    tracker.active(now=110.0)
+    first_offset = tracker._offset
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("start", 105.0, activity_id="sim-2"))
+    tracker.active(now=110.0)
+
+    assert tracker._offset > first_offset
+    assert len(tracker._open) == 2
+
+
+def test_activity_tracker_ignores_starts_from_earlier_attempts(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log, since_epoch=200.0)
+
+    assert not tracker.active(now=210.0)
+
+
+def test_activity_tracker_releases_interval_with_dead_guard(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0, guard_pid=_dead_pid()))
+    tracker = ActivityTracker(log)
+
+    assert not tracker.active(now=110.0)
+    assert tracker.stale_intervals()[0]["reason"].startswith("guard process")
+
+
+def test_activity_tracker_keeps_interval_with_live_guard(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0, guard_pid=os.getpid()))
+    tracker = ActivityTracker(log)
+
+    assert tracker.active(now=110.0)
+
+
+def test_activity_tracker_releases_interval_past_maximum(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log, max_interval_seconds=50)
+
+    assert tracker.active(now=140.0)
+    assert not tracker.active(now=200.0)
+
+
+def test_activity_tracker_recovers_from_truncated_log(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(
+        _activity_line("start", 100.0)
+        + _activity_line("start", 101.0, activity_id="sim-2")
+    )
+    tracker = ActivityTracker(log)
+    assert len(tracker.active(now=110.0)) == 2
+
+    log.write_text(_activity_line("start", 300.0, activity_id="sim-9"))
+    active = tracker.active(now=310.0)
+
+    assert active == {("benchmark", "background_job", "sim-9")}
+
+
+def test_activity_tracker_recovers_from_replaced_log(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log)
+    assert tracker.active(now=110.0)
+
+    # A workspace restored from a collected trial yields a different inode
+    # with, potentially, identical length.
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(
+        _activity_line("start", 300.0, activity_id="sim-9")
+    )
+    replacement.replace(log)
+    active = tracker.active(now=310.0)
+
+    assert active == {("benchmark", "background_job", "sim-9")}
+
+
+def test_activity_run_wrapper_records_guard_pid(tmp_path: Path) -> None:
+    log = tmp_path / "activity.jsonl"
+    execute_activity(
+        [
+            "--log",
+            str(log),
+            "run",
+            "background_job",
+            "case-a",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ]
+    )
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+
+    assert events[0]["phase"] == "start"
+    assert events[0]["guard_pid"] == os.getpid()
+
+
+def test_bare_activity_start_records_no_guard_pid(tmp_path: Path) -> None:
+    log = tmp_path / "activity.jsonl"
+    execute_activity(
+        ["--log", str(log), "start", "background_job", "case-a"]
+    )
+    event = json.loads(log.read_text().splitlines()[0])
+
+    # The starting process exits immediately, so its PID proves nothing.
+    assert "guard_pid" not in event
+
+
+def test_reused_activity_id_does_not_pair_with_stale_start(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    dead = _dead_pid()
+    # A leaked start, then the same ID reused and properly closed.
+    log.write_text(_activity_line("start", 100.0, guard_pid=dead))
+    tracker = ActivityTracker(log)
+    assert not tracker.active(now=110.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("start", 200.0, guard_pid=os.getpid()))
+    assert tracker.active(now=210.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("end", 220.0))
+
+    # The end must close the interval it belongs to, not the leaked one.
+    assert not tracker.active(now=230.0)
+
+
+def test_stale_start_is_dropped_from_the_pairing_queue(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log, max_interval_seconds=50)
+    assert not tracker.active(now=200.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("start", 300.0, guard_pid=os.getpid()))
+        stream.write(_activity_line("end", 310.0))
+
+    assert not tracker.active(now=320.0)
+    assert tracker._open == {}
+
+
+def test_accounting_ends_released_interval_at_release_time() -> None:
+    events = [
+        {
+            "schema_version": "1.0",
+            "event": "activity",
+            "phase": "start",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "epoch_seconds": 100.0,
+        },
+        {
+            "schema_version": "1.0",
+            "event": "activity_interval_stale",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "started_at": epoch_to_iso(100.0),
+            "reason": "guard process exited without ending the interval",
+            "epoch_seconds": 130.0,
+        },
+    ]
+    intervals, limitations = _pair_activity_events(
+        events,
+        wall_start=90.0,
+        wall_end=500.0,
+    )
+
+    assert len(intervals) == 1
+    # Without the release the wait would be charged through to wall_end.
+    assert intervals[0]["duration_seconds"] == 30.0
+    assert intervals[0]["released"] is True
+    assert any("released stale activity" in item for item in limitations)
+
+
+def test_accounting_still_runs_unreleased_start_to_trial_end() -> None:
+    events = [
+        {
+            "schema_version": "1.0",
+            "event": "activity",
+            "phase": "start",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "epoch_seconds": 100.0,
+        },
+    ]
+    intervals, limitations = _pair_activity_events(
+        events,
+        wall_start=90.0,
+        wall_end=500.0,
+    )
+
+    assert intervals[0]["duration_seconds"] == 400.0
+    assert any("unmatched activity start" in item for item in limitations)

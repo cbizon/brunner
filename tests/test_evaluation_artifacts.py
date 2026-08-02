@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ from brunner.artifacts import (
 from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
 from brunner.errors import ContractError, IntegrityError
+from brunner import evaluation as evaluation_module
 from brunner.evaluation import evaluate_trial, evaluator_invocation
 from brunner.reference import (
     build_reference_manifest,
@@ -299,3 +302,75 @@ def test_evaluator_container_invocation_mounts_reference_read_only(
     assert "dst=/brunner/reference,readonly" in encoded
     assert cwd == trial.resolve()
     assert process_environment is not environment
+
+
+
+def test_evaluation_timeout_is_one_shared_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = build_numeric_definition()
+    # A reference validator that consumes part of the budget before the
+    # evaluator runs.
+    definition = replace(
+        base,
+        reference=replace(
+            base.reference,
+            validate_command=(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(0.4)",
+            ),
+        ),
+    )
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            test_id="budget",
+            provider="codex",
+            model="fake",
+            effort=None,
+        ),
+    )
+    submission = trial / "workspace/submission"
+    submission.mkdir()
+    (submission / "results.json").write_text(
+        json.dumps({"results": [4, 9, 25, 49]})
+    )
+    (submission / "manifest.json").write_text(
+        json.dumps({"schema_version": "1.0", "results": "results.json"})
+    )
+    (submission / "run-status.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "submission_manifest": "submission/manifest.json",
+                "completed_units": ["square-values"],
+                "limitations": [],
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    recorded: list[float] = []
+    real_run = evaluation_module._run_evaluator
+
+    def capture(command, **kwargs):
+        recorded.append(kwargs["timeout_seconds"])
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(evaluation_module, "_run_evaluator", capture)
+
+    evaluate_trial(definition, contract, trial, timeout_seconds=30)
+
+    assert len(recorded) == 2
+    assert recorded[0] <= 30
+    # The evaluator gets what the reference validator left, not a fresh 30s.
+    assert recorded[1] < recorded[0] - 0.3
