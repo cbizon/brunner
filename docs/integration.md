@@ -583,7 +583,7 @@ Campaigns bound the states a stuck backend can hide in:
 | `trial_timeout_seconds` | Flags a trial the backend still reports pending or running | Backend workload deadline plus `trial_timeout_margin_seconds` |
 | `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
 | `max_pause_seconds` | Stops waiting on an unreachable backend | 1 hour |
-| `evaluation_timeout_seconds` | Caps evaluation, which runs inline | Benchmark evaluation timeout |
+| `evaluation_timeout_seconds` | One budget shared by reference validation, the evaluator, and all assessments | Benchmark evaluation timeout |
 
 Reconciliation is sequential, so an evaluator that hangs blocks every other
 trial in the campaign until its timeout expires. Set
@@ -591,7 +591,10 @@ trial in the campaign until its timeout expires. Set
 `EvaluationDefinition.timeout_seconds` when a campaign has many trials.
 Exceeding `trial_timeout_seconds` or `max_pause_seconds` moves the campaign to
 `attention_required` rather than cancelling anything, so no remote workload is
-destroyed on a slow but healthy run.
+destroyed on a slow but healthy run. An overdue trial keeps its slot reserved
+while the backend still reports the workload as pending or running, so the
+campaign cannot quietly exceed `max_parallel` by submitting on top of work
+that is still executing.
 
 ## CLI
 

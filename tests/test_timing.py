@@ -11,6 +11,7 @@ import pytest
 from brunner.activity_cli import execute as execute_activity
 from brunner.timing import (
     ActivityTracker,
+    _pair_activity_events,
     build_time_accounting,
     epoch_to_iso,
     record_activity,
@@ -413,3 +414,97 @@ def test_bare_activity_start_records_no_guard_pid(tmp_path: Path) -> None:
 
     # The starting process exits immediately, so its PID proves nothing.
     assert "guard_pid" not in event
+
+
+def test_reused_activity_id_does_not_pair_with_stale_start(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    dead = _dead_pid()
+    # A leaked start, then the same ID reused and properly closed.
+    log.write_text(_activity_line("start", 100.0, guard_pid=dead))
+    tracker = ActivityTracker(log)
+    assert not tracker.active(now=110.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("start", 200.0, guard_pid=os.getpid()))
+    assert tracker.active(now=210.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("end", 220.0))
+
+    # The end must close the interval it belongs to, not the leaked one.
+    assert not tracker.active(now=230.0)
+
+
+def test_stale_start_is_dropped_from_the_pairing_queue(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(_activity_line("start", 100.0))
+    tracker = ActivityTracker(log, max_interval_seconds=50)
+    assert not tracker.active(now=200.0)
+
+    with log.open("a") as stream:
+        stream.write(_activity_line("start", 300.0, guard_pid=os.getpid()))
+        stream.write(_activity_line("end", 310.0))
+
+    assert not tracker.active(now=320.0)
+    assert tracker._open == {}
+
+
+def test_accounting_ends_released_interval_at_release_time() -> None:
+    events = [
+        {
+            "schema_version": "1.0",
+            "event": "activity",
+            "phase": "start",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "epoch_seconds": 100.0,
+        },
+        {
+            "schema_version": "1.0",
+            "event": "activity_interval_stale",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "started_at": epoch_to_iso(100.0),
+            "reason": "guard process exited without ending the interval",
+            "epoch_seconds": 130.0,
+        },
+    ]
+    intervals, limitations = _pair_activity_events(
+        events,
+        wall_start=90.0,
+        wall_end=500.0,
+    )
+
+    assert len(intervals) == 1
+    # Without the release the wait would be charged through to wall_end.
+    assert intervals[0]["duration_seconds"] == 30.0
+    assert intervals[0]["released"] is True
+    assert any("released stale activity" in item for item in limitations)
+
+
+def test_accounting_still_runs_unreleased_start_to_trial_end() -> None:
+    events = [
+        {
+            "schema_version": "1.0",
+            "event": "activity",
+            "phase": "start",
+            "category": "external_wait",
+            "activity_id": "sim-1",
+            "source": "benchmark",
+            "epoch_seconds": 100.0,
+        },
+    ]
+    intervals, limitations = _pair_activity_events(
+        events,
+        wall_start=90.0,
+        wall_end=500.0,
+    )
+
+    assert intervals[0]["duration_seconds"] == 400.0
+    assert any("unmatched activity start" in item for item in limitations)

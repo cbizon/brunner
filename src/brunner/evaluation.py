@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 import traceback
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -220,6 +221,13 @@ def evaluate_trial(
         if timeout_seconds is None
         else min(timeout_seconds, definition.evaluation.timeout_seconds)
     )
+    # One shared budget across reference validation, the evaluator, and every
+    # assessment. Handing each step the full timeout would let a bounded
+    # evaluation still run for a multiple of it.
+    evaluation_deadline = time.monotonic() + evaluation_timeout
+
+    def remaining_seconds() -> float:
+        return max(0.0, evaluation_deadline - time.monotonic())
     results_path = trial / definition.evaluation.results_path
     results_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path = results_path.with_name("evaluator.stdout.log")
@@ -284,7 +292,7 @@ def evaluate_trial(
                     definition.reference.validate_command,
                     cwd=definition.reference.root,
                     environment=environment,
-                    timeout_seconds=evaluation_timeout,
+                    timeout_seconds=remaining_seconds(),
                     stdout_path=results_path.with_name(
                         "reference-validator.stdout.log"
                     ),
@@ -307,7 +315,7 @@ def evaluate_trial(
             command,
             cwd=cwd,
             environment=process_environment,
-            timeout_seconds=evaluation_timeout,
+            timeout_seconds=remaining_seconds(),
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
@@ -389,6 +397,7 @@ def evaluate_trial(
         contract,
         trial,
         result,
+        deadline_epoch=time.time() + remaining_seconds(),
     )
     result["assessment_status"] = assessment_index["status"]
     result["required_assessments_complete"] = assessment_index[

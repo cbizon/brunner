@@ -223,19 +223,26 @@ Liveness is never inferred from bookkeeping alone. A declared interval defers
 the soft deadline only while it is credibly open: Brunner ignores starts from
 earlier attempts, releases intervals whose holding process has exited, and
 caps any interval at `max_activity_interval_seconds`. Released intervals are
-recorded as `activity_interval_stale` timing events. The open-interval set is
+recorded as `activity_interval_stale` timing events, and time accounting ends
+them where they were released rather than charging them to the end of the
+trial. A released interval is also dropped from the pairing queue, so a later
+`end` for a reused activity ID closes the interval it belongs to. The open-interval set is
 maintained incrementally from bytes appended to the activity log, so polling
 cost does not grow with the length of the run. Revalidating the submission
 after a successful terminal event is throttled to
 `submission_poll_seconds`, because that check rehashes every artifact and
 would otherwise run on every poll and delay deadline enforcement.
 
-Once the provider leader is reaped its PID can be recycled, so Brunner stops
-signalling the recorded process group `ORPHAN_SWEEP_MAX_SECONDS` after the
-leader exits rather than trusting the PID indefinitely. Stream pumps that stay
-blocked on a pipe inherited by a grandchild are unblocked by closing the pipe,
-and any output that arrives after the logs close is counted rather than lost
-to an exception inside a daemon thread.
+Stream pumps that stay blocked on a pipe inherited by a grandchild are
+unblocked by closing the pipe, and any output that arrives after the logs
+close is counted rather than lost to an exception inside a daemon thread.
+
+Brunner keeps monitoring the provider's process group until it is gone, even
+after the leader has been reaped, because abandoning it would let descendants
+write into the workspace while artifacts are being collected. Reaping the
+leader frees its PID, so a recycled PID could in principle make the group
+check report a stranger's group. That residual race is accepted: losing the
+orphan-reaping guarantee is the worse failure.
 
 A trial stops after `max_attempts` provider invocations. Without that bound a
 provider that fails immediately would retry for the whole trial window and
@@ -312,8 +319,13 @@ Campaign reconciliation:
   plus `trial_timeout_margin_seconds`
 - Stops waiting on an unreachable backend after `max_pause_seconds` instead of
   polling a disconnected backend indefinitely
-- Bounds evaluation with `evaluation_timeout_seconds`; reconciliation is
-  sequential, so an unbounded evaluator would block every other trial
+- Bounds evaluation with `evaluation_timeout_seconds`, shared as one budget
+  across reference validation, the evaluator, and every assessment;
+  reconciliation is sequential, so an unbounded evaluator would block every
+  other trial
+- Keeps an overdue trial's backend slot reserved while the backend still
+  reports its workload as pending or running, so flagging it cannot let the
+  campaign exceed `max_parallel`
 - Does not clean up when recovery fails
 - Runs trusted evaluation after verified collection
 - Runs configured assessments after deterministic evaluation

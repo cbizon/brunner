@@ -43,7 +43,6 @@ PROVIDER_FINAL_STATUSES = frozenset({"complete", "partial", "failed"})
 PIPELINE_TERMINAL_STATUSES = frozenset(
     {*PROVIDER_FINAL_STATUSES, "provider_error", "timeout"}
 )
-ORPHAN_SWEEP_MAX_SECONDS = 30.0
 STREAM_DRAIN_SECONDS = 5.0
 STREAM_CLOSE_SECONDS = 2.0
 PROTECTED_CONTROL_PATHS = (
@@ -148,20 +147,9 @@ def terminate_process(
     *,
     term_wait_seconds: float = 5,
     kill_wait_seconds: float = 2,
-    group_signal: bool = True,
 ) -> bool:
-    """Terminate a child and its process group.
-
-    ``group_signal`` must be False once the leader has been reaped long enough
-    ago that its PID could have been recycled: signalling the group would then
-    target an unrelated process group. See ``ORPHAN_SWEEP_MAX_SECONDS``.
-    """
     process_group_id = process.pid
     process.poll()
-    if not group_signal:
-        if process.poll() is None:
-            process.terminate()
-        return False
     if not process_group_alive(process_group_id):
         return False
     try:
@@ -601,39 +589,16 @@ def run_attempt(
         lingering_processes_terminated = False
         forced_termination_reason = None
         active_work_terminated = False
-        leader_reaped_monotonic: float | None = None
         next_submission_poll = 0.0
-
-        def group_signal_safe() -> bool:
-            # Once the leader is reaped its PID can be recycled, and signalling
-            # the group would hit an unrelated one. Allow a short sweep window
-            # for orphans, then stop trusting the PID.
-            return (
-                leader_reaped_monotonic is None
-                or time.monotonic() - leader_reaped_monotonic
-                <= ORPHAN_SWEEP_MAX_SECONDS
-            )
-
-        def group_alive() -> bool:
-            return group_signal_safe() and process_group_alive(process.pid)
-
-        while group_alive():
+        while process_group_alive(process.pid):
             work_is_active = active_work()
             now_epoch = time.time()
             now_monotonic = time.monotonic()
-            if (
-                leader_reaped_monotonic is None
-                and process.poll() is not None
-            ):
-                leader_reaped_monotonic = now_monotonic
             with model_lock:
                 mismatched_model = model_mismatch is not None
             if mismatched_model:
                 active_work_terminated = work_is_active
-                terminate_process(
-                    process,
-                    group_signal=group_signal_safe(),
-                )
+                terminate_process(process)
                 forced_termination_reason = "model_mismatch"
                 break
             if (
@@ -655,10 +620,7 @@ def run_attempt(
                 and process.poll() is None
                 and not terminal_seen.is_set()
             ):
-                terminate_process(
-                    process,
-                    group_signal=group_signal_safe(),
-                )
+                terminate_process(process)
                 forced_termination_reason = "prompt_delivery_error"
                 break
             if terminal_exit_ready.is_set():
@@ -670,10 +632,7 @@ def run_attempt(
                     now_monotonic - terminal_idle_since
                     >= terminal_exit_grace_seconds
                 ):
-                    terminate_process(
-                        process,
-                        group_signal=group_signal_safe(),
-                    )
+                    terminate_process(process)
                     lingering_processes_terminated = True
                     forced_termination_reason = "terminal_exit_grace"
                     break
@@ -686,27 +645,18 @@ def run_attempt(
                     now_monotonic - leader_exited_idle_since
                     >= terminal_exit_grace_seconds
                 ):
-                    terminate_process(
-                        process,
-                        group_signal=group_signal_safe(),
-                    )
+                    terminate_process(process)
                     lingering_processes_terminated = True
                     forced_termination_reason = "orphaned_process_group"
                     break
             if stop_requested.is_set():
                 active_work_terminated = work_is_active
-                terminate_process(
-                    process,
-                    group_signal=group_signal_safe(),
-                )
+                terminate_process(process)
                 forced_termination_reason = "stop_requested"
                 break
             if now_epoch >= deadline_epoch:
                 active_work_terminated = work_is_active
-                terminate_process(
-                    process,
-                    group_signal=group_signal_safe(),
-                )
+                terminate_process(process)
                 forced_termination_reason = "hard_deadline"
                 break
             if (
@@ -724,10 +674,7 @@ def run_attempt(
                         now_monotonic - soft_deadline_idle_since
                         >= terminal_exit_grace_seconds
                     ):
-                        terminate_process(
-                            process,
-                            group_signal=group_signal_safe(),
-                        )
+                        terminate_process(process)
                         forced_termination_reason = "soft_deadline"
                         break
             wait_seconds = 0.1

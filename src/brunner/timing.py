@@ -237,7 +237,10 @@ class ActivityTracker:
         self._buffer = ""
         self._identity: tuple[int, int] | None = None
         self._open: dict[tuple[str, str, str], list[OpenActivity]] = {}
-        self._stale: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._stale: dict[
+            tuple[tuple[str, str, str], float],
+            dict[str, Any],
+        ] = {}
 
     def _reset(self) -> None:
         self._offset = 0
@@ -266,7 +269,10 @@ class ActivityTracker:
         phase = value.get("phase")
         if phase == "end":
             if self._open.get(key):
-                self._open[key].pop(0)
+                # Close the most recent start. A leaked start for a reused
+                # activity ID would otherwise swallow this end and leave the
+                # freshly completed interval looking active.
+                self._open[key].pop()
                 if not self._open[key]:
                     del self._open[key]
             return
@@ -338,21 +344,32 @@ class ActivityTracker:
         self.refresh()
         current = time.time() if now is None else now
         live: set[tuple[str, str, str]] = set()
-        for key, items in self._open.items():
-            for item in items:
+        for key in list(self._open):
+            remaining = []
+            for item in self._open[key]:
                 reason = self._is_stale(item, current)
                 if reason is None:
+                    remaining.append(item)
                     live.add(key)
                     continue
-                if key not in self._stale:
-                    self._stale[key] = {
+                # Drop it rather than leaving it in the queue, where a later
+                # end event for a reused ID could pair with it.
+                self._stale.setdefault(
+                    (key, item.epoch_seconds),
+                    {
                         "source": key[0],
                         "category": key[1],
                         "activity_id": key[2],
                         "label": item.label,
                         "started_at": epoch_to_iso(item.epoch_seconds),
+                        "released_at": epoch_to_iso(current),
                         "reason": reason,
-                    }
+                    },
+                )
+            if remaining:
+                self._open[key] = remaining
+            else:
+                del self._open[key]
         return live
 
     def stale_intervals(self) -> list[dict[str, Any]]:
@@ -422,6 +439,22 @@ def _duration(intervals: list[tuple[float, float]]) -> float:
     return sum(end - start for start, end in _merge_intervals(intervals))
 
 
+def _matching_release(
+    releases: list[dict[str, Any]],
+    started_epoch: float,
+) -> dict[str, Any] | None:
+    """Take the release recorded for this particular start, if any.
+
+    Releases carry the start time they refer to, so a reused activity ID does
+    not let one start consume another's release.
+    """
+    for index, release in enumerate(releases):
+        recorded = _iso_to_epoch(release.get("started_at"))
+        if recorded is None or abs(recorded - started_epoch) < 0.001:
+            return releases.pop(index)
+    return None
+
+
 def _pair_activity_events(
     events: list[dict[str, Any]],
     *,
@@ -431,6 +464,21 @@ def _pair_activity_events(
     open_events: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     intervals = []
     limitations = []
+    # The runner releases intervals it judged stale. Accounting must end them
+    # where they were released, not run them to the end of the trial.
+    released: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for event in events:
+        if event.get("event") != "activity_interval_stale":
+            continue
+        category = event.get("category")
+        activity_id = event.get("activity_id")
+        source = str(event.get("source", "benchmark"))
+        if not isinstance(category, str) or not isinstance(activity_id, str):
+            continue
+        released.setdefault(
+            (source, category, activity_id),
+            [],
+        ).append(event)
     for event in events:
         if event.get("event") != "activity":
             continue
@@ -474,10 +522,20 @@ def _pair_activity_events(
             }
         )
     for (source, category, activity_id), starts in open_events.items():
+        pending_releases = list(
+            released.get((source, category, activity_id), ())
+        )
         for start_event in starts:
+            started_epoch = float(start_event["epoch_seconds"])
+            release = _matching_release(pending_releases, started_epoch)
+            stop_epoch = (
+                float(release["epoch_seconds"])
+                if release is not None
+                else wall_end
+            )
             clipped = _clip_interval(
-                float(start_event["epoch_seconds"]),
-                wall_end,
+                started_epoch,
+                stop_epoch,
                 wall_start,
                 wall_end,
             )
@@ -499,9 +557,18 @@ def _pair_activity_events(
                     "_end": end,
                 }
             )
-            limitations.append(
-                f"unmatched activity start: {source}/{category}/{activity_id}"
-            )
+            if release is not None:
+                intervals[-1]["released"] = True
+                intervals[-1]["release_reason"] = release.get("reason")
+                limitations.append(
+                    f"released stale activity: {source}/{category}/"
+                    f"{activity_id}: {release.get('reason')}"
+                )
+            else:
+                limitations.append(
+                    "unmatched activity start: "
+                    f"{source}/{category}/{activity_id}"
+                )
     return intervals, limitations
 
 

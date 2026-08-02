@@ -742,6 +742,7 @@ class CampaignRunner:
             return
         entry["phase"] = "complete"
         entry["completed_at"] = _now()
+        entry["backend_workload_live"] = False
         entry.pop("cleanup_error", None)
         self._event(
             state,
@@ -786,6 +787,7 @@ class CampaignRunner:
                     continue
                 entry["phase"] = "complete"
                 entry["completed_at"] = _now()
+                entry["backend_workload_live"] = False
                 entry.pop("cleanup_error", None)
                 self._event(
                     state,
@@ -861,6 +863,10 @@ class CampaignRunner:
                 )
                 continue
             entry["backend_snapshot"] = snapshot.to_dict()
+            entry["backend_workload_live"] = snapshot.phase in {
+                "pending",
+                "running",
+            }
             if snapshot.phase in {"pending", "running"}:
                 entry["phase"] = snapshot.phase
                 overdue = self._overdue_seconds(entry)
@@ -908,18 +914,25 @@ class CampaignRunner:
                     f"{snapshot.reason or snapshot.message or ''}"
                 )
 
+        # A trial needing attention normally frees its slot, but not while the
+        # backend still reports its workload as pending or running: an overdue
+        # trial is still consuming a real slot, and releasing it would let the
+        # campaign exceed max_parallel.
         active = sum(
             bool(entry.get("handle"))
-            and entry["phase"] in {
-                "submitted",
-                "pending",
-                "running",
-                "collection_pending",
-                "collection_retry_wait",
-                "collecting",
-                "evaluating",
-                "cleanup_pending",
-            }
+            and (
+                entry["phase"] in {
+                    "submitted",
+                    "pending",
+                    "running",
+                    "collection_pending",
+                    "collection_retry_wait",
+                    "collecting",
+                    "evaluating",
+                    "cleanup_pending",
+                }
+                or bool(entry.get("backend_workload_live"))
+            )
             for entry in state["trials"]
         )
         available_by_plan = max(0, self.plan.max_parallel - active)

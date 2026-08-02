@@ -1059,3 +1059,38 @@ def test_campaign_pause_clock_resets_after_connectivity_returns(
     state = runner.run(poll_seconds=0.01)
 
     assert "paused_since" not in state
+
+
+def test_overdue_trial_keeps_holding_its_backend_slot(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = StuckBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="capacity",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("stuck-a", "codex", "model-a"),
+                CampaignTrial("next-run", "codex", "model-a"),
+            ),
+            max_parallel=1,
+            trial_timeout_seconds=0.05,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    time.sleep(0.1)
+    state = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in state["trials"]}
+
+    # The overdue workload is still running on the backend, so the second
+    # trial must not be submitted on top of it.
+    assert by_id["stuck-a"]["phase"] == "attention_required"
+    assert by_id["next-run"]["phase"] == "pending"
+    assert len(backend.handles) == 1
