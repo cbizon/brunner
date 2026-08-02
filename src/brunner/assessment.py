@@ -1271,7 +1271,7 @@ def run_assessments(
             evaluation,
             deadline_epoch=deadline_epoch,
         )
-        for assessment in definition.assessments
+        for assessment in definition.resolved_assessments()
     ]
     required_complete = all(
         result["status"] == "complete"

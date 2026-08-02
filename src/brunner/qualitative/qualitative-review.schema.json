@@ -1,0 +1,418 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brunner.dev/schemas/qualitative-review.schema.json",
+  "title": "Brunner standard qualitative review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rubric_version",
+    "task_summary",
+    "approach",
+    "criteria",
+    "transcript_review",
+    "overall",
+    "review_limitations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "rubric_version": {
+      "const": "1.0"
+    },
+    "task_summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approach": {
+      "$ref": "#/$defs/approach"
+    },
+    "criteria": {
+      "$ref": "#/$defs/criteria"
+    },
+    "transcript_review": {
+      "$ref": "#/$defs/transcriptReview"
+    },
+    "overall": {
+      "$ref": "#/$defs/overall"
+    },
+    "review_limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "rating": {
+      "enum": [
+        "correct",
+        "mostly_correct",
+        "mostly_incorrect",
+        "incorrect",
+        "uncertain",
+        "not_applicable"
+      ]
+    },
+    "criterion": {
+      "allOf": [
+        {
+          "$ref": "https://brunner.dev/schemas/assessment-common.schema.json#/$defs/criterion"
+        },
+        {
+          "properties": {
+            "rating": {
+              "$ref": "#/$defs/rating"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "applicability": {
+                    "const": "not_applicable"
+                  }
+                },
+                "required": ["applicability"]
+              },
+              "then": {
+                "properties": {
+                  "rating": {
+                    "const": "not_applicable"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "applicability": {
+                    "const": "uncertain"
+                  }
+                },
+                "required": ["applicability"]
+              },
+              "then": {
+                "properties": {
+                  "rating": {
+                    "const": "uncertain"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "applicability": {
+                    "const": "applicable"
+                  }
+                },
+                "required": ["applicability"]
+              },
+              "then": {
+                "properties": {
+                  "rating": {
+                    "not": {
+                      "const": "not_applicable"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "approach": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_classification",
+        "components",
+        "output_provenance",
+        "confidence",
+        "summary",
+        "evidence"
+      ],
+      "properties": {
+        "primary_classification": {
+          "$ref": "#/$defs/approachClassification"
+        },
+        "components": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/approachClassification"
+          }
+        },
+        "output_provenance": {
+          "enum": [
+            "generated_by_submitted_implementation",
+            "postprocessed_from_submitted_implementation",
+            "prescribed_or_synthesized_independently",
+            "mixed",
+            "uncertain"
+          ]
+        },
+        "confidence": {
+          "enum": ["high", "medium", "low"]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "https://brunner.dev/schemas/assessment-common.schema.json#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "approachClassification": {
+      "enum": [
+        "direct_implementation",
+        "adaptation",
+        "approximation_or_heuristic",
+        "prescribed_or_hard_coded_output",
+        "hybrid",
+        "other",
+        "uncertain"
+      ]
+    },
+    "criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_fidelity",
+        "result_quality",
+        "implementation_quality",
+        "testing_and_validation",
+        "reproducibility",
+        "efficiency_and_time_use",
+        "rule_compliance",
+        "claims_and_evidence"
+      ],
+      "properties": {
+        "task_fidelity": {
+          "$ref": "#/$defs/criterion"
+        },
+        "result_quality": {
+          "$ref": "#/$defs/criterion"
+        },
+        "implementation_quality": {
+          "$ref": "#/$defs/criterion"
+        },
+        "testing_and_validation": {
+          "$ref": "#/$defs/criterion"
+        },
+        "reproducibility": {
+          "$ref": "#/$defs/criterion"
+        },
+        "efficiency_and_time_use": {
+          "$ref": "#/$defs/criterion"
+        },
+        "rule_compliance": {
+          "$ref": "#/$defs/criterion"
+        },
+        "claims_and_evidence": {
+          "$ref": "#/$defs/criterion"
+        }
+      }
+    },
+    "transcriptReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["narrative", "milestones", "time_accounting"],
+      "properties": {
+        "narrative": {
+          "type": "string",
+          "minLength": 1
+        },
+        "milestones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/milestone"
+          }
+        },
+        "time_accounting": {
+          "$ref": "#/$defs/timeAccounting"
+        }
+      }
+    },
+    "milestone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "phase",
+        "started_at",
+        "ended_at",
+        "summary",
+        "evidence"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "phase": {
+          "enum": [
+            "reading",
+            "planning",
+            "implementation",
+            "execution",
+            "validation",
+            "retry",
+            "wait",
+            "finalization",
+            "other"
+          ]
+        },
+        "started_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "https://brunner.dev/schemas/assessment-common.schema.json#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "timeAccounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "wall_seconds",
+        "agent_active_seconds",
+        "foreground_tool_seconds",
+        "external_wait_seconds",
+        "subscription_wait_seconds",
+        "runner_retry_wait_seconds",
+        "runner_overhead_seconds",
+        "unclassified_seconds",
+        "background_job_seconds",
+        "exclusive_partition",
+        "background_job_may_overlap",
+        "summary",
+        "limitations"
+      ],
+      "properties": {
+        "source": {
+          "enum": ["brunner_accounting", "partial_records", "insufficient"]
+        },
+        "wall_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "agent_active_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "foreground_tool_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "external_wait_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "subscription_wait_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "runner_retry_wait_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "runner_overhead_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "unclassified_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "background_job_seconds": {
+          "$ref": "#/$defs/seconds"
+        },
+        "exclusive_partition": {
+          "type": ["boolean", "null"]
+        },
+        "background_job_may_overlap": {
+          "type": ["boolean", "null"]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "seconds": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "overall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rating",
+        "confidence",
+        "bottom_line",
+        "strengths",
+        "major_failures",
+        "evidence"
+      ],
+      "properties": {
+        "rating": {
+          "enum": [
+            "excellent",
+            "strong",
+            "mixed",
+            "weak",
+            "failed",
+            "uncertain"
+          ]
+        },
+        "confidence": {
+          "enum": ["high", "medium", "low"]
+        },
+        "bottom_line": {
+          "type": "string",
+          "minLength": 1
+        },
+        "strengths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "major_failures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "https://brunner.dev/schemas/assessment-common.schema.json#/$defs/evidence"
+          }
+        }
+      }
+    }
+  }
+}

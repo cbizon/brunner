@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -387,6 +388,56 @@ class AssessmentDefinition:
 
 
 @dataclass(frozen=True)
+class QualitativeReviewDefinition:
+    reviewer: ProviderSettings
+    reviewer_executable: str | None = None
+    required: bool = False
+    run_if_evaluation_failed: bool = True
+    trial_evidence_paths: tuple[str, ...] = (
+        "workspace",
+        "transcript",
+        "timing",
+        "usage",
+        "status.json",
+        "backend/workload.log",
+    )
+    timeout_seconds: float = 60 * 60
+    max_attempts: int = 3
+    retry_initial_seconds: float = 10
+    retry_max_seconds: float = 60
+
+    def to_assessment(self) -> AssessmentDefinition:
+        root = Path(__file__).resolve().parent / "qualitative"
+        return AssessmentDefinition(
+            assessment_id="qualitative-review",
+            root=root,
+            prompt_path="reviewer-prompt.md",
+            rubric_paths=("RUBRIC.md",),
+            output_schema_path="qualitative-review.schema.json",
+            input_path="evaluation/qualitative-review-input.json",
+            output_path="evaluation/qualitative-review.json",
+            reviewer=self.reviewer,
+            reviewer_executable=self.reviewer_executable,
+            render_command=(sys.executable, str(root / "render.py")),
+            trial_evidence_paths=self.trial_evidence_paths,
+            reports=(
+                AssessmentReport(
+                    path="evaluation/qualitative-review.html",
+                    media_type="text/html",
+                    title="Qualitative review",
+                    primary=True,
+                ),
+            ),
+            required=self.required,
+            run_if_evaluation_failed=self.run_if_evaluation_failed,
+            timeout_seconds=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            retry_initial_seconds=self.retry_initial_seconds,
+            retry_max_seconds=self.retry_max_seconds,
+        )
+
+
+@dataclass(frozen=True)
 class ReferenceDefinition:
     root: Path
     manifest_path: str = "manifest.json"
@@ -491,6 +542,15 @@ class BenchmarkDefinition:
     reference: ReferenceDefinition | None = None
     artifacts: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
+    qualitative_review: QualitativeReviewDefinition | None = None
+
+    def resolved_assessments(self) -> tuple[AssessmentDefinition, ...]:
+        standard = (
+            (self.qualitative_review.to_assessment(),)
+            if self.qualitative_review is not None
+            else ()
+        )
+        return (*standard, *self.assessments)
 
     def validate(self) -> None:
         if not self.benchmark_id.strip():
@@ -507,22 +567,17 @@ class BenchmarkDefinition:
             )
         self.challenge.validate()
         self.evaluation.validate()
+        resolved_assessments = self.resolved_assessments()
         assessment_ids = [
-            assessment.assessment_id for assessment in self.assessments
+            assessment.assessment_id for assessment in resolved_assessments
         ]
         if len(assessment_ids) != len(set(assessment_ids)):
             raise ConfigurationError(
                 "assessment IDs must be unique within a benchmark"
             )
-        for assessment in self.assessments:
+        artifact_owners: dict[str, str] = {}
+        for assessment in resolved_assessments:
             assessment.validate()
-            if not assessment.root.resolve().is_relative_to(
-                self.root.resolve()
-            ):
-                raise ConfigurationError(
-                    "assessment root must be within benchmark root: "
-                    f"{assessment.root}"
-                )
             if self.evaluation.results_path in {
                 assessment.resolved_input_path,
                 assessment.output_path,
@@ -530,6 +585,27 @@ class BenchmarkDefinition:
                 raise ConfigurationError(
                     "assessment input/output paths cannot overwrite "
                     "evaluation results"
+                )
+            artifact_paths = {
+                assessment.resolved_input_path,
+                assessment.output_path,
+                *(report.path for report in assessment.reports),
+            }
+            for path in artifact_paths:
+                owner = artifact_owners.get(path)
+                if owner is not None and owner != assessment.assessment_id:
+                    raise ConfigurationError(
+                        f"assessment artifact path {path!r} is used by "
+                        f"both {owner!r} and {assessment.assessment_id!r}"
+                    )
+                artifact_owners[path] = assessment.assessment_id
+        for assessment in self.assessments:
+            if not assessment.root.resolve().is_relative_to(
+                self.root.resolve()
+            ):
+                raise ConfigurationError(
+                    "assessment root must be within benchmark root: "
+                    f"{assessment.root}"
                 )
         self.artifacts.validate()
         self.runtime.validate()
