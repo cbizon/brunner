@@ -5,8 +5,9 @@
 Brunner separates benchmark execution into six trust and responsibility
 stages.
 
-1. **Stage**: copy only challenge-visible files, render output requirements
-   from the canonical contract, and record challenge/contract digests.
+1. **Stage**: optionally materialize resources into a temporary challenge
+   copy, copy only challenge-visible files, render output requirements from
+   the canonical contract, and record challenge/contract digests.
 2. **Run**: execute a provider in the staged workspace with durable state,
    retries, continuation, finalization, timeout, and structured final output.
 3. **Collect**: preserve logs and copy artifacts through a resumable,
@@ -24,7 +25,7 @@ stages.
 | Concern | Brunner owns | Benchmark owns |
 |---|---|---|
 | Identity | Metadata/digest recording | Benchmark ID and version |
-| Agent input | Isolated staging | Challenge files and prompt prose |
+| Agent input | Temporary materialization, isolated staging | Challenge files, prompt prose, and resource preparation command |
 | Output definition | Rendering and validation | `output-contract.json` |
 | Provider runtime | Commands, timestamped events, retries, resource accounting | Model/effort selection |
 | Evaluation | Trusted invocation and result envelope | Metrics and scoring code |
@@ -62,6 +63,18 @@ The prompt output section is rendered from the same contract. Generic
 submission validation follows manifest pointers, rejects path escape and
 symlink traversal, validates JSON artifacts, hashes accepted files, and
 requires a `complete` status to list every work unit.
+
+When a challenge defines a materialization command, Brunner first copies the
+source challenge into a fresh orchestrator-side temporary directory. It runs
+the command there, rechecks symlinks and forbidden names, then uses that
+materialized copy for prompt rendering, schema generation, staging, and the
+challenge digest. The source checkout is never modified. Without a command,
+the original direct-copy staging path is unchanged.
+
+Materialization is part of trial creation, before any local, container, or
+Kubernetes backend receives a workload. Materialized resources are therefore
+candidate-visible, included in `challenge_sha256`, and copied to remote
+storage with the rest of the trial. They are not added to an agent image.
 
 Evaluator code calls `load_evaluation_input()`. That API reloads the staged
 contract, checks its SHA-256 against trial metadata, validates the submission,
@@ -116,6 +129,14 @@ The agent runtime receives only:
 - Minimal `metadata/agent-run.json`
 - Provider credentials supplied by the runtime
 
+Challenge materialization runs earlier as trusted orchestrator-side benchmark
+code. Brunner gives it the temporary challenge root, does not pass trial,
+reference, evaluation, assessment, or submission `BRUNNER_*` paths, and does
+not copy trusted materials into the temporary challenge. The optional
+`BRUNNER_RESOURCE_CACHE` value is passed through as a location only; download,
+locking, checksum, extraction, conversion, and cache validity semantics remain
+benchmark-owned.
+
 Candidate Codex and Claude processes execute with workspace-only write
 permissions and without inherited user configuration or external tool
 connections. Runner-owned metadata, backend, evaluation, assessment, usage,
@@ -167,8 +188,10 @@ downgrades, or routing changes failures of the requested model rather than
 benchmark results for an undisclosed replacement. Claude identity is taken
 from top-level `assistant.message.model` records; subagent messages and
 aggregate `modelUsage` entries are not primary identity evidence because they
-may include legitimate internal helper models. If a provider exposes no
-primary model identity in its event stream, Brunner does not invent one.
+may include legitimate internal helper models. Claude's `<synthetic>` assistant
+records, including subscription-limit notices, are also not model identity
+evidence. If a provider exposes no primary model identity in its event stream,
+Brunner does not invent one.
 
 Provider launch errors become durable `provider_error` results rather than
 escaping before status is written. Prompt input is delivered on a separate

@@ -159,9 +159,12 @@ class ClaudeAdapter:
         model = message.get("model")
         if not isinstance(model, str) or not model.strip():
             return ()
+        normalized = model.strip()
+        if normalized == "<synthetic>":
+            return ()
         return (
             ProviderModelObservation(
-                model=model.strip(),
+                model=normalized,
                 source="assistant.message.model",
             ),
         )

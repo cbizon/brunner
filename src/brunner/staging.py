@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import shutil
+import signal
+import subprocess
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from brunner.contract import OutputContract, render_output_requirements
-from brunner.definition import BenchmarkDefinition
-from brunner.errors import ConfigurationError, IntegrityError
+from brunner.definition import BenchmarkDefinition, ChallengeDefinition
+from brunner.errors import (
+    ChallengeMaterializationError,
+    ConfigurationError,
+    IntegrityError,
+)
 from brunner.hashing import sha256_tree
 from brunner.io import write_json_atomic
 
@@ -44,6 +55,10 @@ def assert_isolated_workspace(
     *,
     forbidden_names: tuple[str, ...] = (),
 ) -> None:
+    if workspace.is_symlink():
+        raise IntegrityError(
+            f"isolated workspace is a symlink: {workspace}"
+        )
     forbidden = set(forbidden_names)
     for path in workspace.rglob("*"):
         if path.is_symlink():
@@ -65,6 +80,130 @@ def _copy_challenge(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, ignore=ignored)
 
 
+def _diagnostic_text(value: str | bytes | None) -> str:
+    if value is None:
+        return "<empty>"
+    if isinstance(value, bytes):
+        text = value.decode(errors="replace")
+    else:
+        text = value
+    text = text.rstrip()
+    if not text:
+        return "<empty>"
+    limit = 20_000
+    if len(text) > limit:
+        return f"... <truncated {len(text) - limit} characters>\n{text[-limit:]}"
+    return text
+
+
+def _materialization_failure(
+    challenge: ChallengeDefinition,
+    *,
+    exit_code: int | None,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+    timed_out: bool = False,
+) -> ChallengeMaterializationError:
+    command = shlex.join(challenge.materialize_command)
+    status = (
+        f"timed out after {challenge.materialize_timeout_seconds} seconds"
+        if timed_out
+        else "failed"
+    )
+    exit_detail = "unavailable" if exit_code is None else str(exit_code)
+    return ChallengeMaterializationError(
+        f"challenge materialization {status}\n"
+        f"command: {command}\n"
+        f"exit code: {exit_detail}\n"
+        f"stdout:\n{_diagnostic_text(stdout)}\n"
+        f"stderr:\n{_diagnostic_text(stderr)}"
+    )
+
+
+def _run_materializer(
+    challenge: ChallengeDefinition,
+    challenge_root: Path,
+) -> None:
+    challenge_root = challenge_root.resolve()
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("BRUNNER_")
+    }
+    resource_cache = os.environ.get("BRUNNER_RESOURCE_CACHE")
+    if resource_cache is not None:
+        environment["BRUNNER_RESOURCE_CACHE"] = resource_cache
+    environment["BRUNNER_CHALLENGE_ROOT"] = str(challenge_root)
+    try:
+        process = subprocess.Popen(
+            challenge.materialize_command,
+            cwd=challenge_root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+    except OSError as error:
+        raise ChallengeMaterializationError(
+            "challenge materialization could not start\n"
+            f"command: {shlex.join(challenge.materialize_command)}\n"
+            "exit code: unavailable\n"
+            "stdout:\n<empty>\n"
+            f"stderr:\n{type(error).__name__}: {error}"
+        ) from error
+    try:
+        stdout, stderr = process.communicate(
+            timeout=challenge.materialize_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        stdout, stderr = process.communicate()
+        raise _materialization_failure(
+            challenge,
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=True,
+        ) from error
+    if process.returncode != 0:
+        raise _materialization_failure(
+            challenge,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+@contextmanager
+def _challenge_source(
+    challenge: ChallengeDefinition,
+) -> Iterator[Path]:
+    if not challenge.materialize_command:
+        yield challenge.root
+        return
+    with tempfile.TemporaryDirectory(
+        prefix="brunner-challenge-"
+    ) as temporary:
+        challenge_root = Path(temporary) / "challenge"
+        assert_isolated_workspace(
+            challenge.root,
+            forbidden_names=challenge.forbidden_names,
+        )
+        _copy_challenge(challenge.root, challenge_root)
+        _run_materializer(challenge, challenge_root)
+        assert_isolated_workspace(
+            challenge_root,
+            forbidden_names=challenge.forbidden_names,
+        )
+        yield challenge_root
+
+
 def stage_challenge(
     definition: BenchmarkDefinition,
     contract: OutputContract,
@@ -83,7 +222,8 @@ def stage_challenge(
             )
         destination.rmdir()
 
-    _copy_challenge(definition.challenge.root, destination)
+    with _challenge_source(definition.challenge) as challenge_source:
+        _copy_challenge(challenge_source, destination)
     template_path = destination / definition.challenge.prompt_template
     template = template_path.read_text()
     marker = definition.challenge.output_marker

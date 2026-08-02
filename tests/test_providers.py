@@ -179,18 +179,52 @@ def test_claude_subscription_boundary_exposes_reset_time() -> None:
                 "type": "rate_limit_event",
                 "rate_limit_info": {
                     "status": "rejected",
-                    "resetsAt": 1785265200,
+                    "resetsAt": 1785616800,
+                    "rateLimitType": "five_hour",
+                    "overageStatus": "rejected",
                     "overageDisabledReason": "org_level_disabled",
+                    "isUsingOverage": False,
                 },
-            }
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You've hit your limit · "
+                                "resets 8:40pm (UTC)"
+                            ),
+                        }
+                    ],
+                },
+                "parent_tool_use_id": None,
+                "error": "rate_limit",
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 429,
+                "result": (
+                    "You've hit your limit · resets 8:40pm (UTC)"
+                ),
+            },
         ],
         "",
     )
 
     assert failure is not None
     assert failure.terminal is False
+    assert failure.summary == (
+        "You've hit your limit · resets 8:40pm (UTC)"
+    )
+    assert failure.api_status == 429
+    assert failure.reason == "org_level_disabled"
     assert failure.wait_category == "subscription_wait"
-    assert failure.retry_at_epoch == 1785265200
+    assert failure.retry_at_epoch == 1785616800
 
 
 def test_provider_activity_observations_normalize_tool_lifecycles() -> None:
@@ -257,12 +291,20 @@ def test_claude_model_identity_uses_primary_assistant_records() -> None:
             },
         }
     )
+    synthetic = adapter.model_observations(
+        {
+            "type": "assistant",
+            "message": {"model": "<synthetic>"},
+            "error": "rate_limit",
+        }
+    )
 
     assert assistant[0].model == "claude-fable-5"
     assert assistant[0].source == "assistant.message.model"
     assert system == ()
     assert subagent == ()
     assert usage == ()
+    assert synthetic == ()
     assert adapter.models_match("fable", "claude-fable-5")
     assert adapter.models_match(
         "claude-fable-5",

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import os
-from datetime import UTC, datetime
 from pathlib import Path
+import shutil
+import sys
 from typing import Any
 
 import pytest
@@ -103,6 +106,14 @@ class ImmediateBackend:
             pending=0,
             available=10,
         )
+
+
+class MaterializationCheckingBackend(ImmediateBackend):
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        assert (
+            workload.trial / "workspace/campaign-resource.txt"
+        ).read_text() == "materialized before backend submission"
+        return super().submit(workload)
 
 
 class OfflineBackend(ImmediateBackend):
@@ -242,6 +253,61 @@ def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
     dashboard = plan.root / "index.html"
     assert dashboard.is_file()
     assert "model-a" in dashboard.read_text()
+
+
+def test_campaign_materializes_before_backend_submission(
+    tmp_path: Path,
+) -> None:
+    challenge_root = tmp_path / "challenge"
+    shutil.copytree(
+        ROOT / "examples/text_benchmark/challenge",
+        challenge_root,
+    )
+    script = tmp_path / "materialize.py"
+    script.write_text(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["BRUNNER_CHALLENGE_ROOT"])
+(root / "campaign-resource.txt").write_text(
+    "materialized before backend submission"
+)
+"""
+    )
+    base = build_definition()
+    definition = replace(
+        base,
+        challenge=replace(
+            base.challenge,
+            root=challenge_root,
+            materialize_command=(sys.executable, str(script)),
+        ),
+    )
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="materialized",
+        root=tmp_path / "campaign",
+        trials=(
+            CampaignTrial(
+                "materialized-a",
+                "codex",
+                "model-a",
+            ),
+        ),
+    )
+    runner = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        MaterializationCheckingBackend(),
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+
+    assert state["status"] == "running"
+    assert state["trials"][0]["phase"] == "submitted"
 
 
 def test_campaign_pauses_when_backend_is_unreachable(
