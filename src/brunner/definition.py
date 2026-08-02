@@ -46,6 +46,8 @@ class ChallengeDefinition:
     rendered_prompt: str = "PROMPT.md"
     output_marker: str = "{{BRUNNER_OUTPUT_CONTRACT}}"
     forbidden_names: tuple[str, ...] = ()
+    materialize_command: tuple[str, ...] = ()
+    materialize_timeout_seconds: float = 60 * 60
 
     def validate(self) -> None:
         if not self.root.is_dir():
@@ -61,6 +63,18 @@ class ChallengeDefinition:
         if marker_count != 1:
             raise ConfigurationError(
                 "prompt template must contain the output marker exactly once"
+            )
+        if any(
+            not isinstance(argument, str) or not argument.strip()
+            for argument in self.materialize_command
+        ):
+            raise ConfigurationError(
+                "challenge materialize_command arguments must be "
+                "non-empty strings"
+            )
+        if self.materialize_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "challenge materialize_timeout_seconds must be positive"
             )
 
 

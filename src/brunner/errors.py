@@ -46,6 +46,10 @@ class IntegrityError(BrunnerError):
     """Recorded and observed artifact identities differ."""
 
 
+class ChallengeMaterializationError(BrunnerError):
+    """Challenge resource preparation failed before staging."""
+
+
 class EvaluationError(BrunnerError):
     """Trusted evaluation failed."""
 

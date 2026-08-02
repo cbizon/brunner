@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import sys
+from dataclasses import replace
 from pathlib import Path
+import sys
 
 from brunner import (
     BenchmarkDefinition,
@@ -22,5 +23,20 @@ def build_definition() -> BenchmarkDefinition:
         challenge=ChallengeDefinition(root=ROOT / "challenge"),
         evaluation=EvaluationDefinition(
             command=(sys.executable, str(ROOT / "evaluator.py")),
+        ),
+    )
+
+
+def build_materialized_definition() -> BenchmarkDefinition:
+    definition = build_definition()
+    return replace(
+        definition,
+        challenge=replace(
+            definition.challenge,
+            materialize_command=(
+                sys.executable,
+                str(ROOT / "materialize_challenge.py"),
+            ),
+            materialize_timeout_seconds=60,
         ),
     )

@@ -17,6 +17,7 @@ benchmark; this repository does not modify or depend on it.
 ## What Is Generic
 
 - Deterministic challenge staging and isolation checks
+- Optional orchestrator-side challenge resource materialization
 - Prompt/schema generation from one output contract
 - Codex and Claude provider adapters
 - Durable retries, session resume, finalization, and timeout handling
@@ -34,6 +35,7 @@ benchmark; this repository does not modify or depend on it.
 
 - `BenchmarkDefinition`: identity and component wiring
 - `challenge/`: prompt template and agent-visible inputs
+- Optional challenge materialization command and timeout
 - `output-contract.json`: submission, work units, artifacts, and JSON schemas
 - Evaluator command and optional evaluator image
 - Optional assessment contracts, commands or reviewer models, and reports
@@ -64,6 +66,19 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
   --benchmark examples.text_benchmark.definition \
   local-run ./runs --provider codex --model MODEL
 ```
+
+Materialize a harmless candidate-visible example resource before staging:
+
+```sh
+UV_CACHE_DIR=.uv-cache uv run brunner \
+  --benchmark examples.text_benchmark.definition:build_materialized_definition \
+  stage ./materialized-workspace
+```
+
+Materializers run on a temporary challenge copy on the orchestrator before
+hashing or backend submission. Their output is candidate-visible and included
+in `challenge_sha256`; evaluator/reference materials are not staged or passed
+through materializer-specific environment variables.
 
 ## Resource Accounting
 

@@ -55,6 +55,12 @@ def build_definition() -> BenchmarkDefinition:
         challenge=ChallengeDefinition(
             root=ROOT / "challenge",
             forbidden_names=("reference", "evaluator.py"),
+            materialize_command=(
+                sys.executable,
+                "-m",
+                "my_benchmark.materialize_challenge",
+            ),
+            materialize_timeout_seconds=60 * 60,
         ),
         evaluation=EvaluationDefinition(
             command=(sys.executable, str(ROOT / "evaluator.py")),
@@ -103,6 +109,75 @@ def build_definition() -> BenchmarkDefinition:
 
 `forbidden_names` is an additional isolation assertion, not an exclusion
 mechanism. Do not put evaluator/reference files under the challenge root.
+
+## Challenge Materialization
+
+Use `materialize_command` for candidate-visible resources that should not be
+committed to the challenge or built into the agent image. Brunner:
+
+1. copies the source challenge into a fresh temporary directory;
+2. runs the command on the orchestrator with that directory as its working
+   directory;
+3. rejects command-created symlinks and configured forbidden names;
+4. renders the prompt and generated schemas from the materialized copy;
+5. stages and hashes every candidate-visible materialized file; and
+6. submits only the completed trial to the selected backend.
+
+The command receives:
+
+```text
+BRUNNER_CHALLENGE_ROOT
+BRUNNER_RESOURCE_CACHE     # only when externally configured
+```
+
+Other inherited `BRUNNER_*` variables are removed. Brunner does not provide
+the command with the trial, reference bundle, evaluator, assessment inputs, or
+candidate workspace. The command is trusted benchmark code running with the
+orchestrator's ordinary process permissions, so deployments should give the
+orchestrator only the credentials and filesystem access the materializer
+needs.
+
+The benchmark command owns all resource semantics, including URLs, cache
+layout and locking, checksums, retries, extraction, conversion, and generated
+filenames. Brunner only supplies the isolated destination and enforces the
+timeout and post-command isolation checks. A launch error, nonzero exit, or
+timeout aborts staging and reports the command, exit code when available,
+stdout, and stderr.
+
+Because the command's working directory is the temporary challenge root,
+module commands such as `python -m my_benchmark.materialize_challenge` require
+the benchmark package to be installed or otherwise importable independently
+of the orchestrator's original working directory. An absolute script path is
+also valid.
+
+For example:
+
+```python
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+challenge_root = Path(os.environ["BRUNNER_CHALLENGE_ROOT"])
+resources = challenge_root / "resources"
+resources.mkdir(parents=True, exist_ok=True)
+(resources / "generated-note.txt").write_text(
+    "Candidate-visible generated resource.\n"
+)
+```
+
+The repository includes a runnable harmless example:
+
+```sh
+brunner \
+  --benchmark examples.text_benchmark.definition:build_materialized_definition \
+  stage ./materialized-workspace
+```
+
+With no `materialize_command`, Brunner retains the existing direct challenge
+copy behavior. `stage`, `trial-create`, `local-run`, and every campaign backend
+share this same staging path.
 
 ## Assessments
 

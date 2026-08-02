@@ -420,7 +420,7 @@ def test_provider_launch_failure_is_persisted(
     assert "provider launch failed" in state["failure"]
 
 
-def test_runner_waits_for_provider_subscription_reset(
+def test_codex_runner_waits_for_provider_subscription_reset(
     tmp_path: Path,
 ) -> None:
     benchmark = definition()
@@ -495,6 +495,140 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     assert state["status"] == "complete"
     assert len(state["attempts"]) == 2
     assert state["attempts"][0]["wait_category"] == "subscription_wait"
+    assert elapsed < 1
+    assert timing["summary"]["subscription_wait_seconds"] > 0
+
+
+def test_claude_runner_waits_for_captured_subscription_reset(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "claude-subscription",
+            "claude",
+            "claude-opus-5",
+            None,
+        ),
+    )
+    binary = tmp_path / "claude"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import time
+
+marker = pathlib.Path(".retried")
+if not marker.exists():
+    marker.write_text("1")
+    reset = time.time() + 0.2
+    message = "You've hit your limit · resets shortly (UTC)"
+    print(json.dumps({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": reset,
+            "rateLimitType": "five_hour",
+            "overageStatus": "rejected",
+            "overageDisabledReason": "org_level_disabled",
+            "isUsingOverage": False,
+        },
+        "uuid": "rate-limit-event",
+        "session_id": "captured-session",
+    }), flush=True)
+    print(json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{"type": "text", "text": message}],
+        },
+        "parent_tool_use_id": None,
+        "session_id": "captured-session",
+        "error": "rate_limit",
+    }), flush=True)
+    print(json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": message,
+        "session_id": "captured-session",
+        "usage": {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        },
+    }), flush=True)
+    raise SystemExit(1)
+
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": json.dumps(response),
+    "session_id": "captured-session",
+    "usage": {
+        "input_tokens": 1,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    },
+}), flush=True)
+""",
+    )
+
+    started = time.monotonic()
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="claude",
+            model="claude-opus-5",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=2,
+            retry_max_seconds=2,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+    elapsed = time.monotonic() - started
+    timing = json.loads((trial / "timing/accounting.json").read_text())
+
+    assert state["status"] == "complete"
+    assert len(state["attempts"]) == 2
+    limited = state["attempts"][0]
+    assert limited["failure"] == (
+        "You've hit your limit · resets shortly (UTC)"
+    )
+    assert limited["api_status"] == 429
+    assert limited["failure_reason"] == "org_level_disabled"
+    assert limited["wait_category"] == "subscription_wait"
+    assert limited["retry_at_epoch"] is not None
+    assert limited["model_mismatch"] is None
     assert elapsed < 1
     assert timing["summary"]["subscription_wait_seconds"] > 0
 

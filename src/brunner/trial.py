@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,20 +48,30 @@ def create_trial(
     definition.validate()
     trial = tests_root.resolve() / identity.test_id
     trial.mkdir(parents=True, exist_ok=False)
-    for name in TRIAL_DIRECTORIES:
-        (trial / name).mkdir()
-    staged = stage_challenge(
-        definition,
-        contract,
-        trial / "workspace",
-    )
-    write_trial_metadata(
-        definition,
-        contract,
-        identity,
-        trial,
-        staged,
-    )
+    try:
+        for name in TRIAL_DIRECTORIES:
+            (trial / name).mkdir()
+        staged = stage_challenge(
+            definition,
+            contract,
+            trial / "workspace",
+        )
+        write_trial_metadata(
+            definition,
+            contract,
+            identity,
+            trial,
+            staged,
+        )
+    except Exception as error:
+        try:
+            shutil.rmtree(trial)
+        except OSError as cleanup_error:
+            error.add_note(
+                "failed to remove incomplete trial "
+                f"{trial}: {cleanup_error}"
+            )
+        raise
     return trial
 
 
