@@ -114,8 +114,6 @@ def write_run_report(trial: Path, output: Path) -> Path:
         if isinstance(assessment, dict)
     ]
     reports = list(evaluation.get("reports", []))
-    for assessment in assessments:
-        reports.extend(assessment.get("reports", []))
     links = []
     seen_reports = set()
     for report in reports:
@@ -150,7 +148,7 @@ def write_run_report(trial: Path, output: Path) -> Path:
                 f"{method.get('model', '')}"
             )
         assessment_links = []
-        for report in assessment.get("reports", []):
+        for report in visible_assessment_reports(assessment):
             if not isinstance(report, dict) or not isinstance(
                 report.get("path"), str
             ):
@@ -281,3 +279,24 @@ details pre {{ margin:0; border-top:1px solid var(--line); }}
 """
     )
     return output
+
+
+def visible_assessment_reports(
+    assessment: dict[str, Any],
+) -> list[dict[str, Any]]:
+    reports = [
+        report
+        for report in assessment.get("reports", [])
+        if isinstance(report, dict)
+    ]
+    output = assessment.get("output", {})
+    output_path = output.get("path") if isinstance(output, dict) else None
+    if not isinstance(output_path, str):
+        return reports
+    if any(report.get("path") != output_path for report in reports):
+        return [
+            report
+            for report in reports
+            if report.get("path") != output_path
+        ]
+    return reports

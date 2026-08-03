@@ -243,12 +243,21 @@ trial = Path(os.environ["BRUNNER_TRIAL_ROOT"])
     assert assessment_result["output"]["sha256"]
     assert assessment_result["identity_blinding"]["identity_blinded"] is True
     assert assessment_result["contract"]["contract_sha256"]
+    assert assessment_result["reports"] == [
+        {
+            "path": "evaluation/qualitative-review.html",
+            "media_type": "text/html",
+            "title": "Qualitative review",
+            "primary": True,
+        }
+    ]
     assert "candidate-model" not in dossier_text
     assert "benchmark_input" in dossier_text
     assert (trial / "evaluation/qualitative-review.html").is_file()
     report = (trial / "evaluation/run-report.html").read_text()
     assert "qualitative" in report
     assert "Qualitative review" in report
+    assert 'href="qualitative-review.json"' not in report
 
     rerun = run_assessments(definition, contract, trial, result)
     rerun_dossier = json.loads(
@@ -411,6 +420,13 @@ printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","c
     assert assessment_result["method"]["executable"] == str(reviewer)
     assert assessment_result["usage"]["total_tokens"] == 5
     assert assessment_result["attempts"][0]["status"] == "complete"
+    assert assessment_result["reports"] == [
+        {
+            "path": "evaluation/model-review.json",
+            "media_type": "application/json",
+            "title": "model-review assessment",
+        }
+    ]
     assert (
         json.loads((trial / "evaluation/model-review.json").read_text())[
             "verdict"

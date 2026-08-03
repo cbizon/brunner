@@ -1328,23 +1328,23 @@ def run_assessment(
                 raise AssessmentError(
                     f"assessment renderer exited {render_return_code}"
                 )
-        reports = [
-            {
-                "path": str(output_path.relative_to(trial)),
-                "media_type": "application/json",
-                "title": f"{assessment.assessment_id} assessment",
-            }
-        ]
+        reports = []
         for report in assessment.reports:
             _safe_trial_path(
                 trial,
                 report.path,
                 require_file=True,
             )
-            if report.path not in {
-                item["path"] for item in reports
-            }:
+            if report.path not in {item["path"] for item in reports}:
                 reports.append(report.to_dict())
+        if not reports:
+            reports.append(
+                {
+                    "path": str(output_path.relative_to(trial)),
+                    "media_type": "application/json",
+                    "title": f"{assessment.assessment_id} assessment",
+                }
+            )
         result = {
             "schema_version": "1.0",
             "assessment_id": assessment.assessment_id,

@@ -81,12 +81,20 @@ def _report_fixture(tmp_path: Path, *, display_title: str | None = None) -> str:
                     "assessment_id": "qualitative",
                     "status": "complete",
                     "required": True,
+                    "output": {
+                        "path": "evaluation/qualitative.json",
+                    },
                     "method": {
                         "kind": "reviewer",
                         "provider": "codex",
                         "model": "reviewer-model",
                     },
                     "reports": [
+                        {
+                            "path": "evaluation/qualitative.json",
+                            "media_type": "application/json",
+                            "title": "Qualitative assessment",
+                        },
                         {
                             "path": "evaluation/qualitative.html",
                             "title": "Qualitative <review>",
@@ -125,6 +133,8 @@ def test_run_report_uses_summary_facts_and_collapsed_raw_json(
     assert "&lt;evaluation complete&gt;" in report
     assert "A &amp; B" in report
     assert "Qualitative &lt;review&gt;" in report
+    assert 'href="qualitative.json"' not in report
+    assert report.count('href="qualitative.html"') == 1
 
 
 def test_run_report_renders_optional_display_title(tmp_path: Path) -> None:
