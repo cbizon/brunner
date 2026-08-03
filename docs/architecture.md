@@ -307,7 +307,9 @@ takes ownership of the state file is therefore reported as failed instead of
 leaving the trial pending forever. `ContainerBackend`
 bind-mounts the trial into an OCI runtime. `KubernetesBackend` creates a PVC,
 stages the trial through a helper pod, creates a Job, and recovers files
-through reader pods.
+through reader pods. Helper pods explicitly use `/tmp` as their working
+directory so an image working directory beneath `/brunner/trial` cannot create
+unwritable paths when the trial PVC is mounted.
 
 The backend workload deadline is the agent hard deadline plus
 `backend_shutdown_grace_seconds`; the outer backend therefore does not kill
