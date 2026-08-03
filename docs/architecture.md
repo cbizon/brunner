@@ -116,7 +116,8 @@ For every assessment Brunner:
 8. records attempts, usage, hashes, blinding limitations, and failure details.
 
 Model reviewers run without session persistence. Codex uses its read-only
-sandbox; Claude is limited to read, glob, and grep tools. They execute in a
+sandbox; Claude exposes and explicitly authorizes only read, glob, and grep
+tools while denying interactive permission requests. They execute in a
 temporary workspace outside the trial with `BRUNNER_*` environment variables
 removed. Candidate provider and model fields are omitted from the dossier and
 matching structured fields are redacted from copied JSON evidence. The result
@@ -155,11 +156,19 @@ not copy trusted materials into the temporary challenge. The optional
 locking, checksum, extraction, conversion, and cache validity semantics remain
 benchmark-owned.
 
-Candidate Codex and Claude processes execute with workspace-only write
-permissions and without inherited user configuration or external tool
-connections. Runner-owned metadata, backend, evaluation, assessment, usage,
-and status paths are snapshotted around every attempt. Any mutation is
-restored and terminates the trial as a provider error.
+Candidate processes execute inside the selected backend's isolation boundary
+and without inherited user configuration or external tool connections. Codex
+uses its workspace-write sandbox. Claude bypasses its interactive permission
+system and relies on the outer container or Kubernetes workload isolation,
+matching the proven granular benchmark execution model and avoiding unsupported
+nested user-namespace sandboxes. Runner-owned metadata, backend, evaluation,
+assessment, usage, and status paths are snapshotted around every attempt. Any
+mutation is restored and terminates the trial as a provider error.
+
+Claude candidate runs therefore require an outer isolation boundary. Container
+and Kubernetes backends provide that boundary. The local backend inherits the
+orchestrator user's operating-system permissions and should run Claude only in
+an equivalently isolated or disposable environment.
 
 Remote jobs run `brunner-agent`, which does not import the benchmark package.
 Evaluator source and trusted references do not need to be present in the
