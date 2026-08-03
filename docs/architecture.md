@@ -210,7 +210,11 @@ and only after that attempt emits a successful provider terminal event. A
 `complete` or `partial` response must exactly match the contract-valid run
 status, manifest, and artifacts in the workspace. Only then does Brunner write
 the canonical `transcript/final.json`; stale canonical files are removed when
-a nonterminal run resumes. Reviewer attempts use the same attempt isolation.
+a nonterminal run resumes. Initial, continuation, and finalization prompts all
+require the provider to return only the exact run-status JSON object. A
+successful provider turn that omits or mismatches that object receives an
+immediate output-repair continuation rather than transient-service backoff.
+Reviewer attempts use the same attempt isolation.
 
 When a provider reports that a primary assistant response came from a model
 other than the requested model, Brunner terminates the process and records a

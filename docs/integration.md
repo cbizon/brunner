@@ -353,9 +353,14 @@ prematurely.
 Provider launch failures are persisted as `provider_error`. Prompt delivery is
 deadline-controlled even when a provider never reads stdin. Missing resumed
 sessions are recognized from JSON events or stderr and cause an immediate
-fresh invocation. Before an attempt returns, Brunner terminates and reaps its
-remaining process group, including undeclared children that could otherwise
-modify the workspace during collection.
+fresh invocation. Initial, resumed, and finalization prompts explicitly require
+the exact run-status JSON as the provider's final response. A successful turn
+that returns prose or a mismatched response receives an immediate corrective
+continuation, but Brunner still requires current-attempt structured output and
+never accepts the workspace run-status file by itself. Before an attempt
+returns, Brunner terminates and reaps its remaining process group, including
+undeclared children that could otherwise modify the workspace during
+collection.
 
 ## Resource Accounting
 
