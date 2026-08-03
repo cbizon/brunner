@@ -54,6 +54,49 @@ def _elapsed(trial: dict[str, Any], now: datetime) -> str:
     return " ".join(pieces)
 
 
+def _qualitative_summary(
+    trial: dict[str, Any],
+    evaluation: dict[str, Any],
+) -> tuple[str, str]:
+    collected_value = trial.get("collected_trial")
+    if not isinstance(collected_value, str) or not collected_value:
+        return "", ""
+    collected = Path(collected_value)
+    if not collected.is_dir():
+        return "", ""
+    for assessment in evaluation.get("assessments", []):
+        if (
+            not isinstance(assessment, dict)
+            or assessment.get("assessment_id") != "qualitative-review"
+            or assessment.get("status") != "complete"
+        ):
+            continue
+        output = assessment.get("output", {})
+        relative = output.get("path") if isinstance(output, dict) else None
+        if not isinstance(relative, str):
+            return "", ""
+        path = (collected / relative).resolve()
+        if not path.is_relative_to(collected.resolve()) or not path.is_file():
+            return "", ""
+        try:
+            review = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return "", ""
+        if not isinstance(review, dict):
+            return "", ""
+        overall = review.get("overall", {})
+        approach = review.get("approach", {})
+        return (
+            str(overall.get("rating", ""))
+            if isinstance(overall, dict)
+            else "",
+            str(approach.get("primary_classification", ""))
+            if isinstance(approach, dict)
+            else "",
+        )
+    return "", ""
+
+
 def write_campaign_dashboard(
     state: dict[str, Any],
     output: Path,
@@ -121,6 +164,10 @@ def write_campaign_dashboard(
         )
         usage = trial.get("usage", {})
         timing = trial.get("timing", {})
+        review_rating, review_approach = _qualitative_summary(
+            trial,
+            evaluation,
+        )
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(trial.get('test_id', '')))}</td>"
@@ -131,6 +178,8 @@ def write_campaign_dashboard(
             f"<td>{html.escape(_elapsed(trial, dashboard_now))}</td>"
             f"<td>{html.escape(str(trial.get('outcome') or ''))}</td>"
             f"<td>{html.escape(str(evaluation.get('assessment_status') or ''))}</td>"
+            f"<td>{html.escape(review_rating)}</td>"
+            f"<td>{html.escape(review_approach)}</td>"
             f"<td>{html.escape(str(usage.get('total_tokens') or ''))}</td>"
             f"<td>{_seconds(timing.get('wall_seconds'))}</td>"
             f"<td>{_seconds(timing.get('agent_active_seconds'))}</td>"
@@ -191,7 +240,8 @@ a {{ color:var(--green); font-weight:bold; }}
 <div class="cards">{cards}</div>
 <div class="table"><table>
 <thead><tr><th>Trial</th><th>Provider</th><th>Model</th><th>Effort</th>
-<th>Phase</th><th>Elapsed</th><th>Outcome</th><th>Assessment</th><th>Tokens</th>
+<th>Phase</th><th>Elapsed</th><th>Outcome</th><th>Assessment</th>
+<th>Review</th><th>Approach</th><th>Tokens</th>
 <th>Wall s</th><th>Agent s</th><th>External wait s</th>
 <th>Subscription wait s</th><th>Node</th>
 <th>Report</th><th>Assessment reports</th><th>Issue</th>

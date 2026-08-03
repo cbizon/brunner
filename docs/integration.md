@@ -33,11 +33,10 @@ import sys
 
 from brunner import (
     ArtifactPolicy,
-    AssessmentDefinition,
-    AssessmentReport,
     BenchmarkDefinition,
     ChallengeDefinition,
     EvaluationDefinition,
+    QualitativeReviewDefinition,
     ReferenceDefinition,
     RuntimeDefaults,
     ProviderSettings,
@@ -66,32 +65,13 @@ def build_definition() -> BenchmarkDefinition:
             command=(sys.executable, str(ROOT / "evaluator.py")),
             # image="my-evaluator:1.0",  # optional trusted container
         ),
-        assessments=(
-            AssessmentDefinition(
-                assessment_id="qualitative",
-                root=ROOT / "assessment",
-                prompt_path="prompt.md",
-                rubric_paths=("rubric.md",),
-                output_schema_path="review.schema.json",
-                input_path="evaluation/review-input.json",
-                output_path="evaluation/qualitative-review.json",
-                reviewer=ProviderSettings(
-                    provider="codex",
-                    model="REVIEWER_MODEL",
-                    effort="high",
-                ),
-                render_command=(
-                    sys.executable,
-                    str(ROOT / "assessment/render.py"),
-                ),
-                reports=(
-                    AssessmentReport(
-                        path="evaluation/qualitative-review.html",
-                        media_type="text/html",
-                        title="Qualitative review",
-                    ),
-                ),
+        qualitative_review=QualitativeReviewDefinition(
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="REVIEWER_MODEL",
+                effort="high",
             ),
+            required=False,
         ),
         reference=ReferenceDefinition(
             root=ROOT / "reference",
@@ -181,13 +161,65 @@ With no `materialize_command`, Brunner retains the existing direct challenge
 copy behavior. `stage`, `trial-create`, `local-run`, and every campaign backend
 share this same staging path.
 
-## Assessments
+## Standard Qualitative Review
 
-Assessment prompt, rubric, and output schema remain benchmark-owned. Brunner
-uses the schema as the structural source of truth: the reviewer receives it
-and Brunner validates the returned JSON against the same file. The rubric
-remains the semantic source of truth and should not duplicate a field list
-already represented by the schema.
+`QualitativeReviewDefinition` enables Brunner's packaged generic review. The
+benchmark supplies only reviewer settings and lifecycle policy:
+
+```python
+qualitative_review=QualitativeReviewDefinition(
+    reviewer=ProviderSettings(
+        provider="codex",
+        model="REVIEWER_MODEL",
+        effort="high",
+    ),
+    required=False,
+    run_if_evaluation_failed=True,
+)
+```
+
+When configured, every evaluation path runs the review after the deterministic
+evaluator and before campaign cleanup. This includes `trial-evaluate`,
+`trial-assess`, `local-run`, and local, container, or Kubernetes campaigns.
+Trial creation records the review contract before execution.
+
+Brunner writes:
+
+```text
+evaluation/qualitative-review-input.json
+evaluation/qualitative-review.json
+evaluation/qualitative-review.html
+assessments/qualitative-review/
+```
+
+The packaged rubric covers approach classification, output provenance, task
+and result fidelity, implementation quality, tests, reproducibility,
+efficiency and time use, rule compliance, claims, transcript milestones, and
+overall synthesis. It requires evidence for applicable judgments and uses the
+canonical Brunner timing partition rather than asking the reviewer to invent
+thinking or waiting time.
+
+The JSON Schema is the structural source of truth. Brunner gives the reviewer
+a resolved copy and validates the response against the same schema before
+running the packaged renderer. Candidate provider/model identity is omitted
+or redacted where practical. Reviewer identity, attempts, token usage, and
+contract hashes are recorded by the assessment envelope rather than trusted
+to reviewer self-report.
+
+The standard review is non-gating by default. Set `required=True` only when a
+missing or invalid review should make the campaign trial unsuccessful. If
+`qualitative_review` is omitted, existing benchmarks retain the previous
+`assessment_status="not_configured"` behavior.
+
+## Additional Assessments
+
+Use `BenchmarkDefinition.assessments` for benchmark-specific qualitative or
+domain review beyond the standard contract. These assessment prompts, rubrics,
+output schemas, trusted evidence, and renderers remain benchmark-owned.
+Brunner uses each schema as the structural source of truth: the reviewer
+receives it and Brunner validates the returned JSON against the same file.
+The rubric remains the semantic source of truth and should not duplicate a
+field list already represented by the schema.
 
 An assessment must define exactly one execution method:
 
@@ -195,6 +227,14 @@ An assessment must define exactly one execution method:
   structured output and read-only tools.
 - `command=(...)` invokes trusted benchmark code that writes
   `BRUNNER_ASSESSMENT_OUTPUT`.
+
+`portable_command_paths=True` records the active Python interpreter as
+`{python}` and files beneath the assessment root as
+`{assessment_root}/...` in the contract digest. Runtime commands remain
+unchanged, and referenced files remain content-hashed. The packaged standard
+review enables this so moving between equivalent Brunner installations does
+not create false contract drift; benchmark-owned assessments retain their
+literal command paths unless they opt in.
 
 Command implementations can use the helper API instead of reading environment
 variables directly:
@@ -245,6 +285,13 @@ is a configuration error. Symlinks are rejected. Generated inputs, outputs,
 and reports must be under `evaluation/` or `assessments/`; Brunner rejects
 configurations that could overwrite the candidate workspace or deterministic
 evaluation result.
+
+Model-review evidence exists in two copies while the review runs: one durable
+copy under the trial's assessment workspace and one temporary copy that
+isolates the reviewer from the trial. Benchmarks with large datasets,
+trajectories, videos, or generated resources should narrow
+`trial_evidence_paths` to the source, summaries, metrics, and representative
+artifacts the reviewer actually needs.
 
 The packaged common schema can be referenced without copying it:
 

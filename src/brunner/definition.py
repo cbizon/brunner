@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,30 @@ def _assessment_artifact_path(value: str, *, field_name: str) -> str:
             f"{field_name} must be under evaluation/ or assessments/: "
             f"{value!r}"
         )
+    return normalized
+
+
+def _contract_command(
+    command: tuple[str, ...],
+    *,
+    assessment_root: Path,
+) -> list[str]:
+    root = assessment_root.resolve()
+    python = Path(sys.executable).resolve()
+    normalized = []
+    for argument in command:
+        candidate = Path(argument)
+        if not candidate.is_absolute():
+            normalized.append(argument)
+            continue
+        resolved = candidate.resolve()
+        if resolved == python:
+            normalized.append("{python}")
+        elif resolved.is_relative_to(root):
+            relative = resolved.relative_to(root).as_posix()
+            normalized.append(f"{{assessment_root}}/{relative}")
+        else:
+            normalized.append(argument)
     return normalized
 
 
@@ -162,6 +187,7 @@ class AssessmentDefinition:
     max_attempts: int = 3
     retry_initial_seconds: float = 10
     retry_max_seconds: float = 60
+    portable_command_paths: bool = False
 
     @property
     def resolved_input_path(self) -> str:
@@ -273,6 +299,15 @@ class AssessmentDefinition:
 
     def contract_manifest(self) -> dict[str, Any]:
         self.validate()
+
+        def contract_command(command: tuple[str, ...]) -> list[str]:
+            if not self.portable_command_paths:
+                return list(command)
+            return _contract_command(
+                command,
+                assessment_root=self.root,
+            )
+
         materials = []
         recorded_paths = set()
         for role, relative in (
@@ -357,7 +392,7 @@ class AssessmentDefinition:
         else:
             method = {
                 "kind": "command",
-                "command": list(self.command),
+                "command": contract_command(self.command),
             }
         value = {
             "assessment_id": self.assessment_id,
@@ -365,8 +400,8 @@ class AssessmentDefinition:
             "method": method,
             "output_path": self.output_path,
             "input_path": self.resolved_input_path,
-            "prepare_command": list(self.prepare_command),
-            "render_command": list(self.render_command),
+            "prepare_command": contract_command(self.prepare_command),
+            "render_command": contract_command(self.render_command),
             "trial_evidence_paths": list(self.trial_evidence_paths),
             "trusted_evidence_paths": list(
                 self.trusted_evidence_paths
@@ -380,10 +415,62 @@ class AssessmentDefinition:
             "retry_initial_seconds": self.retry_initial_seconds,
             "retry_max_seconds": self.retry_max_seconds,
         }
+        if self.portable_command_paths:
+            value["portable_command_paths"] = True
         return {
             **value,
             "contract_sha256": _contract_digest(value),
         }
+
+
+@dataclass(frozen=True)
+class QualitativeReviewDefinition:
+    reviewer: ProviderSettings
+    reviewer_executable: str | None = None
+    required: bool = False
+    run_if_evaluation_failed: bool = True
+    trial_evidence_paths: tuple[str, ...] = (
+        "workspace",
+        "transcript",
+        "timing",
+        "usage",
+        "status.json",
+    )
+    timeout_seconds: float = 60 * 60
+    max_attempts: int = 3
+    retry_initial_seconds: float = 10
+    retry_max_seconds: float = 60
+
+    def to_assessment(self) -> AssessmentDefinition:
+        root = Path(__file__).resolve().parent / "qualitative"
+        return AssessmentDefinition(
+            assessment_id="qualitative-review",
+            root=root,
+            prompt_path="reviewer-prompt.md",
+            rubric_paths=("RUBRIC.md",),
+            output_schema_path="qualitative-review.schema.json",
+            input_path="evaluation/qualitative-review-input.json",
+            output_path="evaluation/qualitative-review.json",
+            reviewer=self.reviewer,
+            reviewer_executable=self.reviewer_executable,
+            render_command=(sys.executable, str(root / "render.py")),
+            portable_command_paths=True,
+            trial_evidence_paths=self.trial_evidence_paths,
+            reports=(
+                AssessmentReport(
+                    path="evaluation/qualitative-review.html",
+                    media_type="text/html",
+                    title="Qualitative review",
+                    primary=True,
+                ),
+            ),
+            required=self.required,
+            run_if_evaluation_failed=self.run_if_evaluation_failed,
+            timeout_seconds=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            retry_initial_seconds=self.retry_initial_seconds,
+            retry_max_seconds=self.retry_max_seconds,
+        )
 
 
 @dataclass(frozen=True)
@@ -491,6 +578,15 @@ class BenchmarkDefinition:
     reference: ReferenceDefinition | None = None
     artifacts: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
+    qualitative_review: QualitativeReviewDefinition | None = None
+
+    def resolved_assessments(self) -> tuple[AssessmentDefinition, ...]:
+        standard = (
+            (self.qualitative_review.to_assessment(),)
+            if self.qualitative_review is not None
+            else ()
+        )
+        return (*standard, *self.assessments)
 
     def validate(self) -> None:
         if not self.benchmark_id.strip():
@@ -507,29 +603,44 @@ class BenchmarkDefinition:
             )
         self.challenge.validate()
         self.evaluation.validate()
+        resolved_assessments = self.resolved_assessments()
         assessment_ids = [
-            assessment.assessment_id for assessment in self.assessments
+            assessment.assessment_id for assessment in resolved_assessments
         ]
         if len(assessment_ids) != len(set(assessment_ids)):
             raise ConfigurationError(
                 "assessment IDs must be unique within a benchmark"
             )
-        for assessment in self.assessments:
+        artifact_owners: dict[str, str] = {}
+        for assessment in resolved_assessments:
             assessment.validate()
+            artifact_paths = {
+                assessment.resolved_input_path,
+                assessment.output_path,
+                *(report.path for report in assessment.reports),
+            }
+            if self.evaluation.results_path in artifact_paths:
+                raise ConfigurationError(
+                    "assessment artifact paths cannot overwrite "
+                    "evaluation results"
+                )
+            for path in artifact_paths:
+                owner = artifact_owners.get(path)
+                if owner is not None and owner != assessment.assessment_id:
+                    raise ConfigurationError(
+                        f"assessment artifact path {path!r} is used by "
+                        f"both {owner!r} and {assessment.assessment_id!r}"
+                    )
+                artifact_owners[path] = assessment.assessment_id
+        # Benchmark-owned assessments stay in the benchmark checkout. The
+        # standard qualitative review is packaged with Brunner instead.
+        for assessment in self.assessments:
             if not assessment.root.resolve().is_relative_to(
                 self.root.resolve()
             ):
                 raise ConfigurationError(
                     "assessment root must be within benchmark root: "
                     f"{assessment.root}"
-                )
-            if self.evaluation.results_path in {
-                assessment.resolved_input_path,
-                assessment.output_path,
-            }:
-                raise ConfigurationError(
-                    "assessment input/output paths cannot overwrite "
-                    "evaluation results"
                 )
         self.artifacts.validate()
         self.runtime.validate()

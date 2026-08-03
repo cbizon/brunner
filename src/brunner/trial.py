@@ -97,7 +97,7 @@ def write_trial_metadata(
             "challenge_sha256": staged.challenge_sha256,
             "assessment_contracts": [
                 assessment.contract_manifest()
-                for assessment in definition.assessments
+                for assessment in definition.resolved_assessments()
             ],
             "created_at": datetime.now(UTC).isoformat(),
         },

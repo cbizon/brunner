@@ -690,6 +690,77 @@ Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT"]).write_text(
     assert "contract changed" in assessment_result["error"]["message"]
 
 
+def test_assessment_contract_normalizes_runtime_install_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first/assessment"
+    second_root = tmp_path / "second/assessment"
+    for assessment_root in (first_root, second_root):
+        assessment_root.parent.mkdir()
+        _write_assessment_materials(assessment_root)
+        (assessment_root / "assess.py").write_text("print('assess')\n")
+        (assessment_root / "render.py").write_text("print('render')\n")
+
+    def assessment(
+        root: Path,
+        python: Path,
+    ) -> AssessmentDefinition:
+        return AssessmentDefinition(
+            assessment_id="portable-review",
+            root=root,
+            prompt_path="prompt.md",
+            output_schema_path="review.schema.json",
+            output_path="evaluation/portable-review.json",
+            command=(str(python), str(root / "assess.py")),
+            render_command=(str(python), str(root / "render.py")),
+            portable_command_paths=True,
+        )
+
+    first_python = tmp_path / "first/venv/bin/python"
+    second_python = tmp_path / "second/venv/bin/python"
+    monkeypatch.setattr(
+        "brunner.definition.sys.executable",
+        str(first_python),
+    )
+    first = assessment(first_root, first_python).contract_manifest()
+    monkeypatch.setattr(
+        "brunner.definition.sys.executable",
+        str(second_python),
+    )
+    second_definition = assessment(second_root, second_python)
+    second = second_definition.contract_manifest()
+
+    assert first["contract_sha256"] == second["contract_sha256"]
+    assert first["method"]["command"] == [
+        "{python}",
+        "{assessment_root}/assess.py",
+    ]
+    assert first["render_command"] == [
+        "{python}",
+        "{assessment_root}/render.py",
+    ]
+    assert first["portable_command_paths"] is True
+
+    default_contract = AssessmentDefinition(
+        assessment_id="author-controlled-review",
+        root=second_root,
+        prompt_path="prompt.md",
+        output_schema_path="review.schema.json",
+        output_path="evaluation/author-controlled-review.json",
+        command=(str(second_python), str(second_root / "assess.py")),
+    ).contract_manifest()
+    assert default_contract["method"]["command"] == [
+        str(second_python),
+        str(second_root / "assess.py"),
+    ]
+    assert "portable_command_paths" not in default_contract
+
+    (second_root / "render.py").write_text("print('changed')\n")
+    changed = second_definition.contract_manifest()
+    assert changed["contract_sha256"] != first["contract_sha256"]
+
+
 def test_assessment_requires_exactly_one_execution_method(
     tmp_path: Path,
 ) -> None:
@@ -725,6 +796,37 @@ def test_assessment_outputs_cannot_modify_candidate_workspace(
 
     with pytest.raises(ConfigurationError, match="must be under"):
         assessment.validate()
+
+
+def test_assessment_report_cannot_overwrite_evaluation_results(
+    tmp_path: Path,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    _write_assessment_materials(assessment_root)
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="invalid-report",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            output_schema_path="review.schema.json",
+            output_path="evaluation/review.json",
+            command=(sys.executable, "-c", "pass"),
+            reports=(
+                AssessmentReport(
+                    path="evaluation/results.json",
+                    media_type="application/json",
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="artifact paths cannot overwrite evaluation results",
+    ):
+        definition.validate()
 
 
 def test_assessment_rejects_output_symlink(

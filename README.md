@@ -5,7 +5,8 @@ the reusable lifecycle:
 
 ```text
 isolated agent execution -> submission -> verified collection
-                         -> trusted evaluation -> optional assessments
+                         -> trusted evaluation -> qualitative review
+                         -> optional domain assessments
                          -> campaign reporting
 ```
 
@@ -25,6 +26,7 @@ benchmark; this repository does not modify or depend on it.
 - Local, OCI-container, and Kubernetes execution backends
 - Resumable checksum-verified artifact collection
 - Trusted host or evaluator-container execution
+- Packaged evidence-bound qualitative review contract and HTML report
 - Schema-bound command or model-based post-evaluation assessments
 - Evidence dossiers, timing facts, assessment provenance, and report links
 - Reference bundle manifests and integrity checks
@@ -38,7 +40,8 @@ benchmark; this repository does not modify or depend on it.
 - Optional challenge materialization command and timeout
 - `output-contract.json`: submission, work units, artifacts, and JSON schemas
 - Evaluator command and optional evaluator image
-- Optional assessment contracts, commands or reviewer models, and reports
+- Standard qualitative-review model configuration
+- Optional domain assessment contracts, commands or reviewer models, and reports
 - Optional reference root and validation command
 - Artifact exclusion/group policy
 - Runtime defaults and campaign/backend profile

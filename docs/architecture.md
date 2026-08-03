@@ -14,9 +14,9 @@ stages.
    checksum-verified transfer.
 4. **Evaluate**: validate the submission contract, then run trusted
    benchmark-specific scoring against optional verified references.
-5. **Assess**: optionally build an evidence dossier and run trusted,
-   schema-bound command or model reviews without changing deterministic
-   evaluation status.
+5. **Assess**: build evidence dossiers and run the configured standard
+   qualitative review plus any domain-specific, schema-bound command or model
+   reviews without changing deterministic evaluation status.
 6. **Campaign**: schedule a matrix, reconcile backend state, recover outputs,
    evaluate, clean up, and publish a dashboard.
 
@@ -29,7 +29,8 @@ stages.
 | Output definition | Rendering and validation | `output-contract.json` |
 | Provider runtime | Commands, timestamped events, retries, resource accounting | Model/effort selection |
 | Evaluation | Trusted invocation and result envelope | Metrics and scoring code |
-| Assessment | Dossier, execution, validation, provenance, status | Rubric, prompt, output schema, evidence, renderer |
+| Standard qualitative review | Generic rubric, prompt, schema, dossier, execution, validation, renderer, provenance, status | Reviewer identity and whether completion gates success |
+| Domain assessments | Dossier, execution, validation, provenance, status | Rubric, prompt, output schema, evidence, renderer |
 | References | Manifest and integrity validation | Reference content |
 | Artifacts | Inventory, resume, checksum, groups | Retention policy |
 | Infrastructure | Backend interfaces and implementations | Runtime profile/images |
@@ -84,11 +85,23 @@ structural validation.
 
 ## Assessment Contracts
 
-An assessment is a trusted post-evaluation operation. Each benchmark owns an
-assessment directory containing its reviewer prompt, rubric, and output
-schema. Brunner records a contract digest over those materials, trusted
-evidence, reviewer identity or command, input/output paths, and renderer
-configuration when the trial is created.
+An assessment is a trusted post-evaluation operation. Brunner packages a
+standard qualitative review that classifies the approach, checks output
+provenance, reviews generic task/result/implementation quality, tests,
+reproducibility, rule compliance, claims, transcript milestones, and canonical
+time accounting. Its prompt, rubric, output schema, and HTML renderer are one
+versioned Brunner contract.
+
+A benchmark enables that contract with `QualitativeReviewDefinition`, which
+supplies the fixed reviewer identity and policy. Brunner records the standard
+contract digest when it creates the trial and runs the review automatically
+after deterministic evaluation on direct, local, container, and campaign
+paths. The reviewer receives the same output schema that Brunner later uses to
+validate the response.
+
+Benchmarks may also own additional assessment directories for domain-specific
+criteria. Those directories contain their reviewer prompt, rubric, output
+schema, trusted evidence, and optional renderer.
 
 For every assessment Brunner:
 
@@ -108,8 +121,11 @@ temporary workspace outside the trial with `BRUNNER_*` environment variables
 removed. Candidate provider and model fields are omitted from the dossier and
 matching structured fields are redacted from copied JSON evidence. The result
 records that provider family may still be inferable from transcript structure.
+The temporary reviewer workspace is a second copy of the selected evidence;
+large benchmarks should select compact review inputs rather than whole
+datasets or trajectory trees.
 
-Brunner packages
+Brunner also packages
 `https://brunner.dev/schemas/assessment-common.schema.json` as an optional
 schema resource. Benchmarks may reference its generic `evidence` and
 `criterion` definitions while retaining their own rating vocabulary and
@@ -118,7 +134,9 @@ domain-specific output structure.
 Assessment status is separate from deterministic evaluation status. Optional
 assessment failures remain visible but do not fail a campaign trial. A failed
 required assessment sets `required_assessments_complete` to false and makes
-the campaign trial unsuccessful.
+the campaign trial unsuccessful. The standard qualitative review is
+non-gating by default and runs on failed deterministic evaluations so it can
+diagnose the failure; both behaviors are configurable.
 
 ## Trust Boundary
 
@@ -328,7 +346,8 @@ Campaign reconciliation:
   campaign exceed `max_parallel`
 - Does not clean up when recovery fails
 - Runs trusted evaluation after verified collection
-- Runs configured assessments after deterministic evaluation
+- Runs the configured standard qualitative review and domain assessments after
+  deterministic evaluation
 - Regenerates `index.html` after each transition with live elapsed time,
   backend warnings, usage, timing, and report links
 

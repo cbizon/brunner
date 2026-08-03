@@ -7,6 +7,7 @@ from brunner.definition import (
     BenchmarkDefinition,
     ChallengeDefinition,
     EvaluationDefinition,
+    QualitativeReviewDefinition,
     ReferenceDefinition,
     RuntimeDefaults,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "CampaignTrial",
     "EvaluationDefinition",
     "ProviderSettings",
+    "QualitativeReviewDefinition",
     "ReferenceDefinition",
     "RuntimeDefaults",
     "activity",
