@@ -141,6 +141,27 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert expression["values"] == ["node-a"]
 
 
+def test_kubernetes_helper_pod_uses_neutral_working_directory() -> None:
+    profile = KubernetesProfile(
+        namespace="benchmarks",
+        agent_image="agent:latest",
+    )
+
+    helper = render_helper_pod(
+        "case-1-stage",
+        "case-1-data",
+        "agent:latest",
+        profile,
+        {"dev.brunner/role": "trial-stager"},
+    )
+
+    container = helper["spec"]["containers"][0]
+    assert container["workingDir"] == "/tmp"
+    assert container["volumeMounts"] == [
+        {"name": "trial", "mountPath": "/brunner/trial"}
+    ]
+
+
 def test_native_resource_names_do_not_collapse_caller_ids(
     tmp_path: Path,
 ) -> None:

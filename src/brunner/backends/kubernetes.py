@@ -167,6 +167,8 @@ def render_helper_pod(
         "name": "helper",
         "image": image,
         "command": ["sh", "-c", "trap : TERM INT; sleep 86400 & wait"],
+        # Never inherit an image WORKDIR hidden by the trial PVC mount.
+        "workingDir": "/tmp",
         "volumeMounts": [{"name": "trial", "mountPath": "/brunner/trial"}],
     }
     return {
