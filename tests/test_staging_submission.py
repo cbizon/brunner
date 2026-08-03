@@ -17,6 +17,7 @@ from brunner.definition import (
 )
 from brunner.errors import (
     ChallengeMaterializationError,
+    ConfigurationError,
     ContractError,
     IntegrityError,
 )
@@ -367,6 +368,28 @@ root = Path(os.environ["BRUNNER_CHALLENGE_ROOT"])
         (trial / "workspace/.brunner-challenge.json").read_text()
     )
     assert metadata["challenge_sha256"] == staged["challenge_sha256"]
+
+
+def test_trial_metadata_records_optional_display_title(tmp_path: Path) -> None:
+    benchmark = replace(definition(), display_title="Text transformation")
+    contract = load_output_contract(benchmark.contract_path)
+
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "trials",
+        TrialIdentity("display-title", "codex", "test-model", "high"),
+    )
+
+    metadata = json.loads((trial / "metadata/manifest.json").read_text())
+    assert metadata["display_title"] == "Text transformation"
+
+
+def test_empty_display_title_is_rejected() -> None:
+    benchmark = replace(definition(), display_title=" ")
+
+    with pytest.raises(ConfigurationError, match="display_title"):
+        benchmark.validate()
 
 
 def test_failed_materialization_removes_partial_trial(

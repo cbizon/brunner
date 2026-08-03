@@ -110,10 +110,11 @@ For every assessment Brunner:
    artifact hashes, timing facts, usage, and evidence locations;
 3. copies allowlisted trial and trusted evidence into an assessment workspace;
 4. optionally runs a benchmark input-builder command;
-5. runs either a trusted command or a fixed Codex/Claude reviewer;
-6. validates the output against the benchmark's exact JSON Schema;
-7. optionally runs a benchmark renderer and registers its reports; and
-8. records attempts, usage, hashes, blinding limitations, and failure details.
+5. resolves and preflights the provider output schema;
+6. runs either a trusted command or a fixed Codex/Claude reviewer;
+7. validates the output against the benchmark's exact JSON Schema;
+8. optionally runs a benchmark renderer and registers its reports; and
+9. records attempts, usage, hashes, blinding limitations, and failure details.
 
 Model reviewers run without session persistence. Codex uses its read-only
 sandbox; Claude exposes and explicitly authorizes only read, glob, and grep
@@ -130,7 +131,10 @@ Brunner also packages
 `https://brunner.dev/schemas/assessment-common.schema.json` as an optional
 schema resource. Benchmarks may reference its generic `evidence` and
 `criterion` definitions while retaining their own rating vocabulary and
-domain-specific output structure.
+domain-specific output structure. Provider schemas inline only referenced
+common definitions and their dependencies; the typeless common-schema document
+is never embedded as a `$defs` entry. Provider-specific preflight failures are
+terminal assessment configuration errors and create no reviewer attempt.
 
 Assessment status is separate from deterministic evaluation status. Optional
 assessment failures remain visible but do not fail a campaign trial. A failed

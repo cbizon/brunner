@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from referencing import Registry, Resource
 
 from brunner.contract import OutputContract
 from brunner.definition import AssessmentDefinition, BenchmarkDefinition
-from brunner.errors import AssessmentError, IntegrityError
+from brunner.errors import AssessmentError, IntegrityError, ProviderSchemaError
 from brunner.hashing import sha256_file, sha256_tree
 from brunner.io import load_json_object, write_json_atomic
 from brunner.providers import ProviderRunContext, get_provider
@@ -467,48 +468,196 @@ def _run_prepare_command(
 def _resolved_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
     common = _packaged_schema("assessment-common.schema.json")
     common_id = str(common["$id"])
+    common_definitions = common.get("$defs", {})
+    if not isinstance(common_definitions, dict):
+        raise ProviderSchemaError(
+            "packaged assessment common schema has no $defs object"
+        )
+    local_definitions = schema.get("$defs", {})
+    if not isinstance(local_definitions, dict):
+        local_definitions = {}
+    injected: dict[str, Any] = {}
+    resolving: set[str] = set()
 
-    def rewrite(value: Any) -> Any:
+    def common_reference(reference: str) -> tuple[str, str] | None:
+        prefix = common_id + "#/$defs/"
+        if not reference.startswith(prefix):
+            return None
+        suffix = reference.removeprefix(prefix)
+        raw_name, separator, remainder = suffix.partition("/")
+        name = raw_name.replace("~1", "/").replace("~0", "~")
+        tail = f"/{remainder}" if separator else ""
+        return name, tail
+
+    def injected_reference(name: str, tail: str = "") -> str:
+        key = f"brunnerAssessmentCommon__{name}"
+        encoded = key.replace("~", "~0").replace("/", "~1")
+        return f"#/$defs/{encoded}{tail}"
+
+    def inject_common_definition(name: str) -> None:
+        key = f"brunnerAssessmentCommon__{name}"
+        if key in injected:
+            return
+        if key in local_definitions:
+            raise ProviderSchemaError(
+                "assessment schema reserves local $defs name "
+                f"{key!r} for Brunner common definitions"
+            )
+        definition = common_definitions.get(name)
+        if not isinstance(definition, dict):
+            raise ProviderSchemaError(
+                f"unknown Brunner assessment common definition {name!r}"
+            )
+        if name in resolving:
+            return
+        resolving.add(name)
+        injected[key] = rewrite_common(definition)
+        resolving.remove(name)
+
+    def rewrite_common(value: Any) -> Any:
         if isinstance(value, list):
-            return [rewrite(item) for item in value]
+            return [rewrite_common(item) for item in value]
         if not isinstance(value, dict):
             return value
-        selected = {key: rewrite(item) for key, item in value.items()}
+        selected = {
+            key: rewrite_common(item) for key, item in value.items()
+        }
         reference = selected.get("$ref")
-        if isinstance(reference, str) and reference.startswith(
-            common_id + "#"
-        ):
-            suffix = reference.removeprefix(common_id + "#")
-            selected["$ref"] = (
-                "#/$defs/brunnerAssessmentCommon" + suffix
-            )
+        if not isinstance(reference, str):
+            return selected
+        common_target = common_reference(reference)
+        if common_target is not None:
+            name, tail = common_target
+            inject_common_definition(name)
+            selected["$ref"] = injected_reference(name, tail)
+            return selected
+        if reference.startswith("#/$defs/"):
+            suffix = reference.removeprefix("#/$defs/")
+            raw_name, separator, remainder = suffix.partition("/")
+            name = raw_name.replace("~1", "/").replace("~0", "~")
+            tail = f"/{remainder}" if separator else ""
+            inject_common_definition(name)
+            selected["$ref"] = injected_reference(name, tail)
         return selected
 
-    selected = rewrite(schema)
-    embedded_common = rewrite(common)
-
-    def rewrite_embedded(value: Any) -> Any:
+    def rewrite_schema(value: Any) -> Any:
         if isinstance(value, list):
-            return [rewrite_embedded(item) for item in value]
+            return [rewrite_schema(item) for item in value]
         if not isinstance(value, dict):
             return value
-        rewritten = {
-            key: rewrite_embedded(item) for key, item in value.items()
+        selected = {
+            key: rewrite_schema(item) for key, item in value.items()
         }
-        reference = rewritten.get("$ref")
-        if isinstance(reference, str) and reference.startswith("#/$defs/"):
-            rewritten["$ref"] = (
-                "#/$defs/brunnerAssessmentCommon"
-                + reference.removeprefix("#")
-            )
-        return rewritten
+        reference = selected.get("$ref")
+        if isinstance(reference, str):
+            common_target = common_reference(reference)
+            if common_target is not None:
+                name, tail = common_target
+                inject_common_definition(name)
+                selected["$ref"] = injected_reference(name, tail)
+        return selected
 
-    embedded_common = rewrite_embedded(embedded_common)
-    embedded_common.pop("$id", None)
-    definitions = dict(selected.get("$defs", {}))
-    definitions["brunnerAssessmentCommon"] = embedded_common
-    selected["$defs"] = definitions
+    selected = rewrite_schema(schema)
+    if injected:
+        definitions = dict(selected.get("$defs", {}))
+        definitions.update(injected)
+        selected["$defs"] = definitions
     return selected
+
+
+def _schema_references(value: Any, path: str = "<root>") -> list[tuple[str, str]]:
+    references = []
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            references.extend(_schema_references(item, f"{path}/{index}"))
+    elif isinstance(value, dict):
+        reference = value.get("$ref")
+        if isinstance(reference, str):
+            references.append((path, reference))
+        for key, item in value.items():
+            references.extend(_schema_references(item, f"{path}/{key}"))
+    return references
+
+
+def _resolve_json_pointer(document: Any, reference: str) -> None:
+    if reference == "#":
+        return
+    if not reference.startswith("#/"):
+        raise ProviderSchemaError(
+            f"Codex reviewer schema reference must be local: {reference}"
+        )
+    selected = document
+    for raw_part in reference.removeprefix("#/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(selected, dict) and part in selected:
+            selected = selected[part]
+        elif isinstance(selected, list) and part.isdigit():
+            index = int(part)
+            if index >= len(selected):
+                raise ProviderSchemaError(
+                    f"Codex reviewer schema reference does not resolve: {reference}"
+                )
+            selected = selected[index]
+        else:
+            raise ProviderSchemaError(
+                f"Codex reviewer schema reference does not resolve: {reference}"
+            )
+
+
+def _preflight_provider_schema(
+    provider: str,
+    schema: dict[str, Any],
+) -> None:
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as error:
+        raise ProviderSchemaError(
+            f"resolved {provider} reviewer schema is invalid: {error}"
+        ) from error
+    if provider != "codex":
+        return
+    if schema.get("type") != "object":
+        raise ProviderSchemaError(
+            "Codex reviewer output schema root must have type 'object'"
+        )
+    if schema.get("additionalProperties") is not False:
+        raise ProviderSchemaError(
+            "Codex reviewer output schema root must set "
+            "additionalProperties to false"
+        )
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if not isinstance(properties, dict) or set(required or ()) != set(properties):
+        raise ProviderSchemaError(
+            "Codex reviewer output schema root must require every property"
+        )
+    definitions = schema.get("$defs", {})
+    if isinstance(definitions, dict):
+        shape_keys = {
+            "$ref",
+            "allOf",
+            "anyOf",
+            "const",
+            "enum",
+            "not",
+            "oneOf",
+            "type",
+        }
+        for name, definition in definitions.items():
+            if (
+                isinstance(definition, dict)
+                and "$defs" in definition
+                and not shape_keys.intersection(definition)
+            ):
+                raise ProviderSchemaError(
+                    "Codex reviewer output schema definition "
+                    f"{name!r} is a typeless schema container"
+                )
+    for path, reference in _schema_references(schema):
+        try:
+            _resolve_json_pointer(schema, reference)
+        except ProviderSchemaError as error:
+            raise ProviderSchemaError(f"{path}: {error}") from error
 
 
 def _reviewer_prompt(
@@ -564,6 +713,8 @@ def _run_reviewer(
     assert assessment.reviewer is not None
     adapter = get_provider(assessment.reviewer.provider)
     settings = adapter.validate_settings(assessment.reviewer)
+    resolved_schema = _resolved_provider_schema(schema)
+    _preflight_provider_schema(settings.provider, resolved_schema)
     with tempfile.TemporaryDirectory(
         prefix=f"brunner-{assessment.assessment_id}-"
     ) as temporary:
@@ -582,7 +733,7 @@ def _run_reviewer(
         )
         write_json_atomic(
             resolved_schema_path,
-            _resolved_provider_schema(schema),
+            resolved_schema,
         )
         run_environment = {
             key: value
