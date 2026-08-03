@@ -28,7 +28,19 @@ from brunner.usage import normalize_claude_usage, sum_usage
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CLAUDE_DISALLOWED_TOOLS = ("WebSearch", "WebFetch")
-CLAUDE_WORKSPACE_TOOLS = ("Bash", "Edit", "Write", "Read", "Glob", "Grep")
+CLAUDE_READ_ONLY_TOOLS = ("Read", "Glob", "Grep")
+CLAUDE_TERMINAL_HARNESS_ERROR_FRAGMENTS = (
+    "failed to create sandbox",
+    "failed to initialize sandbox",
+    "sandbox is not available",
+    "sandbox is unavailable",
+    "sandboxing is not supported",
+    "unshare: unshare failed: operation not permitted",
+)
+CLAUDE_PERMISSION_DENIAL_FRAGMENTS = (
+    "but you haven't granted it yet",
+    "but you have not granted it yet",
+)
 
 
 class ClaudeAdapter:
@@ -80,40 +92,21 @@ class ClaudeAdapter:
             '{"mcpServers":{}}',
             "--model",
             settings.model,
-            "--settings",
-            json.dumps(
-                {
-                    "sandbox": {
-                        "enabled": True,
-                        "autoAllowBashIfSandboxed": True,
-                        "allowUnsandboxedCommands": False,
-                        "failIfUnavailable": True,
-                        "filesystem": {
-                            "allowWrite": [str(context.workspace)],
-                        },
-                    },
-                },
-                separators=(",", ":"),
-            ),
         ]
         if context.read_only:
+            tools = ",".join(CLAUDE_READ_ONLY_TOOLS)
             command.extend(
                 (
                     "--permission-mode",
                     "dontAsk",
                     "--tools",
-                    "Read,Glob,Grep",
+                    tools,
+                    "--allowedTools",
+                    tools,
                 )
             )
         else:
-            command.extend(
-                (
-                    "--permission-mode",
-                    "dontAsk",
-                    "--tools",
-                    ",".join(CLAUDE_WORKSPACE_TOOLS),
-                )
-            )
+            command.append("--dangerously-skip-permissions")
         if settings.effort is not None:
             command.extend(("--effort", settings.effort))
         command.extend(("--json-schema", schema))
@@ -241,9 +234,9 @@ class ClaudeAdapter:
         stderr: str,
     ) -> ProviderFailure | None:
         summary = stderr.strip()
-        terminal = False
+        terminal = _is_terminal_harness_failure(stderr)
         api_status = None
-        reason = None
+        reason = "harness_configuration_error" if terminal else None
         wait_category = None
         retry_at_epoch = None
         for record in reversed(records):
@@ -288,11 +281,15 @@ class ClaudeAdapter:
             )
             if is_error and text and not summary:
                 summary = text
+            harness_failure = _is_terminal_harness_failure(text)
             if is_error and (
                 status in TERMINAL_HTTP_STATUSES
                 or any(fragment in lowered for fragment in TERMINAL_ERROR_FRAGMENTS)
+                or harness_failure
             ):
                 terminal = True
+                if harness_failure:
+                    reason = "harness_configuration_error"
         if not summary and not terminal:
             return None
         return ProviderFailure(
@@ -327,3 +324,17 @@ def _model_parts(value: str) -> tuple[str, ...]:
     if normalized.startswith("claude-"):
         normalized = normalized.removeprefix("claude-")
     return tuple(part for part in normalized.split("-") if part)
+
+
+def _is_terminal_harness_failure(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        fragment in lowered
+        for fragment in CLAUDE_TERMINAL_HARNESS_ERROR_FRAGMENTS
+    ) or (
+        "requested permissions to use" in lowered
+        and any(
+            fragment in lowered
+            for fragment in CLAUDE_PERMISSION_DENIAL_FRAGMENTS
+        )
+    )

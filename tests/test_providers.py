@@ -95,12 +95,11 @@ def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
     assert command[command.index("--mcp-config") + 1] == (
         '{"mcpServers":{}}'
     )
-    assert "--dangerously-skip-permissions" not in command
-    assert "dontAsk" in command
-    settings = json.loads(command[command.index("--settings") + 1])
-    assert settings["sandbox"]["enabled"] is True
-    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
-    assert settings["sandbox"]["failIfUnavailable"] is True
+    assert "--dangerously-skip-permissions" in command
+    assert "--settings" not in command
+    assert "--permission-mode" not in command
+    assert "--tools" not in command
+    assert "--allowedTools" not in command
 
 
 def test_claude_adapter_limits_read_only_reviewer_tools(
@@ -121,8 +120,59 @@ def test_claude_adapter_limits_read_only_reviewer_tools(
 
     assert "--permission-mode" in command
     assert "dontAsk" in command
-    assert "Read,Glob,Grep" in command
+    assert command[command.index("--tools") + 1] == "Read,Glob,Grep"
+    assert command[command.index("--allowedTools") + 1] == "Read,Glob,Grep"
     assert "--dangerously-skip-permissions" not in command
+    assert "--settings" not in command
+
+
+@pytest.mark.parametrize(
+    ("records", "stderr"),
+    [
+        (
+            [],
+            "unshare: unshare failed: Operation not permitted",
+        ),
+        (
+            [
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "result": (
+                        "Claude requested permissions to use Write, "
+                        "but you haven't granted it yet."
+                    ),
+                }
+            ],
+            "",
+        ),
+    ],
+)
+def test_claude_harness_configuration_failures_are_terminal(
+    records: list[dict[str, object]],
+    stderr: str,
+) -> None:
+    failure = ClaudeAdapter().classify_failure(records, stderr)
+
+    assert failure is not None
+    assert failure.terminal is True
+    assert failure.reason == "harness_configuration_error"
+
+
+def test_claude_command_permission_error_is_not_a_harness_failure() -> None:
+    failure = ClaudeAdapter().classify_failure(
+        [
+            {
+                "type": "result",
+                "is_error": True,
+                "result": "Bash exited with code 1: permission denied",
+            }
+        ],
+        "",
+    )
+
+    assert failure is not None
+    assert failure.terminal is False
 
 
 def test_provider_effort_can_be_limited_by_runtime_configuration(
