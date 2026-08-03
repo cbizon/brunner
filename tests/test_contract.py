@@ -49,6 +49,8 @@ def test_contract_rendering_uses_machine_readable_definition() -> None:
     assert "`uppercase`" in rendered
     assert "manifest value at `/output`" in rendered
     assert contract.run_status_path in rendered
+    assert "Return only the exact JSON object" in rendered
+    assert "must not be wrapped in prose, Markdown, or code fences" in rendered
 
 
 def test_contract_rejects_duplicate_work_units(tmp_path: Path) -> None:

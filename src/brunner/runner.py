@@ -15,6 +15,7 @@ from typing import IO, Any, Callable
 from brunner.contract import (
     OutputContract,
     load_output_contract,
+    render_final_response_handoff,
     validate_final_response,
 )
 from brunner.definition import BenchmarkDefinition, RuntimeDefaults
@@ -112,24 +113,58 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def continuation_prompt(contract: OutputContract) -> str:
-    return (
+def _output_repair_feedback(reason: str | None) -> str:
+    if reason == "missing_structured_final_response":
+        return (
+            "The previous attempt was rejected because it returned prose or "
+            "no valid structured final response. Workspace files alone do not "
+            "complete the run."
+        )
+    if reason == "submission_validation_failed":
+        return (
+            "The previous attempt was rejected because its final response did "
+            "not exactly match a valid submission. Repair the submission and "
+            "run-status document before responding."
+        )
+    return ""
+
+
+def continuation_prompt(
+    contract: OutputContract,
+    *,
+    repair_reason: str | None = None,
+) -> str:
+    parts = [
         "Continue the benchmark from the persistent workspace and provider "
         "session. Inspect existing work, complete every required output in "
         f"{contract.submission_manifest}, validate it against the schemas, "
-        f"and update {contract.run_status_path}. Do not stop after planning."
-    )
+        f"and update {contract.run_status_path}. Do not stop after planning.",
+    ]
+    feedback = _output_repair_feedback(repair_reason)
+    if feedback:
+        parts.append(feedback)
+    parts.append(render_final_response_handoff(contract))
+    return " ".join(parts)
 
 
-def finalization_prompt(contract: OutputContract) -> str:
-    return (
+def finalization_prompt(
+    contract: OutputContract,
+    *,
+    repair_reason: str | None = None,
+) -> str:
+    parts = [
         "The benchmark deadline is approaching. Stop starting long-running "
         "work. Preserve all useful outputs already produced and write the best "
         f"valid {contract.submission_manifest} possible. Always write "
         f"{contract.run_status_path}. Report complete only when all required "
         "outputs are valid, partial when useful valid work exists, or failed "
-        "otherwise. Finish now."
-    )
+        "otherwise. Finish now.",
+    ]
+    feedback = _output_repair_feedback(repair_reason)
+    if feedback:
+        parts.append(feedback)
+    parts.append(render_final_response_handoff(contract))
+    return " ".join(parts)
 
 
 def process_group_alive(process_group_id: int) -> bool:
@@ -1058,6 +1093,10 @@ def _run_configured_trial(
         attempt_events = attempt_prefix.with_suffix(".events.jsonl")
         attempt_stderr = attempt_prefix.with_suffix(".stderr.log")
         attempt_final = attempt_prefix.with_suffix(".final.json")
+        previous_attempt = state["attempts"][-1] if state["attempts"] else {}
+        repair_reason = previous_attempt.get("output_repair_reason")
+        if not isinstance(repair_reason, str):
+            repair_reason = None
         resume_session = bool(state["session_started"])
         context = ProviderRunContext(
             workspace=workspace,
@@ -1094,9 +1133,15 @@ def _run_configured_trial(
             mode=attempt["mode"],
         )
         if finalizing:
-            prompt = finalization_prompt(contract)
+            prompt = finalization_prompt(
+                contract,
+                repair_reason=repair_reason,
+            )
         elif resume_session:
-            prompt = continuation_prompt(contract)
+            prompt = continuation_prompt(
+                contract,
+                repair_reason=repair_reason,
+            )
         else:
             prompt = (
                 workspace / configuration.rendered_prompt
@@ -1262,6 +1307,9 @@ def _run_configured_trial(
             )
             if final_response is None:
                 attempt["status"] = "failed"
+                attempt["output_repair_reason"] = (
+                    "missing_structured_final_response"
+                )
                 attempt["failure"] = (
                     "provider returned no valid current structured final "
                     "response"
@@ -1276,6 +1324,9 @@ def _run_configured_trial(
                 )
                 if validation_error is not None:
                     attempt["status"] = "failed"
+                    attempt["output_repair_reason"] = (
+                        "submission_validation_failed"
+                    )
                     attempt["submission_validation_error"] = validation_error
                     attempt["failure"] = (
                         "provider final response did not have a valid "
@@ -1323,13 +1374,21 @@ def _run_configured_trial(
         if time.time() >= phase_deadline:
             continue
         state["status"] = "retrying"
+        output_repair_required = isinstance(
+            attempt.get("output_repair_reason"),
+            str,
+        )
         wait_category = (
             failure.wait_category
             if failure is not None and failure.wait_category
             else "runner_retry_wait"
         )
         now = time.time()
-        requested_wait = 0.0 if resume_unavailable else retry_seconds
+        requested_wait = (
+            0.0
+            if resume_unavailable or output_repair_required
+            else retry_seconds
+        )
         if (
             failure is not None
             and wait_category == "subscription_wait"
@@ -1379,7 +1438,7 @@ def _run_configured_trial(
             source="runner",
             attempt=attempt_number,
         )
-        if resume_unavailable:
+        if resume_unavailable or output_repair_required:
             retry_seconds = runtime.retry_initial_seconds
         elif wait_category == "runner_retry_wait":
             retry_seconds = min(

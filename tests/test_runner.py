@@ -17,6 +17,8 @@ from brunner.definition import (
 )
 from brunner.providers import CodexAdapter, ProviderSettings
 from brunner.runner import (
+    continuation_prompt,
+    finalization_prompt,
     process_group_alive,
     run_attempt,
     run_staged_trial,
@@ -691,6 +693,154 @@ print(json.dumps({
     assert limited["model_mismatch"] is None
     assert elapsed < 1
     assert timing["summary"]["subscription_wait_seconds"] > 0
+
+
+def test_claude_resume_repairs_missing_structured_final_response(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "claude-structured-repair",
+            "claude",
+            "claude-opus-5",
+            None,
+        ),
+    )
+    binary = tmp_path / "claude"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+import time
+
+counter_path = pathlib.Path(".attempt-count")
+count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
+counter_path.write_text(str(count))
+prompt = sys.stdin.read()
+with pathlib.Path(".prompts.jsonl").open("a") as stream:
+    stream.write(json.dumps(prompt) + "\n")
+
+if count == 1:
+    message = "You've hit your limit"
+    print(json.dumps({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": time.time() + 0.05,
+            "overageDisabledReason": "org_level_disabled",
+        },
+    }), flush=True)
+    print(json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": message,
+        "usage": {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        },
+    }), flush=True)
+    raise SystemExit(1)
+
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+record = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": (
+        "The benchmark is complete and all outputs are valid."
+        if count == 2
+        else json.dumps(response)
+    ),
+    "usage": {
+        "input_tokens": 1,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    },
+}
+if count == 3:
+    record["structured_output"] = response
+print(json.dumps(record), flush=True)
+""",
+    )
+
+    started = time.monotonic()
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="claude",
+            model="claude-opus-5",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=2,
+            retry_max_seconds=2,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+    elapsed = time.monotonic() - started
+    prompts = [
+        json.loads(line)
+        for line in (
+            trial / "workspace/.prompts.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    assert state["status"] == "complete"
+    assert len(state["attempts"]) == 3
+    assert state["attempts"][0]["wait_category"] == "subscription_wait"
+    assert state["attempts"][1]["output_repair_reason"] == (
+        "missing_structured_final_response"
+    )
+    assert elapsed < 1
+    assert len(prompts) == 3
+    assert all("Return only the exact JSON object" in prompt for prompt in prompts)
+    assert "previous attempt was rejected" not in prompts[1].lower()
+    assert "previous attempt was rejected" in prompts[2].lower()
+
+
+def test_continuation_and_finalization_prompts_require_json_handoff() -> None:
+    contract = load_output_contract(definition().contract_path)
+
+    prompts = (
+        continuation_prompt(contract),
+        finalization_prompt(contract),
+        continuation_prompt(
+            contract,
+            repair_reason="missing_structured_final_response",
+        ),
+    )
+
+    assert all("Return only the exact JSON object" in prompt for prompt in prompts)
+    assert all("must not be wrapped in prose" in prompt for prompt in prompts)
+    assert "previous attempt was rejected" in prompts[-1].lower()
 
 
 def test_missing_resumed_session_retries_as_fresh_session(

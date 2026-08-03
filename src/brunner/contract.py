@@ -241,6 +241,15 @@ def _schema_type(schema: dict[str, Any]) -> str:
     return str(value or "value")
 
 
+def render_final_response_handoff(contract: OutputContract) -> str:
+    return (
+        "Return only the exact JSON object written to "
+        f"`{contract.run_status_path}` as your final response. It must conform "
+        "to `schema/final-response.schema.json` and must not be wrapped in "
+        "prose, Markdown, or code fences."
+    )
+
+
 def render_output_requirements(contract: OutputContract) -> str:
     data = contract.data
     lines = [f"## Required output: {data['title']}", ""]
@@ -313,6 +322,8 @@ def render_output_requirements(contract: OutputContract) -> str:
             "The run status contains `status`, `submission_manifest`, "
             "`completed_units`, and `limitations`. Use `complete` only when "
             "every required work unit and artifact is valid.",
+            "",
+            render_final_response_handoff(contract),
         )
     )
     return "\n".join(lines).rstrip() + "\n"
