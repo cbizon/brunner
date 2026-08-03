@@ -556,6 +556,64 @@ def test_dashboard_shows_live_elapsed_time_and_backend_warning(
     assert "ProvisioningFailed: storage offline" in rendered
 
 
+def test_dashboard_prefers_styled_assessment_report(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "index.html"
+    collected = tmp_path / "collected" / "run-a"
+
+    write_campaign_dashboard(
+        {
+            "campaign_id": "dashboard",
+            "status": "complete",
+            "benchmark_id": "benchmark",
+            "trials": [
+                {
+                    "test_id": "run-a",
+                    "provider": "codex",
+                    "model": "model-a",
+                    "phase": "complete",
+                    "collected_trial": str(collected),
+                    "evaluation": {
+                        "assessments": [
+                            {
+                                "assessment_id": "qualitative-review",
+                                "output": {
+                                    "path": (
+                                        "evaluation/qualitative-review.json"
+                                    )
+                                },
+                                "reports": [
+                                    {
+                                        "path": (
+                                            "evaluation/"
+                                            "qualitative-review.json"
+                                        ),
+                                        "media_type": "application/json",
+                                    },
+                                    {
+                                        "path": (
+                                            "evaluation/"
+                                            "qualitative-review.html"
+                                        ),
+                                        "media_type": "text/html",
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+            "events": [],
+        },
+        output,
+    )
+
+    rendered = output.read_text()
+    assert "qualitative-review.json" not in rendered
+    assert rendered.count("qualitative-review.html") == 1
+
+
 def test_required_assessment_failure_marks_campaign_trial_failed(
     tmp_path: Path,
     monkeypatch: Any,

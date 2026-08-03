@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brunner.report import visible_assessment_reports
+
 
 def _relative_link(output: Path, value: str | None) -> str:
     if not value:
@@ -133,7 +135,9 @@ def write_campaign_dashboard(
         for assessment in evaluation.get("assessments", []):
             if not isinstance(assessment, dict):
                 continue
-            for assessment_report in assessment.get("reports", []):
+            for assessment_report in visible_assessment_reports(
+                assessment
+            ):
                 if not isinstance(assessment_report, dict):
                     continue
                 href = _relative_link(
