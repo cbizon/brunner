@@ -49,6 +49,7 @@ def build_definition() -> BenchmarkDefinition:
     return BenchmarkDefinition(
         benchmark_id="my-benchmark",
         version="1.0.0",
+        display_title="My benchmark",  # optional run-report heading
         root=ROOT,
         contract_path=ROOT / "output-contract.json",
         challenge=ChallengeDefinition(
@@ -88,6 +89,11 @@ def build_definition() -> BenchmarkDefinition:
         ),
     )
 ```
+
+`benchmark_id` is the stable machine identity. Set `display_title` only when the
+generic run report should show a human-facing heading; omitting it leaves the
+report untitled while retaining the run ID, provider, model, effort, and status
+facts.
 
 `forbidden_names` is an additional isolation assertion, not an exclusion
 mechanism. Do not put evaluator/reference files under the challenge root.
@@ -205,6 +211,14 @@ running the packaged renderer. Candidate provider/model identity is omitted
 or redacted where practical. Reviewer identity, attempts, token usage, and
 contract hashes are recorded by the assessment envelope rather than trusted
 to reviewer self-report.
+
+References to Brunner's common assessment schema are resolved by copying only
+the referenced definitions and their transitive dependencies into the provider
+schema. Benchmark-local `$defs` remain unchanged. Before a Codex reviewer is
+launched, Brunner verifies that the resolved schema is a self-contained object
+schema with closed, required root properties and resolvable local references.
+Construction or preflight errors fail the assessment with zero reviewer
+attempts.
 
 The standard review is non-gating by default. Set `required=True` only when a
 missing or invalid review should make the campaign trial unsuccessful. If

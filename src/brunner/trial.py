@@ -82,25 +82,28 @@ def write_trial_metadata(
     trial: Path,
     staged: StageReport,
 ) -> None:
+    manifest = {
+        "schema_version": "1.0",
+        "test_id": identity.test_id,
+        "provider": identity.provider,
+        "model": identity.model,
+        "effort": identity.effort,
+        "benchmark_id": definition.benchmark_id,
+        "benchmark_version": definition.version,
+        "brunner_version": __version__,
+        "contract_sha256": contract.sha256,
+        "challenge_sha256": staged.challenge_sha256,
+        "assessment_contracts": [
+            assessment.contract_manifest()
+            for assessment in definition.resolved_assessments()
+        ],
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    if definition.display_title is not None:
+        manifest["display_title"] = definition.display_title
     write_json_atomic(
         trial / "metadata/manifest.json",
-        {
-            "schema_version": "1.0",
-            "test_id": identity.test_id,
-            "provider": identity.provider,
-            "model": identity.model,
-            "effort": identity.effort,
-            "benchmark_id": definition.benchmark_id,
-            "benchmark_version": definition.version,
-            "brunner_version": __version__,
-            "contract_sha256": contract.sha256,
-            "challenge_sha256": staged.challenge_sha256,
-            "assessment_contracts": [
-                assessment.contract_manifest()
-                for assessment in definition.resolved_assessments()
-            ],
-            "created_at": datetime.now(UTC).isoformat(),
-        },
+        manifest,
     )
     write_json_atomic(
         trial / "metadata/agent-run.json",

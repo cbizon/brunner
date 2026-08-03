@@ -56,3 +56,7 @@ class EvaluationError(BrunnerError):
 
 class AssessmentError(BrunnerError):
     """A trusted post-evaluation assessment failed."""
+
+
+class ProviderSchemaError(AssessmentError):
+    """A reviewer schema cannot be submitted to its provider."""

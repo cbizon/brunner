@@ -579,6 +579,7 @@ class BenchmarkDefinition:
     artifacts: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
     qualitative_review: QualitativeReviewDefinition | None = None
+    display_title: str | None = None
 
     def resolved_assessments(self) -> tuple[AssessmentDefinition, ...]:
         standard = (
@@ -593,6 +594,8 @@ class BenchmarkDefinition:
             raise ConfigurationError("benchmark_id cannot be empty")
         if not self.version.strip():
             raise ConfigurationError("benchmark version cannot be empty")
+        if self.display_title is not None and not self.display_title.strip():
+            raise ConfigurationError("benchmark display_title cannot be empty")
         if not self.root.is_dir():
             raise ConfigurationError(
                 f"benchmark root does not exist: {self.root}"

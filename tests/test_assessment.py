@@ -15,9 +15,13 @@ from brunner import (
     ChallengeDefinition,
     EvaluationDefinition,
 )
-from brunner.assessment import run_assessments
+from brunner.assessment import (
+    _preflight_provider_schema,
+    _resolved_provider_schema,
+    run_assessments,
+)
 from brunner.contract import load_output_contract
-from brunner.errors import ConfigurationError
+from brunner.errors import ConfigurationError, ProviderSchemaError
 from brunner.evaluation import evaluate_trial
 from brunner.providers import ProviderSettings
 from brunner.trial import TrialIdentity, create_trial
@@ -413,6 +417,199 @@ printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","c
         ]
         == "pass"
     )
+
+
+def test_provider_schema_inlines_only_referenced_common_definitions() -> None:
+    resolved = _resolved_provider_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["criterion"],
+            "properties": {
+                "criterion": {
+                    "$ref": f"{COMMON_SCHEMA}#/$defs/criterion"
+                }
+            },
+        }
+    )
+
+    definitions = resolved["$defs"]
+    assert "brunnerAssessmentCommon" not in definitions
+    assert definitions["brunnerAssessmentCommon__criterion"]["type"] == (
+        "object"
+    )
+    assert definitions["brunnerAssessmentCommon__evidence"]["type"] == "object"
+    assert resolved["properties"]["criterion"]["$ref"] == (
+        "#/$defs/brunnerAssessmentCommon__criterion"
+    )
+
+
+def test_codex_schema_preflight_rejects_typeless_definition_container() -> None:
+    with pytest.raises(ProviderSchemaError, match="typeless schema container"):
+        _preflight_provider_schema(
+            "codex",
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["result"],
+                "properties": {
+                    "result": {"$ref": "#/$defs/container"}
+                },
+                "$defs": {
+                    "container": {
+                        "$schema": (
+                            "https://json-schema.org/draft/2020-12/schema"
+                        ),
+                        "$defs": {
+                            "value": {"type": "string"},
+                        },
+                    }
+                },
+            },
+        )
+
+
+def test_codex_reviewer_preserves_local_defs_without_common_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    assessment_root.mkdir()
+    (assessment_root / "prompt.md").write_text("Review the evidence.\n")
+    (assessment_root / "review.schema.json").write_text(
+        json.dumps(
+            {
+                "$schema": (
+                    "https://json-schema.org/draft/2020-12/schema"
+                ),
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["verdict"],
+                "properties": {
+                    "verdict": {"$ref": "#/$defs/localVerdict"}
+                },
+                "$defs": {
+                    "localVerdict": {
+                        "type": "string",
+                        "enum": ["pass"],
+                    }
+                },
+            }
+        )
+    )
+    reviewer = tmp_path / "codex-reviewer"
+    reviewer.write_text(
+        f"""#!{sys.executable}
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+schema_path = pathlib.Path(
+    arguments[arguments.index("--output-schema") + 1]
+)
+schema = json.loads(schema_path.read_text())
+assert set(schema["$defs"]) == {{"localVerdict"}}
+assert "brunnerAssessmentCommon" not in json.dumps(schema)
+final = pathlib.Path(
+    arguments[arguments.index("--output-last-message") + 1]
+)
+result = {{"verdict": "pass"}}
+final.write_text(json.dumps(result))
+print(json.dumps({{
+    "type": "turn.completed",
+    "structured_output": result,
+}}), flush=True)
+"""
+    )
+    reviewer.chmod(0o755)
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="local-defs-review",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            output_schema_path="review.schema.json",
+            output_path="evaluation/local-defs-review.json",
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="judge-model",
+            ),
+            reviewer_executable=str(reviewer),
+            required=True,
+            max_attempts=3,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    _pythonpath(monkeypatch)
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assessment = result["assessments"][0]
+    assert assessment["status"] == "complete"
+    assert len(assessment["attempts"]) == 1
+
+
+def test_codex_schema_preflight_fails_before_reviewer_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    assessment_root.mkdir()
+    (assessment_root / "prompt.md").write_text("Review the evidence.\n")
+    (assessment_root / "review.schema.json").write_text(
+        json.dumps(
+            {
+                "$schema": (
+                    "https://json-schema.org/draft/2020-12/schema"
+                ),
+                "$defs": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["pass"],
+                    }
+                },
+            }
+        )
+    )
+    marker = tmp_path / "reviewer-launched"
+    reviewer = tmp_path / "codex-reviewer"
+    reviewer.write_text(
+        "#!/bin/sh\n"
+        f"touch {marker}\n"
+        "exit 1\n"
+    )
+    reviewer.chmod(0o755)
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="invalid-schema-review",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            output_schema_path="review.schema.json",
+            output_path="evaluation/invalid-schema-review.json",
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="judge-model",
+            ),
+            reviewer_executable=str(reviewer),
+            required=True,
+            max_attempts=3,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    _pythonpath(monkeypatch)
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assessment = result["assessments"][0]
+    assert assessment["status"] == "failed"
+    assert assessment["attempts"] == []
+    assert assessment["error"]["type"] == "ProviderSchemaError"
+    assert "root must have type 'object'" in assessment["error"]["message"]
+    assert not marker.exists()
 
 
 def test_provider_reviewer_retries_transient_failure(
