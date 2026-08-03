@@ -41,6 +41,30 @@ def _assessment_artifact_path(value: str, *, field_name: str) -> str:
     return normalized
 
 
+def _contract_command(
+    command: tuple[str, ...],
+    *,
+    assessment_root: Path,
+) -> list[str]:
+    root = assessment_root.resolve()
+    python = Path(sys.executable).resolve()
+    normalized = []
+    for argument in command:
+        candidate = Path(argument)
+        if not candidate.is_absolute():
+            normalized.append(argument)
+            continue
+        resolved = candidate.resolve()
+        if resolved == python:
+            normalized.append("{python}")
+        elif resolved.is_relative_to(root):
+            relative = resolved.relative_to(root).as_posix()
+            normalized.append(f"{{assessment_root}}/{relative}")
+        else:
+            normalized.append(argument)
+    return normalized
+
+
 @dataclass(frozen=True)
 class ChallengeDefinition:
     root: Path
@@ -163,6 +187,7 @@ class AssessmentDefinition:
     max_attempts: int = 3
     retry_initial_seconds: float = 10
     retry_max_seconds: float = 60
+    portable_command_paths: bool = False
 
     @property
     def resolved_input_path(self) -> str:
@@ -274,6 +299,15 @@ class AssessmentDefinition:
 
     def contract_manifest(self) -> dict[str, Any]:
         self.validate()
+
+        def contract_command(command: tuple[str, ...]) -> list[str]:
+            if not self.portable_command_paths:
+                return list(command)
+            return _contract_command(
+                command,
+                assessment_root=self.root,
+            )
+
         materials = []
         recorded_paths = set()
         for role, relative in (
@@ -358,7 +392,7 @@ class AssessmentDefinition:
         else:
             method = {
                 "kind": "command",
-                "command": list(self.command),
+                "command": contract_command(self.command),
             }
         value = {
             "assessment_id": self.assessment_id,
@@ -366,8 +400,8 @@ class AssessmentDefinition:
             "method": method,
             "output_path": self.output_path,
             "input_path": self.resolved_input_path,
-            "prepare_command": list(self.prepare_command),
-            "render_command": list(self.render_command),
+            "prepare_command": contract_command(self.prepare_command),
+            "render_command": contract_command(self.render_command),
             "trial_evidence_paths": list(self.trial_evidence_paths),
             "trusted_evidence_paths": list(
                 self.trusted_evidence_paths
@@ -381,6 +415,8 @@ class AssessmentDefinition:
             "retry_initial_seconds": self.retry_initial_seconds,
             "retry_max_seconds": self.retry_max_seconds,
         }
+        if self.portable_command_paths:
+            value["portable_command_paths"] = True
         return {
             **value,
             "contract_sha256": _contract_digest(value),
@@ -399,7 +435,6 @@ class QualitativeReviewDefinition:
         "timing",
         "usage",
         "status.json",
-        "backend/workload.log",
     )
     timeout_seconds: float = 60 * 60
     max_attempts: int = 3
@@ -419,6 +454,7 @@ class QualitativeReviewDefinition:
             reviewer=self.reviewer,
             reviewer_executable=self.reviewer_executable,
             render_command=(sys.executable, str(root / "render.py")),
+            portable_command_paths=True,
             trial_evidence_paths=self.trial_evidence_paths,
             reports=(
                 AssessmentReport(
@@ -578,19 +614,16 @@ class BenchmarkDefinition:
         artifact_owners: dict[str, str] = {}
         for assessment in resolved_assessments:
             assessment.validate()
-            if self.evaluation.results_path in {
-                assessment.resolved_input_path,
-                assessment.output_path,
-            }:
-                raise ConfigurationError(
-                    "assessment input/output paths cannot overwrite "
-                    "evaluation results"
-                )
             artifact_paths = {
                 assessment.resolved_input_path,
                 assessment.output_path,
                 *(report.path for report in assessment.reports),
             }
+            if self.evaluation.results_path in artifact_paths:
+                raise ConfigurationError(
+                    "assessment artifact paths cannot overwrite "
+                    "evaluation results"
+                )
             for path in artifact_paths:
                 owner = artifact_owners.get(path)
                 if owner is not None and owner != assessment.assessment_id:
@@ -599,6 +632,8 @@ class BenchmarkDefinition:
                         f"both {owner!r} and {assessment.assessment_id!r}"
                     )
                 artifact_owners[path] = assessment.assessment_id
+        # Benchmark-owned assessments stay in the benchmark checkout. The
+        # standard qualitative review is packaged with Brunner instead.
         for assessment in self.assessments:
             if not assessment.root.resolve().is_relative_to(
                 self.root.resolve()

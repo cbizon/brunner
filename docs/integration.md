@@ -228,6 +228,14 @@ An assessment must define exactly one execution method:
 - `command=(...)` invokes trusted benchmark code that writes
   `BRUNNER_ASSESSMENT_OUTPUT`.
 
+`portable_command_paths=True` records the active Python interpreter as
+`{python}` and files beneath the assessment root as
+`{assessment_root}/...` in the contract digest. Runtime commands remain
+unchanged, and referenced files remain content-hashed. The packaged standard
+review enables this so moving between equivalent Brunner installations does
+not create false contract drift; benchmark-owned assessments retain their
+literal command paths unless they opt in.
+
 Command implementations can use the helper API instead of reading environment
 variables directly:
 
@@ -277,6 +285,13 @@ is a configuration error. Symlinks are rejected. Generated inputs, outputs,
 and reports must be under `evaluation/` or `assessments/`; Brunner rejects
 configurations that could overwrite the candidate workspace or deterministic
 evaluation result.
+
+Model-review evidence exists in two copies while the review runs: one durable
+copy under the trial's assessment workspace and one temporary copy that
+isolates the reviewer from the trial. Benchmarks with large datasets,
+trajectories, videos, or generated resources should narrow
+`trial_evidence_paths` to the source, summaries, metrics, and representative
+artifacts the reviewer actually needs.
 
 The packaged common schema can be referenced without copying it:
 

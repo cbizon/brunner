@@ -159,7 +159,9 @@ def main() -> None:
     review = json.loads(review_path.read_text())
     if not isinstance(review, dict):
         raise TypeError("qualitative review output must be an object")
-    output = trial / "evaluation/qualitative-review.html"
+    output = review_path.with_suffix(".html")
+    if not output.resolve().is_relative_to(trial.resolve()):
+        raise ValueError("qualitative review report must remain in the trial")
     output.write_text(render_review(review))
 
 

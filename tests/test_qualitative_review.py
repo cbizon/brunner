@@ -255,6 +255,15 @@ def test_standard_qualitative_review_runs_and_renders(
     _write_reviewer(reviewer, _valid_review())
     definition = _definition(root, reviewer)
     trial, contract = _create_trial(tmp_path, definition)
+    (trial / "backend/workload.log").write_text(
+        json.dumps(
+            {
+                "provider": "codex",
+                "model": "candidate-model",
+                "effort": "high",
+            }
+        )
+    )
     _set_pythonpath(monkeypatch)
 
     result = evaluate_trial(definition, contract, trial)
@@ -281,6 +290,19 @@ def test_standard_qualitative_review_runs_and_renders(
     assert roles == {"prompt", "rubric", "output_schema", "render_command"}
     assert dossier["identity_blinding"]["identity_blinded"] is True
     assert "candidate-model" not in json.dumps(dossier)
+    evidence_root = (
+        trial
+        / "assessments/qualitative-review/workspace/evidence"
+    )
+    copied_evidence = "\n".join(
+        path.read_text(errors="replace")
+        for path in evidence_root.rglob("*")
+        if path.is_file()
+    )
+    assert "candidate-model" not in copied_evidence
+    assert not (
+        evidence_root / "trial/backend/workload.log"
+    ).exists()
     assert "<script>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "Task Fidelity" in rendered
@@ -299,6 +321,25 @@ def test_benchmark_without_qualitative_review_is_unchanged(
     assert result["assessments"] == []
     assert metadata["assessment_contracts"] == []
     assert not (trial / "evaluation/qualitative-review.json").exists()
+
+
+def test_qualitative_renderer_derives_report_from_output_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brunner.qualitative.render import main
+
+    trial = tmp_path / "trial"
+    output = trial / "evaluation/custom-review.json"
+    output.parent.mkdir(parents=True)
+    output.write_text(json.dumps(_valid_review()))
+    monkeypatch.setenv("BRUNNER_TRIAL_ROOT", str(trial))
+    monkeypatch.setenv("BRUNNER_ASSESSMENT_OUTPUT", str(output))
+
+    main()
+
+    assert (trial / "evaluation/custom-review.html").is_file()
+    assert not (trial / "evaluation/qualitative-review.html").exists()
 
 
 def test_standard_review_runs_after_failed_deterministic_evaluation(

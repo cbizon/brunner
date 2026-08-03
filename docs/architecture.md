@@ -121,6 +121,9 @@ temporary workspace outside the trial with `BRUNNER_*` environment variables
 removed. Candidate provider and model fields are omitted from the dossier and
 matching structured fields are redacted from copied JSON evidence. The result
 records that provider family may still be inferable from transcript structure.
+The temporary reviewer workspace is a second copy of the selected evidence;
+large benchmarks should select compact review inputs rather than whole
+datasets or trajectory trees.
 
 Brunner also packages
 `https://brunner.dev/schemas/assessment-common.schema.json` as an optional
