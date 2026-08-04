@@ -317,6 +317,11 @@ Campaign backends must declare `agent_isolation = "container"`.
 creates a Job, and recovers files through reader pods. Helper pods explicitly
 use `/tmp` as their working directory so an image working directory beneath
 `/brunner/trial` cannot create unwritable paths when the trial PVC is mounted.
+Submission is idempotent across ambiguous backend responses: a Kubernetes
+retry adopts an existing labeled Job before considering staging, and an OCI
+retry adopts the deterministic named container. Kubernetes records completed
+staging on the PVC so a retry after staging but before Job creation does not
+copy the trial again.
 
 The backend workload deadline is the agent hard deadline plus
 `backend_shutdown_grace_seconds`; the outer backend therefore does not kill
@@ -346,6 +351,8 @@ Campaign reconciliation:
 - Treats an existing matching ID as already known, regardless of list order
 - Rejects only an ID reused with conflicting execution attributes
 - Submits only up to plan and backend capacity
+- Persists a `submitting` phase before backend side effects and immediately
+  persists the returned or adopted handle
 - Resumes from persisted handles
 - Pauses individual steps on backend connectivity loss; `run()` waits and
   resumes without changing remote workloads
