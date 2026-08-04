@@ -648,6 +648,11 @@ the backend cannot be reached. `campaign-run` keeps waiting and retries until
 connectivity returns or the process is interrupted; it does not alter remote
 workloads while disconnected.
 
+Kubernetes helper, Job, and PVC cleanup is synchronous. Brunner removes stale
+staging and artifact-reader pods by workload labels before reuse and does not
+mark a trial complete until deletions finish. If Kubernetes becomes unreachable
+during cleanup, the campaign remains in `cleanup_pending` and retries later.
+
 Artifact-transfer interruptions retain verified partial files and retry after
 `collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
 identity, path, and other integrity failures are not retried automatically.

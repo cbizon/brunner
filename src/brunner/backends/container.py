@@ -12,7 +12,6 @@ from brunner.backends.base import (
     BackendHandle,
     BackendSnapshot,
     WorkloadSpec,
-    backend_registry_key,
     native_resource_name,
 )
 from brunner.definition import ArtifactPolicy
@@ -51,7 +50,6 @@ class ContainerBackend:
             dict.fromkeys(inherited_environment)
         )
         self.nonsecret_environment = dict(nonsecret_environment or {})
-        self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     def _runtime_error(
         self,
@@ -124,9 +122,6 @@ class ContainerBackend:
                 trial=workload.trial.resolve(),
                 metadata={"name": str(state["name"])},
             )
-            self._handles[
-                backend_registry_key(workload.workload_id, workload.trial)
-            ] = handle
             return handle
         existing = self._run(
             "inspect",
@@ -165,9 +160,6 @@ class ContainerBackend:
                     "name": name,
                 },
             )
-            self._handles[
-                backend_registry_key(workload.workload_id, workload.trial)
-            ] = handle
             return handle
         existing_message = (existing.stderr or existing.stdout).strip()
         if "no such" not in existing_message.lower():
@@ -225,9 +217,6 @@ class ContainerBackend:
                 "name": name,
             },
         )
-        self._handles[
-            backend_registry_key(workload.workload_id, workload.trial)
-        ] = handle
         return handle
 
     def restart(

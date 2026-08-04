@@ -665,6 +665,10 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     retry_not_before = interrupted["retry_not_before_epoch"]
     assert retry_not_before > time.time()
     assert interrupted["next_retry_category"] == "subscription_wait"
+    assert "next_retry_seconds" not in interrupted
+    assert interrupted["retry_backoff_seconds"] == (
+        runtime.retry_initial_seconds
+    )
 
     remaining_wait = max(0.0, retry_not_before - time.time())
     resumed_at = time.monotonic()
@@ -682,6 +686,9 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     assert len(completed["attempts"]) == 2
     assert resumed_elapsed >= max(0.0, remaining_wait - 0.08)
     assert "retry_not_before_epoch" not in completed
+    assert "retry_backoff_seconds" not in completed
+    assert "next_retry_category" not in completed
+    assert "next_retry_seconds" not in completed
     assert all(attempt["provider_started"] for attempt in completed["attempts"])
 
 
