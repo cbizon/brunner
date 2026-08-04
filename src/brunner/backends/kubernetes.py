@@ -49,6 +49,18 @@ CONNECTIVITY_FRAGMENTS = (
     "service unavailable",
 )
 STAGED_ANNOTATION = "dev.brunner/staged"
+NON_RETRYABLE_JOB_FAILURES = frozenset({"DeadlineExceeded"})
+NON_RETRYABLE_CONTAINER_FAILURES = frozenset(
+    {
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "InvalidImageName",
+        "RunContainerError",
+        "StartError",
+    }
+)
 
 
 class ReaderMountError(BackendRequestError):
@@ -387,6 +399,18 @@ class KubernetesBackend:
             "--wait=false",
         )
 
+    def _delete_and_wait(self, kind: str, name: str) -> None:
+        self._run(
+            "delete",
+            kind,
+            name,
+            "-n",
+            self.profile.namespace,
+            "--ignore-not-found=true",
+            "--wait=true",
+            f"--timeout={math.ceil(self.profile.command_timeout_seconds)}s",
+        )
+
     def _get(
         self,
         kind: str,
@@ -559,9 +583,12 @@ class KubernetesBackend:
         pvc: dict[str, Any] | None,
         job_name: str,
         claim_name: str,
+        workload_name: str | None = None,
     ) -> None:
         labels = job.get("metadata", {}).get("labels", {})
-        if labels.get("dev.brunner/workload") != job_name:
+        if labels.get("dev.brunner/workload") != (
+            workload_name or job_name
+        ):
             raise BackendRequestError(
                 f"existing Kubernetes Job {job_name} is not owned by Brunner"
             )
@@ -699,6 +726,91 @@ class KubernetesBackend:
         )
         return self._persist_submission_handle(state_path, handle)
 
+    def restart(
+        self,
+        handle: BackendHandle,
+        workload: WorkloadSpec,
+        generation: int,
+    ) -> BackendHandle:
+        workload.validate()
+        if generation < 1:
+            raise BackendRequestError(
+                "Kubernetes restart generation must be positive"
+            )
+        image = workload.image or self.profile.agent_image
+        if not image:
+            raise BackendRequestError(
+                "Kubernetes workloads require an agent image"
+            )
+        workload_name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+        )
+        claim_name = str(handle.metadata["claim_name"])
+        job_name = native_resource_name(
+            workload.workload_id,
+            workload.trial,
+            suffix=f"-r{generation}",
+        )
+        labels = {
+            "app.kubernetes.io/name": "brunner",
+            "dev.brunner/workload": workload_name,
+            "dev.brunner/restart-generation": str(generation),
+            **workload.labels,
+        }
+        pvc = self._get("pvc", claim_name)
+        if pvc is None:
+            raise BackendRequestError(
+                f"cannot restart Kubernetes workload without PVC {claim_name}"
+            )
+        pvc_labels = pvc.get("metadata", {}).get("labels", {})
+        if pvc_labels.get("dev.brunner/workload") != workload_name:
+            raise BackendRequestError(
+                f"existing Kubernetes PVC {claim_name} is not owned "
+                "by this Brunner workload"
+            )
+        job = self._get("job", job_name)
+        if job is not None:
+            self._validate_remote_submission(
+                job=job,
+                pvc=pvc,
+                job_name=job_name,
+                claim_name=claim_name,
+                workload_name=workload_name,
+            )
+            restarted = self._submission_handle(
+                workload,
+                job_name=job_name,
+                claim_name=claim_name,
+                submitted_at=job.get("metadata", {}).get("creationTimestamp"),
+            )
+            restarted.metadata["restart_generation"] = generation
+            return self._persist_submission_handle(
+                self._state_path(workload.trial),
+                restarted,
+            )
+
+        self._delete_and_wait("job", handle.native_id)
+        self._apply(
+            render_job(
+                job_name,
+                claim_name,
+                workload,
+                self.profile,
+                labels,
+            )
+        )
+        restarted = self._submission_handle(
+            workload,
+            job_name=job_name,
+            claim_name=claim_name,
+        )
+        restarted.metadata["restart_generation"] = generation
+        return self._persist_submission_handle(
+            self._state_path(workload.trial),
+            restarted,
+        )
+
     def _pod_for_handle(
         self,
         handle: BackendHandle,
@@ -791,6 +903,32 @@ class KubernetesBackend:
             reason = failed.get("reason") or "JobFailed"
             message = failed.get("message")
         pod_status = pod.get("status", {}) if pod else {}
+        failed_condition = conditions.get("Failed", {})
+        job_failure_reason = failed_condition.get("reason")
+        pod_failure_reason = pod_status.get("reason")
+        retryable_infrastructure = (
+            phase == "failed"
+            and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
+            and reason not in NON_RETRYABLE_CONTAINER_FAILURES
+            and (
+                exit_code not in {None, 0}
+                or reason
+                in {
+                    "ContainerStatusUnknown",
+                    "Evicted",
+                    "NodeLost",
+                    "OOMKilled",
+                    "Shutdown",
+                }
+                or pod_failure_reason
+                in {
+                    "Evicted",
+                    "NodeLost",
+                    "Shutdown",
+                }
+                or job_failure_reason == "BackoffLimitExceeded"
+            )
+        )
         return BackendSnapshot(
             phase=phase,
             reason=reason,
@@ -806,6 +944,9 @@ class KubernetesBackend:
                     pvc.get("status", {}).get("phase") if pvc else None
                 ),
                 "terminated_container": terminated,
+                "job_failure_reason": job_failure_reason,
+                "pod_failure_reason": pod_failure_reason,
+                "retryable_infrastructure": retryable_infrastructure,
             },
         )
 

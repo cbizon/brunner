@@ -211,6 +211,17 @@ class ContainerBackend:
         ] = handle
         return handle
 
+    def restart(
+        self,
+        handle: BackendHandle,
+        workload: WorkloadSpec,
+        generation: int,
+    ) -> BackendHandle:
+        raise BackendRequestError(
+            "automatic infrastructure restart is not supported by the "
+            "container backend"
+        )
+
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
         result = self._run(
             "inspect",

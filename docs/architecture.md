@@ -338,6 +338,13 @@ retries artifact readers, excludes failed reader nodes when rescheduling,
 resumes partial files by byte offset, and verifies every SHA-256. A failed
 workload's PVC is retained until artifact collection succeeds.
 
+Failed Kubernetes Jobs whose agent process was interrupted by eviction, node
+loss, OOM termination, or another nonzero container exit can be relaunched
+against the same staged PVC. Restart Jobs use deterministic generation names,
+so an ambiguous restart response is adoptable. Deadline expiry and container
+configuration failures are terminal rather than retried. The campaign bounds
+automatic restart generations with `infrastructure_max_restarts`.
+
 ## Campaign State
 
 Campaign trial IDs are supplied explicitly by the benchmark. They are not
@@ -358,6 +365,8 @@ Campaign reconciliation:
   resumes without changing remote workloads
 - Collects artifacts for both successful and failed workloads
 - Recovers interrupted collection and evaluation phases after a crash
+- Relaunches retryable infrastructure failures against existing persistent
+  agent state with a bounded restart count
 - Retries interrupted artifact transfers with a bounded, configurable policy
 - Keeps integrity and evaluation failures durable instead of retrying them
 - Continues healthy running or pending trials when another needs attention

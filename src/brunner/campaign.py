@@ -106,6 +106,7 @@ class CampaignPlan:
     included_artifact_groups: frozenset[str] = frozenset()
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
+    infrastructure_max_restarts: int = 2
     trial_timeout_seconds: float | None = None
     trial_timeout_margin_seconds: float = 5 * 60
     max_pause_seconds: float | None = 60 * 60
@@ -125,6 +126,10 @@ class CampaignPlan:
         if self.collection_max_attempts < 1:
             raise ValueError(
                 "campaign collection_max_attempts must be positive"
+            )
+        if self.infrastructure_max_restarts < 0:
+            raise ValueError(
+                "campaign infrastructure_max_restarts cannot be negative"
             )
         if (
             self.trial_timeout_seconds is not None
@@ -172,6 +177,9 @@ class CampaignPlan:
             ),
             "collection_retry_seconds": self.collection_retry_seconds,
             "collection_max_attempts": self.collection_max_attempts,
+            "infrastructure_max_restarts": (
+                self.infrastructure_max_restarts
+            ),
             "trial_timeout_seconds": self.trial_timeout_seconds,
             "trial_timeout_margin_seconds": (
                 self.trial_timeout_margin_seconds
@@ -361,6 +369,10 @@ class CampaignRunner:
                 ),
             }
             if existing is not None:
+                attempts = existing.setdefault("attempts", {})
+                attempts.setdefault("submission", 0)
+                attempts.setdefault("collection", 0)
+                attempts.setdefault("infrastructure", 0)
                 actual = {
                     "provider": existing.get("provider"),
                     "model": existing.get("model"),
@@ -450,6 +462,7 @@ class CampaignRunner:
                 "attempts": {
                     "submission": 0,
                     "collection": 0,
+                    "infrastructure": 0,
                 },
             }
             state["trials"].append(entry)
@@ -616,6 +629,79 @@ class CampaignRunner:
         # identity of a workload that may already be running remotely.
         self._save(state)
         return handle
+
+    def _restart_infrastructure_entry(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+        handle: BackendHandle,
+    ) -> BackendHandle | None:
+        restart = getattr(self.backend, "restart", None)
+        if not callable(restart):
+            return None
+        workload = self.workload_factory(
+            Path(entry["trial"]),
+            self._campaign_trial(entry),
+            self.plan,
+            self.definition,
+            self.backend.name,
+        )
+        resuming = entry["phase"] == "infrastructure_retrying"
+        if resuming:
+            generation = int(entry["attempts"]["infrastructure"])
+        else:
+            entry["attempts"]["infrastructure"] += 1
+            generation = int(entry["attempts"]["infrastructure"])
+            entry["phase"] = "infrastructure_retrying"
+            entry["infrastructure_retry"] = {
+                "generation": generation,
+                "started_at": _now(),
+                "previous_handle": handle.to_dict(),
+                "previous_snapshot": entry.get("backend_snapshot"),
+            }
+            self._event(
+                state,
+                "infrastructure_retry_started",
+                f"restarting failed backend workload as generation {generation}",
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+        try:
+            restarted = restart(handle, workload, generation)
+        except BackendConnectivityError:
+            raise
+        except BackendError as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            entry["infrastructure_retry"]["error"] = str(error)
+            self._event(
+                state,
+                "infrastructure_retry_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
+        entry.setdefault("first_submitted_at", entry.get("submitted_at"))
+        entry["handle"] = restarted.to_dict()
+        entry["phase"] = "submitted"
+        entry["submitted_at"] = (
+            restarted.metadata.get("submitted_at")
+            if isinstance(restarted.metadata.get("submitted_at"), str)
+            else _now()
+        )
+        entry["backend_workload_live"] = True
+        entry["infrastructure_retry"]["completed_at"] = _now()
+        entry["infrastructure_retry"]["handle"] = restarted.to_dict()
+        entry.pop("error", None)
+        self._event(
+            state,
+            "infrastructure_retry_submitted",
+            f"submitted backend generation {generation}",
+            test_id=entry["test_id"],
+        )
+        self._save(state)
+        return restarted
 
     def _collect_and_evaluate(
         self,
@@ -816,6 +902,25 @@ class CampaignRunner:
                 return self._pause_connectivity(state, error)
 
         for entry in state["trials"]:
+            if entry["phase"] != "infrastructure_retrying":
+                continue
+            handle_value = entry.get("handle")
+            if not isinstance(handle_value, dict):
+                entry["phase"] = "attention_required"
+                entry["error"] = (
+                    "infrastructure retry has no previous backend handle"
+                )
+                continue
+            try:
+                self._restart_infrastructure_entry(
+                    state,
+                    entry,
+                    _handle_from_dict(handle_value),
+                )
+            except BackendConnectivityError as error:
+                return self._pause_connectivity(state, error)
+
+        for entry in state["trials"]:
             if (
                 entry["phase"] in {"pending", "submitting"}
                 and not entry.get("handle")
@@ -966,6 +1071,22 @@ class CampaignRunner:
                         )
                 continue
             if snapshot.phase in {"succeeded", "failed"}:
+                if (
+                    snapshot.phase == "failed"
+                    and snapshot.details.get("retryable_infrastructure") is True
+                    and int(entry["attempts"].get("infrastructure", 0))
+                    < self.plan.infrastructure_max_restarts
+                ):
+                    try:
+                        restarted = self._restart_infrastructure_entry(
+                            state,
+                            entry,
+                            handle,
+                        )
+                    except BackendConnectivityError as error:
+                        return self._pause_connectivity(state, error)
+                    if restarted is not None:
+                        continue
                 attention = entry.get("attention")
                 if (
                     isinstance(attention, dict)
@@ -1019,6 +1140,7 @@ class CampaignRunner:
             and (
                 entry["phase"] in {
                     "submitted",
+                    "infrastructure_retrying",
                     "pending",
                     "running",
                     "collection_pending",
@@ -1077,6 +1199,7 @@ class CampaignRunner:
             "pending",
             "submitting",
             "submitted",
+            "infrastructure_retrying",
             "running",
             "collection_pending",
             "collection_retry_wait",

@@ -149,6 +149,13 @@ class ExecutionBackend(Protocol):
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle: ...
 
+    def restart(
+        self,
+        handle: BackendHandle,
+        workload: WorkloadSpec,
+        generation: int,
+    ) -> BackendHandle: ...
+
     def inspect(self, handle: BackendHandle) -> BackendSnapshot: ...
 
     def logs(self, handle: BackendHandle) -> str: ...
