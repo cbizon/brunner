@@ -135,6 +135,28 @@ class CleanupReconnectBackend(ImmediateBackend):
         super().cleanup(handle)
 
 
+class CollectionReconnectBackend(ImmediateBackend):
+    def collect(
+        self,
+        handle: BackendHandle,
+        destination: Path,
+        policy: ArtifactPolicy,
+        *,
+        included_groups: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        self.collection_calls += 1
+        if self.collection_calls == 1:
+            raise BackendConnectivityError(
+                "artifact reader connection dropped"
+            )
+        return collect_local_artifacts(
+            handle.trial,
+            destination,
+            policy,
+            included_groups=included_groups,
+        )
+
+
 class FlakyConnectivityBackend(ImmediateBackend):
     def __init__(self) -> None:
         super().__init__()
@@ -597,6 +619,47 @@ def test_campaign_resumes_cleanup_after_connectivity_loss(
     assert paused["trials"][0]["phase"] == "cleanup_pending"
     assert resumed["status"] == "complete"
     assert backend.cleanup_attempts == 2
+    assert [
+        event["type"]
+        for event in resumed["events"]
+        if event["test_id"] == "cleanup-a"
+        and event["type"] in {"trial_complete", "cleanup_complete"}
+    ] == ["trial_complete"]
+
+
+def test_collection_connectivity_pause_does_not_consume_attempt(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = CollectionReconnectBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="collection-connectivity",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+            collection_max_attempts=1,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    paused = runner.advance()
+    completed = runner.advance()
+
+    paused_entry = paused["trials"][0]
+    assert paused["status"] == "paused_backend_connectivity"
+    assert paused_entry["phase"] == "collecting"
+    assert paused_entry["attempts"]["collection"] == 0
+    assert paused_entry["collection_attempt"]["number"] == 1
+    completed_entry = completed["trials"][0]
+    assert completed["status"] == "complete"
+    assert completed_entry["attempts"]["collection"] == 1
+    assert "collection_attempt" not in completed_entry
+    assert backend.collection_calls == 2
 
 
 def test_campaign_retries_transient_artifact_transfer(
@@ -1032,12 +1095,14 @@ def test_campaign_recovers_interrupted_collection(
     )
     state = runner.advance()
     state["trials"][0]["phase"] = "collecting"
+    state["trials"][0]["attempts"]["collection"] = 1
     runner.state_path.write_text(json.dumps(state))
 
     completed = runner.advance()
 
     assert completed["status"] == "complete"
     assert completed["trials"][0]["phase"] == "complete"
+    assert completed["trials"][0]["attempts"]["collection"] == 1
     assert backend.collection_calls == 1
     assert any(
         event["type"] == "phase_recovered"
