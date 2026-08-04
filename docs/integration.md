@@ -658,12 +658,12 @@ Reconciliation is sequential, so an evaluator that hangs blocks every other
 trial in the campaign until its timeout expires. Set
 `evaluation_timeout_seconds` to something much smaller than
 `EvaluationDefinition.timeout_seconds` when a campaign has many trials.
-Exceeding `trial_timeout_seconds` or `max_pause_seconds` moves the campaign to
-`attention_required` rather than cancelling anything, so no remote workload is
-destroyed on a slow but healthy run. An overdue trial keeps its slot reserved
-while the backend still reports the workload as pending or running, so the
-campaign cannot quietly exceed `max_parallel` by submitting on top of work
-that is still executing.
+Exceeding `trial_timeout_seconds` marks the live trial as needing attention but
+keeps its lifecycle phase pending or running. Brunner continues inspecting it,
+resolves the attention marker when it terminates, and keeps its slot reserved
+throughout, so the campaign cannot quietly exceed `max_parallel`. Exceeding
+`max_pause_seconds` moves the campaign to `attention_required` without
+cancelling remote work.
 
 ## CLI
 
