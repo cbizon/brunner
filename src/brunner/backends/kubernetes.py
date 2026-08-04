@@ -109,6 +109,7 @@ class KubernetesProfile:
     secret_environment: dict[str, tuple[str, str]] = field(
         default_factory=dict
     )
+    nonsecret_environment: dict[str, str] = field(default_factory=dict)
     max_parallel: int | None = None
     staging_timeout_seconds: float = 10 * 60
     reader_timeout_seconds: float = 10 * 60
@@ -256,7 +257,7 @@ def render_job(
         )
     environment = [
         {"name": key, "value": value}
-        for key, value in sorted(workload.environment.items())
+        for key, value in sorted(profile.nonsecret_environment.items())
     ]
     environment.extend(
         {

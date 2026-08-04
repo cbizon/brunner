@@ -38,6 +38,9 @@ def test_kubernetes_resources_preserve_secret_boundary(
         secret_environment={
             "OPENAI_API_KEY": ("provider-credentials", "openai")
         },
+        nonsecret_environment={
+            "HTTPS_PROXY": "http://proxy.internal:3128",
+        },
         node_selector={"pool": "bench"},
     )
     workload = WorkloadSpec(
@@ -47,7 +50,6 @@ def test_kubernetes_resources_preserve_secret_boundary(
         timeout_seconds=61.2,
         cpu="2",
         memory="4Gi",
-        environment={"NON_SECRET": "value"},
     )
     labels = {"app.kubernetes.io/name": "brunner"}
 
@@ -87,9 +89,13 @@ def test_kubernetes_resources_preserve_secret_boundary(
     secret = next(
         item for item in environment if item["name"] == "OPENAI_API_KEY"
     )
+    proxy = next(
+        item for item in environment if item["name"] == "HTTPS_PROXY"
+    )
     assert secret["valueFrom"]["secretKeyRef"]["name"] == (
         "provider-credentials"
     )
+    assert proxy["value"] == "http://proxy.internal:3128"
     encoded = json.dumps(job)
     assert "provider-credentials" in encoded
     assert "OPENAI_API_KEY" in encoded
@@ -214,6 +220,83 @@ def test_container_submission_adopts_existing_named_container(
     ]
     state = json.loads((trial / "backend/container.json").read_text())
     assert state["native_id"] == "existing-container-id"
+
+
+def test_container_inherits_credentials_without_argv_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "super-secret-value")
+    backend = ContainerBackend(
+        inherited_environment=("OPENAI_API_KEY",),
+        nonsecret_environment={
+            "HTTPS_PROXY": "http://proxy.internal:3128",
+        },
+    )
+    commands = []
+
+    def run(*arguments: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        if arguments[0] == "inspect":
+            return subprocess.CompletedProcess(
+                arguments,
+                1,
+                stdout="",
+                stderr="Error: No such object",
+            )
+        if arguments[0] == "run":
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout="new-container-id\n",
+                stderr="",
+            )
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    handle = backend.submit(workload)
+
+    assert handle.native_id == "new-container-id"
+    run_arguments = commands[-1]
+    assert "OPENAI_API_KEY" in run_arguments
+    assert "OPENAI_API_KEY=super-secret-value" not in run_arguments
+    assert not any("super-secret-value" in value for value in run_arguments)
+    assert "HTTPS_PROXY=http://proxy.internal:3128" in run_arguments
+
+
+def test_container_fails_when_inherited_credential_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    backend = ContainerBackend(
+        inherited_environment=("OPENAI_API_KEY",),
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="OPENAI_API_KEY",
+    ):
+        backend.submit(workload)
 
 
 def test_kubernetes_submission_adopts_job_after_ambiguous_apply(

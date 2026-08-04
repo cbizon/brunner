@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -40,10 +41,16 @@ class ContainerBackend:
         runtime: str = "docker",
         max_parallel: int | None = None,
         command_timeout_seconds: float = 120,
+        inherited_environment: tuple[str, ...] = (),
+        nonsecret_environment: dict[str, str] | None = None,
     ) -> None:
         self.runtime = runtime
         self.max_parallel = max_parallel
         self.command_timeout_seconds = command_timeout_seconds
+        self.inherited_environment = tuple(
+            dict.fromkeys(inherited_environment)
+        )
+        self.nonsecret_environment = dict(nonsecret_environment or {})
         self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     def _runtime_error(
@@ -92,6 +99,16 @@ class ContainerBackend:
         if not workload.image:
             raise BackendRequestError(
                 "container workloads require an image"
+            )
+        missing_environment = [
+            name
+            for name in self.inherited_environment
+            if name not in os.environ
+        ]
+        if missing_environment:
+            raise BackendRequestError(
+                "container credential environment variables are not set: "
+                + ", ".join(missing_environment)
             )
         name = native_resource_name(
             workload.workload_id,
@@ -173,8 +190,10 @@ class ContainerBackend:
             "--workdir",
             "/brunner/trial/workspace",
         ]
-        for key, value in sorted(workload.environment.items()):
+        for key, value in sorted(self.nonsecret_environment.items()):
             arguments.extend(("--env", f"{key}={value}"))
+        for key in sorted(self.inherited_environment):
+            arguments.extend(("--env", key))
         if workload.cpu:
             arguments.extend(("--cpus", workload.cpu))
         if workload.memory:

@@ -69,7 +69,6 @@ class CampaignTrial:
     provider: str
     model: str
     effort: str | None = None
-    environment_keys: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if not self.test_id.strip():
@@ -94,7 +93,6 @@ class CampaignTrial:
             "provider": self.provider,
             "model": self.model,
             "effort": self.effort,
-            "environment_keys": sorted(set(self.environment_keys)),
         }
 
 
@@ -199,16 +197,6 @@ def default_workload_factory(
     definition: BenchmarkDefinition,
     backend_name: str,
 ) -> WorkloadSpec:
-    missing_environment = [
-        key
-        for key in campaign_trial.environment_keys
-        if key not in os.environ
-    ]
-    if missing_environment:
-        raise ValueError(
-            "campaign environment variables are not set: "
-            + ", ".join(missing_environment)
-        )
     command = [
         "python",
         "-m",
@@ -227,10 +215,6 @@ def default_workload_factory(
             definition.runtime.timeout_seconds
             + definition.runtime.backend_shutdown_grace_seconds
         ),
-        environment={
-            key: os.environ[key]
-            for key in campaign_trial.environment_keys
-        },
         image=plan.backend_image,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
@@ -418,9 +402,6 @@ class CampaignRunner:
                 "provider": campaign_trial.provider,
                 "model": campaign_trial.model,
                 "effort": campaign_trial.effort,
-                "environment_keys": sorted(
-                    set(campaign_trial.environment_keys)
-                ),
             }
             if existing is not None:
                 attempts = existing.setdefault("attempts", {})
@@ -431,9 +412,6 @@ class CampaignRunner:
                     "provider": existing.get("provider"),
                     "model": existing.get("model"),
                     "effort": existing.get("effort"),
-                    "environment_keys": sorted(
-                        set(existing.get("environment_keys", ()))
-                    ),
                 }
                 mismatches = {
                     key: {
@@ -631,9 +609,6 @@ class CampaignRunner:
             provider=str(entry["provider"]),
             model=str(entry["model"]),
             effort=entry.get("effort"),
-            environment_keys=tuple(
-                entry.get("environment_keys", ())
-            ),
         )
 
     def _submit_entry(
