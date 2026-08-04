@@ -352,6 +352,13 @@ derived from provider, model, effort, or a run count. `campaign.json` records
 the contract identity, append-only trial list, handles, snapshots, collection
 attempts, evaluation results, outcomes, and recent events.
 
+Every initialize, step, and continuous run holds an exclusive operating-system
+lock on `campaign.lock`. A second orchestrator fails immediately with the
+recorded PID and hostname instead of racing state writes or submissions. The
+kernel releases the lock automatically when its process exits or crashes; the
+lock file's owner record is diagnostic and is not itself treated as proof that
+an orchestrator is alive.
+
 Campaign reconciliation:
 
 - Adds new caller-supplied trial IDs without invalidating existing state

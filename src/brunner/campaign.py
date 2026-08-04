@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 import re
+import socket
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, TextIO
 
 from brunner.backends import (
     BackendHandle,
@@ -268,8 +271,59 @@ class CampaignRunner:
         self.root = plan.root.resolve()
         self.state_path = self.root / "campaign.json"
         self.dashboard_path = self.root / "index.html"
+        self.lock_path = self.root / "campaign.lock"
+        self._lock_depth = 0
+        self._lock_stream: TextIO | None = None
+
+    @contextmanager
+    def _campaign_lock(self) -> Iterator[None]:
+        if self._lock_depth:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        stream = self.lock_path.open("a+")
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            stream.seek(0)
+            owner = stream.read().strip() or "owner information unavailable"
+            stream.close()
+            raise RuntimeError(
+                f"another orchestrator is using campaign "
+                f"{self.plan.campaign_id}: {owner}"
+            ) from error
+
+        owner = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "campaign_id": self.plan.campaign_id,
+            "state_path": str(self.state_path),
+            "acquired_at": _now(),
+        }
+        stream.seek(0)
+        stream.truncate()
+        stream.write(json.dumps(owner, sort_keys=True) + "\n")
+        stream.flush()
+        self._lock_stream = stream
+        self._lock_depth = 1
+        try:
+            yield
+        finally:
+            self._lock_depth = 0
+            self._lock_stream = None
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            stream.close()
 
     def initialize(self) -> dict[str, Any]:
+        with self._campaign_lock():
+            return self._initialize()
+
+    def _initialize(self) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
         if self.state_path.is_file():
             state = json.loads(self.state_path.read_text())
@@ -889,7 +943,11 @@ class CampaignRunner:
         self._save(state)
 
     def advance(self) -> dict[str, Any]:
-        state = self.initialize()
+        with self._campaign_lock():
+            return self._advance()
+
+    def _advance(self) -> dict[str, Any]:
+        state = self._initialize()
         state["status"] = "running"
         state.pop("pause_reason", None)
 
@@ -1233,11 +1291,12 @@ class CampaignRunner:
     ) -> dict[str, Any]:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
-        while True:
-            state = self.advance()
-            if state["status"] not in {
-                "running",
-                "paused_backend_connectivity",
-            }:
-                return state
-            time.sleep(poll_seconds)
+        with self._campaign_lock():
+            while True:
+                state = self._advance()
+                if state["status"] not in {
+                    "running",
+                    "paused_backend_connectivity",
+                }:
+                    return state
+                time.sleep(poll_seconds)

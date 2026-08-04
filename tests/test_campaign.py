@@ -303,6 +303,74 @@ def test_campaign_rejects_host_process_backend(tmp_path: Path) -> None:
         )
 
 
+def test_campaign_rejects_concurrent_orchestrator(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="locked",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("locked-a", "codex", "model-a"),),
+    )
+    first = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    second = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+
+    with first._campaign_lock():
+        with pytest.raises(
+            RuntimeError,
+            match="another orchestrator is using campaign locked",
+        ) as raised:
+            second.advance()
+
+    message = str(raised.value)
+    assert f'"pid": {os.getpid()}' in message
+    assert '"campaign_id": "locked"' in message
+
+
+def test_campaign_lock_is_released_after_runner_exits(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="released",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("released-a", "codex", "model-a"),),
+    )
+    first = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    second = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+
+    first.initialize()
+    state = second.advance()
+
+    assert state["trials"][0]["phase"] == "submitted"
+
+
 def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
     tmp_path: Path,
     monkeypatch: Any,
