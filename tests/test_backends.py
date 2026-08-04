@@ -293,6 +293,149 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
     assert (trial / "backend/kubernetes.json").is_file()
 
 
+@pytest.mark.parametrize(
+    ("job_reason", "container_reason", "exit_code", "expected"),
+    [
+        ("BackoffLimitExceeded", "Error", 137, True),
+        ("DeadlineExceeded", "Error", 143, False),
+        ("BackoffLimitExceeded", "StartError", 1, False),
+    ],
+)
+def test_kubernetes_snapshot_classifies_infrastructure_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job_reason: str,
+    container_reason: str,
+    exit_code: int,
+    expected: bool,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    pod = {
+        "spec": {"nodeName": "node-a"},
+        "status": {
+            "phase": "Failed",
+            "containerStatuses": [
+                {
+                    "name": "agent",
+                    "state": {
+                        "terminated": {
+                            "exitCode": exit_code,
+                            "reason": container_reason,
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if kind == "pvc":
+            return {"status": {"phase": "Bound"}}
+        if kind == "job":
+            return {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Failed",
+                            "reason": job_reason,
+                            "message": "job failed",
+                        }
+                    ]
+                }
+            }
+        if kind == "pods":
+            return {"items": [pod]}
+        raise AssertionError((kind, name, kwargs))
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.details["retryable_infrastructure"] is expected
+
+
+def test_kubernetes_restart_reuses_pvc_without_restaging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    workload_name = native_resource_name("case-1", trial)
+    claim_name = native_resource_name("case-1", trial, suffix="-data")
+    previous = BackendHandle(
+        backend="kubernetes",
+        workload_id="case-1",
+        native_id=workload_name,
+        trial=trial,
+        metadata={"claim_name": claim_name},
+    )
+    deleted = []
+    applied = []
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object] | None:
+        if kind == "pvc":
+            return {
+                "metadata": {
+                    "labels": {"dev.brunner/workload": workload_name}
+                }
+            }
+        if kind == "job":
+            return None
+        raise AssertionError((kind, name, kwargs))
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_delete_and_wait",
+        lambda kind, name: deleted.append((kind, name)),
+    )
+    monkeypatch.setattr(backend, "_apply", applied.append)
+    monkeypatch.setattr(
+        backend,
+        "_stage_trial",
+        lambda *args, **kwargs: pytest.fail("restart must not restage trial"),
+    )
+
+    restarted = backend.restart(previous, workload, 1)
+
+    assert deleted == [("job", workload_name)]
+    assert len(applied) == 1
+    assert applied[0]["kind"] == "Job"
+    assert restarted.native_id.endswith("-r1")
+    assert restarted.metadata["claim_name"] == claim_name
+    assert restarted.metadata["restart_generation"] == 1
+
+
 @pytest.mark.parametrize("backend_type", ["container", "kubernetes"])
 def test_runtime_connectivity_failures_are_distinct(
     tmp_path: Path,

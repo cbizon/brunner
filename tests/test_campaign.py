@@ -233,6 +233,38 @@ class EventuallyCompleteBackend(ImmediateBackend):
         return BackendSnapshot(phase="succeeded", exit_code=0)
 
 
+class RetryableInfrastructureBackend(ImmediateBackend):
+    def __init__(self, *, always_fail: bool = False) -> None:
+        super().__init__()
+        self.always_fail = always_fail
+        self.restart_calls = 0
+
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        if not self.always_fail and handle.native_id.endswith("-r1"):
+            return BackendSnapshot(phase="succeeded", exit_code=0)
+        return BackendSnapshot(
+            phase="failed",
+            reason="Evicted",
+            exit_code=137,
+            details={"retryable_infrastructure": True},
+        )
+
+    def restart(
+        self,
+        handle: BackendHandle,
+        workload: WorkloadSpec,
+        generation: int,
+    ) -> BackendHandle:
+        self.restart_calls += 1
+        return BackendHandle(
+            backend=self.name,
+            workload_id=workload.workload_id,
+            native_id=f"{workload.workload_id}-r{generation}",
+            trial=workload.trial,
+            metadata={"submitted_at": f"2026-08-04T12:00:0{generation}+00:00"},
+        )
+
+
 class HostProcessBackend(ImmediateBackend):
     agent_isolation = "host"
 
@@ -1162,6 +1194,66 @@ def test_campaign_running_trial_within_timeout_is_not_flagged(
 
     assert state["trials"][0]["phase"] == "running"
     assert state["status"] == "running"
+
+
+def test_campaign_restarts_retryable_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = RetryableInfrastructureBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="restart",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("restart-a", "codex", "model-a"),),
+            infrastructure_max_restarts=2,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    restarted = runner.advance()
+    completed = runner.advance()
+
+    assert restarted["trials"][0]["phase"] == "submitted"
+    assert restarted["trials"][0]["handle"]["native_id"] == "restart-a-r1"
+    assert restarted["trials"][0]["attempts"]["infrastructure"] == 1
+    assert backend.restart_calls == 1
+    assert completed["status"] == "complete"
+    assert completed["trials"][0]["outcome"] == "succeeded"
+
+
+def test_campaign_stops_restarting_after_infrastructure_limit(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = RetryableInfrastructureBackend(always_fail=True)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="restart-limit",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("restart-a", "codex", "model-a"),),
+            infrastructure_max_restarts=1,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    runner.advance()
+    completed = runner.advance()
+
+    assert backend.restart_calls == 1
+    assert completed["status"] == "complete"
+    assert completed["trials"][0]["outcome"] == "failed"
+    assert completed["trials"][0]["attempts"]["infrastructure"] == 1
 
 
 def test_campaign_gives_up_after_prolonged_connectivity_loss(
