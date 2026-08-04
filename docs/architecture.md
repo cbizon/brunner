@@ -162,10 +162,12 @@ benchmark-owned.
 
 Candidate processes execute inside the selected backend's isolation boundary
 and without inherited user configuration or external tool connections. Codex
-uses its workspace-write sandbox. Claude bypasses its interactive permission
-system and relies on the outer container or Kubernetes workload isolation,
-matching the proven granular benchmark execution model and avoiding unsupported
-nested user-namespace sandboxes. Runner-owned metadata, backend, evaluation,
+uses its workspace-write sandbox on the initial invocation. Resumed Codex
+sessions inherit that sandbox because `codex exec resume` does not accept the
+`--sandbox` option. Claude bypasses its interactive permission system and
+relies on the outer container or Kubernetes workload isolation, matching the
+proven granular benchmark execution model and avoiding unsupported nested
+user-namespace sandboxes. Runner-owned metadata, backend, evaluation,
 assessment, usage, and status paths are snapshotted around every attempt. Any
 mutation is restored and terminates the trial as a provider error.
 

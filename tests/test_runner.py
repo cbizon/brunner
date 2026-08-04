@@ -865,7 +865,11 @@ import sys
 counter_path = pathlib.Path(".attempt-count")
 count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
 counter_path.write_text(str(count))
-resume = "resume" in sys.argv[1:]
+arguments = sys.argv[1:]
+resume = "resume" in arguments
+if resume and "--sandbox" in arguments:
+    print("error: unexpected argument '--sandbox'", file=sys.stderr)
+    raise SystemExit(2)
 with pathlib.Path(".modes").open("a") as stream:
     stream.write(("resume" if resume else "initial") + "\n")
 
@@ -882,7 +886,6 @@ if count == 2:
     }), flush=True)
     raise SystemExit(1)
 
-arguments = sys.argv[1:]
 final = pathlib.Path(
     arguments[arguments.index("--output-last-message") + 1]
 )

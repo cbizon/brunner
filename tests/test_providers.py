@@ -76,6 +76,32 @@ def test_codex_adapter_can_run_in_read_only_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
+def test_codex_adapter_resume_omits_initial_only_options(
+    tmp_path: Path,
+) -> None:
+    selected = context(tmp_path)
+    selected = ProviderRunContext(
+        **{
+            **selected.__dict__,
+            "persist_session": True,
+            "resume_session": True,
+        }
+    )
+
+    command = CodexAdapter().build_command(
+        ProviderSettings(provider="codex", model="test-model"),
+        selected,
+    ).command
+
+    assert command[:3] == ("codex", "exec", "resume")
+    assert command[-2:] == ("--last", "-")
+    assert "--sandbox" not in command
+    assert "--cd" not in command
+    assert "--output-schema" in command
+    assert "--output-last-message" in command
+    assert "--json" in command
+
+
 def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
     command = ClaudeAdapter().build_command(
         ProviderSettings(
