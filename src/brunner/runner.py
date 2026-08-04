@@ -876,14 +876,18 @@ def load_state(
     }
 
 
-def clear_retry_state(state: dict[str, Any]) -> None:
+def clear_retry_wait_state(state: dict[str, Any]) -> None:
     for key in (
         "retry_not_before_epoch",
-        "retry_backoff_seconds",
         "next_retry_seconds",
         "next_retry_category",
     ):
         state.pop(key, None)
+
+
+def clear_retry_state(state: dict[str, Any]) -> None:
+    clear_retry_wait_state(state)
+    state.pop("retry_backoff_seconds", None)
 
 
 def launched_attempt_count(attempts: list[dict[str, Any]]) -> int:
@@ -983,6 +987,9 @@ def write_terminal_artifacts(
     state: dict[str, Any],
     adapter: ProviderAdapter,
 ) -> None:
+    if state["status"] in PIPELINE_TERMINAL_STATUSES:
+        clear_retry_state(state)
+        write_json_atomic(trial / "status.json", state)
     created_epoch = float(state.get("created_epoch", time.time()))
     deadline_epoch = float(state["deadline_epoch"])
     last_attempt = state["attempts"][-1] if state["attempts"] else {}
@@ -1126,10 +1133,6 @@ def _run_configured_trial(
                 state.get("next_retry_category") or "runner_retry_wait"
             )
             state["status"] = "retrying"
-            state["next_retry_seconds"] = max(
-                0.0,
-                float(retry_not_before) - now,
-            )
             write_json_atomic(state_path, state)
             retry_activity_id = (
                 f"retry-{next_attempt_number(state['attempts'])}-"
@@ -1168,15 +1171,11 @@ def _run_configured_trial(
             if stopped:
                 state["status"] = "interrupted"
                 state["completed_at"] = utc_now()
-                state["next_retry_seconds"] = max(
-                    0.0,
-                    float(retry_not_before) - time.time(),
-                )
                 write_json_atomic(state_path, state)
                 write_terminal_artifacts(trial, state, adapter)
                 return state
             if time.time() >= float(retry_not_before):
-                clear_retry_state(state)
+                clear_retry_wait_state(state)
                 write_json_atomic(state_path, state)
             continue
 
@@ -1524,11 +1523,6 @@ def _run_configured_trial(
             and failure.retry_at_epoch is not None
         ):
             requested_wait = max(0.0, failure.retry_at_epoch - now)
-        wait_seconds = min(
-            requested_wait,
-            max(0.0, phase_deadline - time.time()),
-        )
-        state["next_retry_seconds"] = wait_seconds
         state["next_retry_category"] = wait_category
         state["retry_not_before_epoch"] = now + requested_wait
         if resume_unavailable or output_repair_required:

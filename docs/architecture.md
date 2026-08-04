@@ -333,7 +333,9 @@ Submission is idempotent across ambiguous backend responses: a Kubernetes
 retry adopts an existing labeled Job before considering staging, and an OCI
 retry adopts the deterministic named container. Kubernetes records completed
 staging on the PVC so a retry after staging but before Job creation does not
-copy the trial again.
+copy the trial again. Backend objects do not keep process-local handle
+registries; persisted trial/backend state and remote labels are the recovery
+sources of truth after an orchestrator restart.
 
 The backend workload deadline is the agent hard deadline plus
 `backend_shutdown_grace_seconds`; the outer backend therefore does not kill
@@ -347,8 +349,12 @@ workload failures. It reports pending PVCs, inspects terminated init/main
 containers, preserves previously recovered workload logs, and includes
 Kubernetes warning events for pending storage and failed artifact readers. It
 retries artifact readers, excludes failed reader nodes when rescheduling,
-resumes partial files by byte offset, and verifies every SHA-256. A failed
-workload's PVC is retained until artifact collection succeeds.
+resumes partial files by byte offset, and verifies every SHA-256. Before helper
+creation and final cleanup, Brunner finds stale stager and reader pods by
+workload/role labels and waits for their deletion. Final cleanup likewise waits
+for Job and eligible PVC deletion; connectivity loss leaves campaign cleanup
+pending rather than silently leaking resources. A failed workload's PVC is
+retained until artifact collection succeeds.
 
 Failed Kubernetes Jobs whose agent process was interrupted by eviction, node
 loss, OOM termination, or another nonzero container exit can be relaunched

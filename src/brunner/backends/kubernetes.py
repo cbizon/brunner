@@ -21,7 +21,6 @@ from brunner.backends.base import (
     BackendHandle,
     BackendSnapshot,
     WorkloadSpec,
-    backend_registry_key,
     native_resource_name,
 )
 from brunner.definition import ArtifactPolicy
@@ -331,7 +330,6 @@ class KubernetesBackend:
     ) -> None:
         self.profile = profile
         self.kubectl = kubectl
-        self._handles: dict[tuple[str, str], BackendHandle] = {}
 
     def _error(
         self,
@@ -462,6 +460,27 @@ class KubernetesBackend:
             f"--timeout={math.ceil(self.profile.command_timeout_seconds)}s",
         )
 
+    def _delete_helper_pods(
+        self,
+        workload_names: tuple[str, ...],
+        role: str,
+    ) -> None:
+        deleted: set[str] = set()
+        for workload_name in dict.fromkeys(workload_names):
+            value = self._get(
+                "pods",
+                labels=(
+                    f"dev.brunner/workload={workload_name},"
+                    f"dev.brunner/role={role}"
+                ),
+            ) or {"items": []}
+            for pod in value.get("items", ()):
+                name = pod.get("metadata", {}).get("name")
+                if not isinstance(name, str) or not name or name in deleted:
+                    continue
+                self._delete_and_wait("pod", name)
+                deleted.add(name)
+
     def _get(
         self,
         kind: str,
@@ -573,10 +592,22 @@ class KubernetesBackend:
         image: str,
         labels: dict[str, str],
     ) -> None:
+        workload_name = str(labels["dev.brunner/workload"])
         pod_name = native_resource_name(
             workload.workload_id,
             workload.trial,
             suffix="-stage",
+        )
+        # Stagers created before role labels were introduced are still
+        # discoverable by their deterministic name.
+        self._delete_and_wait("pod", pod_name)
+        helper_labels = {
+            **labels,
+            "dev.brunner/role": "trial-stager",
+        }
+        self._delete_helper_pods(
+            (workload_name,),
+            "trial-stager",
         )
         self._apply(
             render_helper_pod(
@@ -584,7 +615,7 @@ class KubernetesBackend:
                 claim_name,
                 image,
                 self.profile,
-                labels,
+                helper_labels,
             )
         )
         try:
@@ -601,7 +632,7 @@ class KubernetesBackend:
                 ),
             )
         finally:
-            self._delete("pod", pod_name)
+            self._delete_and_wait("pod", pod_name)
 
     @staticmethod
     def _state_path(trial: Path) -> Path:
@@ -676,9 +707,6 @@ class KubernetesBackend:
                 **handle.to_dict(),
             },
         )
-        self._handles[
-            backend_registry_key(handle.workload_id, handle.trial)
-        ] = handle
         return handle
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
@@ -698,9 +726,6 @@ class KubernetesBackend:
                 trial=workload.trial.resolve(),
                 metadata=dict(state["metadata"]),
             )
-            self._handles[
-                backend_registry_key(workload.workload_id, workload.trial)
-            ] = handle
             return handle
 
         job_name = native_resource_name(
@@ -1039,7 +1064,10 @@ class KubernetesBackend:
         )
         labels = {
             "app.kubernetes.io/name": "brunner",
-            "dev.brunner/workload": handle.native_id,
+            "dev.brunner/workload": native_resource_name(
+                handle.workload_id,
+                handle.trial,
+            ),
             "dev.brunner/role": "artifact-reader",
         }
         self._apply(
@@ -1073,7 +1101,7 @@ class KubernetesBackend:
                     else None
                 ),
             )
-            self._delete("pod", name)
+            self._delete_and_wait("pod", name)
             detail = str(error)
             if event_warnings:
                 detail += "; Kubernetes warning: " + event_warnings[-1]
@@ -1215,6 +1243,14 @@ class KubernetesBackend:
         *,
         included_groups: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
+        workload_name = native_resource_name(
+            handle.workload_id,
+            handle.trial,
+        )
+        self._delete_helper_pods(
+            (workload_name, handle.native_id),
+            "artifact-reader",
+        )
         excluded_nodes: list[str] = []
         failures = []
         attempts = max(1, self.profile.reader_attempts)
@@ -1255,10 +1291,7 @@ class KubernetesBackend:
                     excluded_nodes.append(node)
             finally:
                 if pod is not None:
-                    try:
-                        self._delete("pod", pod)
-                    except BackendConnectivityError:
-                        pass
+                    self._delete_and_wait("pod", pod)
         raise ArtifactTransferError(
             "artifact reader failed after retries; partial files and PVC "
             "were preserved: " + "; ".join(failures)
@@ -1272,7 +1305,22 @@ class KubernetesBackend:
             if state_path.is_file()
             else {}
         )
-        self._delete("job", handle.native_id)
+        workload_name = native_resource_name(
+            handle.workload_id,
+            handle.trial,
+        )
+        helper_workloads = (workload_name, handle.native_id)
+        self._delete_and_wait(
+            "pod",
+            native_resource_name(
+                handle.workload_id,
+                handle.trial,
+                suffix="-stage",
+            ),
+        )
+        self._delete_helper_pods(helper_workloads, "trial-stager")
+        self._delete_helper_pods(helper_workloads, "artifact-reader")
+        self._delete_and_wait("job", handle.native_id)
         if (
             snapshot.phase == "failed"
             and self.profile.retain_failed_storage
@@ -1283,7 +1331,7 @@ class KubernetesBackend:
             if state_path.parent.is_dir():
                 write_json_atomic(state_path, state)
             return
-        self._delete(
+        self._delete_and_wait(
             "pvc",
             str(handle.metadata["claim_name"]),
         )

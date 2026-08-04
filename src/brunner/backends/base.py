@@ -43,13 +43,6 @@ def native_resource_name(
     return f"brunner-{prefix}-{digest}{suffix}"
 
 
-def backend_registry_key(
-    workload_id: str,
-    trial: Path,
-) -> tuple[str, str]:
-    return workload_id, str(trial.resolve())
-
-
 @dataclass(frozen=True)
 class WorkloadSpec:
     workload_id: str
