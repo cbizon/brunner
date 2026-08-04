@@ -568,6 +568,55 @@ class CampaignRunner:
             ),
         )
 
+    def _submit_entry(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+    ) -> BackendHandle | None:
+        trial = Path(entry["trial"])
+        workload = self.workload_factory(
+            trial,
+            self._campaign_trial(entry),
+            self.plan,
+            self.definition,
+            self.backend.name,
+        )
+        entry["phase"] = "submitting"
+        entry["attempts"]["submission"] += 1
+        entry.pop("error", None)
+        self._save(state)
+        try:
+            handle = self.backend.submit(workload)
+        except BackendConnectivityError:
+            raise
+        except BackendError as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            self._event(
+                state,
+                "submission_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
+        entry["handle"] = handle.to_dict()
+        entry["phase"] = "submitted"
+        submitted_at = handle.metadata.get("submitted_at")
+        entry["submitted_at"] = (
+            submitted_at if isinstance(submitted_at, str) else _now()
+        )
+        self._event(
+            state,
+            "trial_submitted",
+            f"submitted to or adopted from {self.backend.name}",
+            test_id=entry["test_id"],
+        )
+        # Persist the handle immediately. A later crash must not lose the
+        # identity of a workload that may already be running remotely.
+        self._save(state)
+        return handle
+
     def _collect_and_evaluate(
         self,
         state: dict[str, Any],
@@ -759,7 +808,18 @@ class CampaignRunner:
         state.pop("pause_reason", None)
 
         for entry in state["trials"]:
-            if entry["phase"] == "pending" and not entry.get("handle"):
+            if entry["phase"] != "submitting" or entry.get("handle"):
+                continue
+            try:
+                self._submit_entry(state, entry)
+            except BackendConnectivityError as error:
+                return self._pause_connectivity(state, error)
+
+        for entry in state["trials"]:
+            if (
+                entry["phase"] in {"pending", "submitting"}
+                and not entry.get("handle")
+            ):
                 continue
             if entry["phase"] not in {
                 "submitted",
@@ -960,40 +1020,13 @@ class CampaignRunner:
                     break
                 if entry["phase"] != "pending" or entry.get("handle"):
                     continue
-                trial = Path(entry["trial"])
-                campaign_trial = self._campaign_trial(entry)
-                workload = self.workload_factory(
-                    trial,
-                    campaign_trial,
-                    self.plan,
-                    self.definition,
-                    self.backend.name,
-                )
-                entry["attempts"]["submission"] += 1
                 try:
-                    handle = self.backend.submit(workload)
+                    handle = self._submit_entry(state, entry)
                 except BackendConnectivityError as error:
                     return self._pause_connectivity(state, error)
-                except BackendError as error:
-                    entry["phase"] = "attention_required"
-                    entry["error"] = str(error)
-                    self._event(
-                        state,
-                        "submission_failed",
-                        str(error),
-                        test_id=entry["test_id"],
-                    )
+                if handle is None:
                     continue
-                entry["handle"] = handle.to_dict()
-                entry["phase"] = "submitted"
-                entry["submitted_at"] = _now()
                 available -= 1
-                self._event(
-                    state,
-                    "trial_submitted",
-                    f"submitted to {self.backend.name}",
-                    test_id=entry["test_id"],
-                )
 
         phases = {entry["phase"] for entry in state["trials"]}
         if phases == {"complete"}:
@@ -1002,6 +1035,7 @@ class CampaignRunner:
             state["has_attention"] = False
         elif phases & {
             "pending",
+            "submitting",
             "submitted",
             "running",
             "collection_pending",

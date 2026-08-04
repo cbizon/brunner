@@ -48,6 +48,7 @@ CONNECTIVITY_FRAGMENTS = (
     "tls handshake timeout",
     "service unavailable",
 )
+STAGED_ANNOTATION = "dev.brunner/staged"
 
 
 class ReaderMountError(BackendRequestError):
@@ -531,6 +532,77 @@ class KubernetesBackend:
     def _state_path(trial: Path) -> Path:
         return trial / "backend/kubernetes.json"
 
+    def _submission_handle(
+        self,
+        workload: WorkloadSpec,
+        *,
+        job_name: str,
+        claim_name: str,
+        submitted_at: str | None = None,
+    ) -> BackendHandle:
+        return BackendHandle(
+            backend=self.name,
+            workload_id=workload.workload_id,
+            native_id=job_name,
+            trial=workload.trial.resolve(),
+            metadata={
+                "claim_name": claim_name,
+                "namespace": self.profile.namespace,
+                "submitted_at": submitted_at or _now(),
+            },
+        )
+
+    @staticmethod
+    def _validate_remote_submission(
+        *,
+        job: dict[str, Any],
+        pvc: dict[str, Any] | None,
+        job_name: str,
+        claim_name: str,
+    ) -> None:
+        labels = job.get("metadata", {}).get("labels", {})
+        if labels.get("dev.brunner/workload") != job_name:
+            raise BackendRequestError(
+                f"existing Kubernetes Job {job_name} is not owned by Brunner"
+            )
+        if pvc is None:
+            raise BackendRequestError(
+                f"existing Kubernetes Job {job_name} has no PVC {claim_name}"
+            )
+        volumes = (
+            job.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("volumes", ())
+        )
+        if not any(
+            volume.get("persistentVolumeClaim", {}).get("claimName")
+            == claim_name
+            for volume in volumes
+            if isinstance(volume, dict)
+        ):
+            raise BackendRequestError(
+                f"existing Kubernetes Job {job_name} does not mount "
+                f"expected PVC {claim_name}"
+            )
+
+    def _persist_submission_handle(
+        self,
+        state_path: Path,
+        handle: BackendHandle,
+    ) -> BackendHandle:
+        write_json_atomic(
+            state_path,
+            {
+                "schema_version": "1.0",
+                **handle.to_dict(),
+            },
+        )
+        self._handles[
+            backend_registry_key(handle.workload_id, handle.trial)
+        ] = handle
+        return handle
+
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         workload.validate()
         image = workload.image or self.profile.agent_image
@@ -567,8 +639,50 @@ class KubernetesBackend:
             "dev.brunner/workload": job_name,
             **workload.labels,
         }
-        self._apply(render_pvc(claim_name, self.profile, labels))
-        self._stage_trial(workload, claim_name, image, labels)
+        job = self._get("job", job_name)
+        pvc = self._get("pvc", claim_name)
+        if job is not None:
+            self._validate_remote_submission(
+                job=job,
+                pvc=pvc,
+                job_name=job_name,
+                claim_name=claim_name,
+            )
+            handle = self._submission_handle(
+                workload,
+                job_name=job_name,
+                claim_name=claim_name,
+                submitted_at=job.get("metadata", {}).get("creationTimestamp"),
+            )
+            return self._persist_submission_handle(state_path, handle)
+
+        if pvc is None:
+            self._apply(render_pvc(claim_name, self.profile, labels))
+            staged = False
+        else:
+            pvc_labels = pvc.get("metadata", {}).get("labels", {})
+            if pvc_labels.get("dev.brunner/workload") != job_name:
+                raise BackendRequestError(
+                    f"existing Kubernetes PVC {claim_name} is not owned "
+                    "by this Brunner workload"
+                )
+            staged = (
+                pvc.get("metadata", {})
+                .get("annotations", {})
+                .get(STAGED_ANNOTATION)
+                == "true"
+            )
+        if not staged:
+            self._stage_trial(workload, claim_name, image, labels)
+            self._run(
+                "annotate",
+                "pvc",
+                claim_name,
+                "-n",
+                self.profile.namespace,
+                f"{STAGED_ANNOTATION}=true",
+                "--overwrite",
+            )
         self._apply(
             render_job(
                 job_name,
@@ -578,28 +692,12 @@ class KubernetesBackend:
                 labels,
             )
         )
-        handle = BackendHandle(
-            backend=self.name,
-            workload_id=workload.workload_id,
-            native_id=job_name,
-            trial=workload.trial.resolve(),
-            metadata={
-                "claim_name": claim_name,
-                "namespace": self.profile.namespace,
-                "submitted_at": _now(),
-            },
+        handle = self._submission_handle(
+            workload,
+            job_name=job_name,
+            claim_name=claim_name,
         )
-        write_json_atomic(
-            state_path,
-            {
-                "schema_version": "1.0",
-                **handle.to_dict(),
-            },
-        )
-        self._handles[
-            backend_registry_key(workload.workload_id, workload.trial)
-        ] = handle
-        return handle
+        return self._persist_submission_handle(state_path, handle)
 
     def _pod_for_handle(
         self,

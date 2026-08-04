@@ -111,6 +111,53 @@ class ContainerBackend:
                 backend_registry_key(workload.workload_id, workload.trial)
             ] = handle
             return handle
+        existing = self._run(
+            "inspect",
+            "--format",
+            "{{json .}}",
+            name,
+            check=False,
+        )
+        if existing.returncode == 0:
+            try:
+                inspected = json.loads(existing.stdout)
+                native_id = str(inspected["Id"])
+                labels = inspected["Config"]["Labels"]
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise BackendRequestError(
+                    f"cannot adopt existing container {name}: "
+                    "runtime returned invalid metadata"
+                ) from error
+            if labels.get("dev.brunner.workload") != workload.workload_id:
+                raise BackendRequestError(
+                    f"existing container {name} is not owned by this "
+                    "Brunner workload"
+                )
+            handle = BackendHandle(
+                backend=self.name,
+                workload_id=workload.workload_id,
+                native_id=native_id,
+                trial=workload.trial.resolve(),
+                metadata={"name": name},
+            )
+            write_json_atomic(
+                state_path,
+                {
+                    "schema_version": "1.0",
+                    **handle.to_dict(),
+                    "name": name,
+                },
+            )
+            self._handles[
+                backend_registry_key(workload.workload_id, workload.trial)
+            ] = handle
+            return handle
+        existing_message = (existing.stderr or existing.stdout).strip()
+        if "no such" not in existing_message.lower():
+            raise self._runtime_error(
+                ("inspect", name),
+                existing_message,
+            )
         arguments = [
             "run",
             "--detach",

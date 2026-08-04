@@ -165,6 +165,134 @@ def test_backend_registry_keeps_same_id_from_different_trials(
     assert len(keys) == 2
 
 
+def test_container_submission_adopts_existing_named_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    backend = ContainerBackend()
+    calls = []
+
+    def run(*arguments: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[0] != "inspect":
+            raise AssertionError(arguments)
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps(
+                {
+                    "Id": "existing-container-id",
+                    "Config": {
+                        "Labels": {"dev.brunner.workload": "case-1"}
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    handle = backend.submit(workload)
+
+    assert handle.native_id == "existing-container-id"
+    assert calls == [
+        (
+            "inspect",
+            "--format",
+            "{{json .}}",
+            native_resource_name("case-1", trial),
+        )
+    ]
+    state = json.loads((trial / "backend/container.json").read_text())
+    assert state["native_id"] == "existing-container-id"
+
+
+def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    job_name = native_resource_name("case-1", trial)
+    claim_name = native_resource_name("case-1", trial, suffix="-data")
+    remote: dict[str, dict[str, object]] = {}
+    staging_calls = 0
+    job_apply_calls = 0
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object] | None:
+        assert name is not None
+        return remote.get(f"{kind}/{name}")
+
+    def apply_resource(resource: dict[str, object]) -> None:
+        nonlocal job_apply_calls
+        kind = str(resource["kind"]).lower()
+        if kind == "persistentvolumeclaim":
+            kind = "pvc"
+        metadata = resource["metadata"]
+        assert isinstance(metadata, dict)
+        name = str(metadata["name"])
+        remote[f"{kind}/{name}"] = resource
+        if kind == "job":
+            job_apply_calls += 1
+            if job_apply_calls == 1:
+                raise BackendConnectivityError(
+                    "connection dropped after Job creation"
+                )
+
+    def stage_trial(*args: object, **kwargs: object) -> None:
+        nonlocal staging_calls
+        staging_calls += 1
+
+    def run_command(
+        *arguments: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert arguments[:3] == ("annotate", "pvc", claim_name)
+        pvc = remote[f"pvc/{claim_name}"]
+        metadata = pvc["metadata"]
+        assert isinstance(metadata, dict)
+        metadata.setdefault("annotations", {})["dev.brunner/staged"] = "true"
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(backend, "_apply", apply_resource)
+    monkeypatch.setattr(backend, "_stage_trial", stage_trial)
+    monkeypatch.setattr(backend, "_run", run_command)
+
+    with pytest.raises(BackendConnectivityError):
+        backend.submit(workload)
+    handle = backend.submit(workload)
+
+    assert handle.native_id == job_name
+    assert handle.metadata["claim_name"] == claim_name
+    assert staging_calls == 1
+    assert job_apply_calls == 1
+    assert (trial / "backend/kubernetes.json").is_file()
+
+
 @pytest.mark.parametrize("backend_type", ["container", "kubernetes"])
 def test_runtime_connectivity_failures_are_distinct(
     tmp_path: Path,

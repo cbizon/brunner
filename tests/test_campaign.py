@@ -147,6 +147,31 @@ class FlakyConnectivityBackend(ImmediateBackend):
         return super().capacity()
 
 
+class AmbiguousSubmissionBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_calls = 0
+        self.remote_handle: BackendHandle | None = None
+
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        self.submit_calls += 1
+        if self.remote_handle is None:
+            self.remote_handle = BackendHandle(
+                backend=self.name,
+                workload_id=workload.workload_id,
+                native_id=f"remote-{workload.workload_id}",
+                trial=workload.trial,
+                metadata={"submitted_at": "2026-08-04T12:00:00+00:00"},
+            )
+            raise BackendConnectivityError(
+                "connection dropped after remote submission"
+            )
+        return self.remote_handle
+
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        return BackendSnapshot(phase="running")
+
+
 class TransferRetryBackend(ImmediateBackend):
     def collect(
         self,
@@ -391,6 +416,39 @@ def test_campaign_run_waits_for_connectivity_and_resumes(
         event["type"] == "backend_connectivity"
         for event in state["events"]
     )
+
+
+def test_campaign_recovers_ambiguous_submission_by_adopting_workload(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = AmbiguousSubmissionBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="ambiguous-submit",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    paused = runner.advance()
+    resumed = runner.advance()
+
+    assert paused["status"] == "paused_backend_connectivity"
+    assert paused["trials"][0]["phase"] == "submitting"
+    assert paused["trials"][0].get("handle") is None
+    assert resumed["status"] == "running"
+    assert resumed["trials"][0]["phase"] == "running"
+    assert resumed["trials"][0]["handle"]["native_id"] == "remote-run-a"
+    assert resumed["trials"][0]["submitted_at"] == (
+        "2026-08-04T12:00:00+00:00"
+    )
+    assert backend.submit_calls == 2
 
 
 def test_campaign_resumes_cleanup_after_connectivity_loss(
