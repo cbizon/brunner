@@ -112,7 +112,7 @@ class CampaignPlan:
     infrastructure_max_restarts: int = 2
     trial_timeout_seconds: float | None = None
     trial_timeout_margin_seconds: float = 5 * 60
-    max_pause_seconds: float | None = 60 * 60
+    max_pause_seconds: float | None = None
     evaluation_timeout_seconds: float | None = None
 
     def validate(self) -> None:
@@ -561,16 +561,17 @@ class CampaignRunner:
         error: BackendConnectivityError,
     ) -> dict[str, Any]:
         state["status"] = "paused_backend_connectivity"
+        state["has_attention"] = True
         state["pause_reason"] = str(error)
         paused_since = state.get("paused_since")
         if not paused_since:
             paused_since = _now()
             state["paused_since"] = paused_since
-        self._event(
-            state,
-            "backend_connectivity",
-            str(error),
-        )
+            self._event(
+                state,
+                "backend_connectivity",
+                str(error),
+            )
         if self.plan.max_pause_seconds is not None:
             try:
                 since = datetime.fromisoformat(str(paused_since))

@@ -381,8 +381,9 @@ Campaign reconciliation:
   `trial_timeout_seconds`, which defaults to the backend workload deadline
   plus `trial_timeout_margin_seconds`, while continuing to inspect it until it
   reaches a terminal state
-- Stops waiting on an unreachable backend after `max_pause_seconds` instead of
-  polling a disconnected backend indefinitely
+- Waits indefinitely for an unreachable backend by default, preserving remote
+  lifecycle state across orchestrator sleep or network loss; deployments may
+  set `max_pause_seconds` to require manual attention after a bounded interval
 - Bounds evaluation with `evaluation_timeout_seconds`, shared as one budget
   across reference validation, the evaluator, and every assessment;
   reconciliation is sequential, so an unbounded evaluator would block every

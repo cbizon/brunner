@@ -36,17 +36,40 @@ from brunner.io import write_json_atomic
 
 
 CONNECTIVITY_FRAGMENTS = (
+    "bad gateway",
+    "connection closed",
     "unable to connect to the server",
     "connection refused",
     "connection reset by peer",
     "context deadline exceeded",
     "dial tcp",
+    "gateway timeout",
+    "http/2: client connection lost",
+    "http2: client connection lost",
     "i/o timeout",
+    "internal server error",
     "no route to host",
     "no such host",
+    "network is unreachable",
+    "proxyconnect tcp",
+    "server is currently unable to handle the request",
+    "stream error",
     "temporary failure in name resolution",
     "tls handshake timeout",
+    "too many requests",
+    "unexpected eof",
     "service unavailable",
+)
+REACHABLE_REQUEST_FRAGMENTS = (
+    "already exists",
+    "cannot be changed",
+    "exceeded quota",
+    "forbidden",
+    "immutable",
+    "invalid",
+    "not found",
+    "the server has asked for the client to provide credentials",
+    "unauthorized",
 )
 STAGED_ANNOTATION = "dev.brunner/staged"
 NON_RETRYABLE_JOB_FAILURES = frozenset({"DeadlineExceeded"})
@@ -318,14 +341,41 @@ class KubernetesBackend:
     ) -> BackendError:
         message = (stderr or stdout).decode(errors="replace").strip()
         lowered = message.lower()
-        error_type = (
-            BackendConnectivityError
-            if any(item in lowered for item in CONNECTIVITY_FRAGMENTS)
-            else BackendRequestError
-        )
+        if any(item in lowered for item in CONNECTIVITY_FRAGMENTS):
+            error_type = BackendConnectivityError
+        elif any(item in lowered for item in REACHABLE_REQUEST_FRAGMENTS):
+            error_type = BackendRequestError
+        elif self._probe_backend_reachable():
+            error_type = BackendRequestError
+        else:
+            error_type = BackendConnectivityError
         return error_type(
             f"{self.kubectl} {' '.join(arguments)} exited "
             f"{return_code}: {message}"
+        )
+
+    def _probe_backend_reachable(self) -> bool:
+        try:
+            result = subprocess.run(
+                (self.kubectl, "get", "--raw=/readyz"),
+                capture_output=True,
+                check=False,
+                timeout=min(10, self.profile.command_timeout_seconds),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode == 0:
+            return True
+        message = (result.stderr or result.stdout).decode(
+            errors="replace"
+        ).lower()
+        return any(
+            item in message
+            for item in (
+                "forbidden",
+                "unauthorized",
+                "the server has asked for the client to provide credentials",
+            )
         )
 
     def _run_bytes(
