@@ -65,6 +65,24 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert pvc["spec"]["storageClassName"] == "fast"
     pod_spec = job["spec"]["template"]["spec"]
     assert pod_spec["activeDeadlineSeconds"] == 62
+    assert pod_spec["automountServiceAccountToken"] is False
+    assert pod_spec["terminationGracePeriodSeconds"] == 30
+    assert pod_spec["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 1000,
+        "runAsGroup": 1000,
+        "fsGroup": 1000,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    assert pod_spec["volumes"][-1] == {"name": "tmp", "emptyDir": {}}
+    assert pod_spec["containers"][0]["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": True,
+    }
+    assert {"name": "tmp", "mountPath": "/tmp"} in (
+        pod_spec["containers"][0]["volumeMounts"]
+    )
     environment = pod_spec["containers"][0]["env"]
     secret = next(
         item for item in environment if item["name"] == "OPENAI_API_KEY"
@@ -100,8 +118,16 @@ def test_kubernetes_helper_pod_uses_neutral_working_directory() -> None:
     container = helper["spec"]["containers"][0]
     assert container["workingDir"] == "/tmp"
     assert container["volumeMounts"] == [
-        {"name": "trial", "mountPath": "/brunner/trial"}
+        {"name": "trial", "mountPath": "/brunner/trial"},
+        {"name": "tmp", "mountPath": "/tmp"},
     ]
+    assert helper["spec"]["automountServiceAccountToken"] is False
+    assert helper["spec"]["securityContext"]["runAsNonRoot"] is True
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": True,
+    }
 
 
 def test_native_resource_names_do_not_collapse_caller_ids(

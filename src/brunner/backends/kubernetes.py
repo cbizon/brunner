@@ -113,14 +113,32 @@ def _pod_spec_common(
     container: dict[str, Any],
     excluded_nodes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    container["securityContext"] = {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": True,
+    }
+    container.setdefault("volumeMounts", []).append(
+        {"name": "tmp", "mountPath": "/tmp"}
+    )
     spec: dict[str, Any] = {
+        "automountServiceAccountToken": False,
         "restartPolicy": "Never",
+        "terminationGracePeriodSeconds": 30,
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": 1000,
+            "runAsGroup": 1000,
+            "fsGroup": 1000,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
         "containers": [container],
         "volumes": [
             {
                 "name": "trial",
                 "persistentVolumeClaim": {"claimName": claim_name},
-            }
+            },
+            {"name": "tmp", "emptyDir": {}},
         ],
     }
     if profile.service_account_name:
