@@ -266,6 +266,7 @@ def render_job(
 
 class KubernetesBackend:
     name = "kubernetes"
+    agent_isolation = "container"
 
     def __init__(
         self,

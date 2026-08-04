@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,6 +11,7 @@ from typing import Any, Callable
 
 from brunner.backends import (
     BackendHandle,
+    CONTAINER_ISOLATION,
     ExecutionBackend,
     WorkloadSpec,
 )
@@ -198,15 +198,11 @@ def default_workload_factory(
             "campaign environment variables are not set: "
             + ", ".join(missing_environment)
         )
-    backend_trial = (
-        trial if backend_name == "local" else Path("/brunner/trial")
-    )
-    python = sys.executable if backend_name == "local" else "python"
     command = [
-        python,
+        "python",
         "-m",
         "brunner.agent_cli",
-        str(backend_trial),
+        "/brunner/trial",
     ]
     if plan.provider_executable:
         command.extend(
@@ -249,6 +245,11 @@ class CampaignRunner:
         *,
         workload_factory: WorkloadFactory = default_workload_factory,
     ) -> None:
+        if getattr(backend, "agent_isolation", None) != CONTAINER_ISOLATION:
+            raise ValueError(
+                "campaign backends must run agents in a container isolation "
+                "boundary; host-process execution is not supported"
+            )
         plan.validate()
         definition.validate()
         self.definition = definition

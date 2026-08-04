@@ -9,14 +9,12 @@ from typing import Any, Callable, Sequence
 
 from brunner.contract import load_output_contract, render_output_requirements
 from brunner.campaign import CampaignRunner
-from brunner.definition import BenchmarkDefinition, RuntimeDefaults
+from brunner.definition import BenchmarkDefinition
 from brunner.evaluation import evaluate_trial
-from brunner.providers import ProviderSettings
 from brunner.reference import (
     build_reference_manifest,
     validate_reference_manifest,
 )
-from brunner.runner import run_trial
 from brunner.staging import stage_challenge
 from brunner.trial import TrialIdentity, create_trial, new_test_id
 
@@ -84,25 +82,11 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     _add_provider_arguments(create)
     create.add_argument("--test-id")
 
-    run = subparsers.add_parser("trial-run")
-    run.add_argument("trial", type=_path)
-    run.add_argument("--timeout-seconds", type=float)
-    run.add_argument("--finalization-seconds", type=float)
-    run.add_argument("--provider-executable")
-
     evaluation = subparsers.add_parser("trial-evaluate")
     evaluation.add_argument("trial", type=_path)
 
     assessment = subparsers.add_parser("trial-assess")
     assessment.add_argument("trial", type=_path)
-
-    local = subparsers.add_parser("local-run")
-    local.add_argument("tests_root", type=_path)
-    _add_provider_arguments(local)
-    local.add_argument("--test-id")
-    local.add_argument("--timeout-seconds", type=float)
-    local.add_argument("--finalization-seconds", type=float)
-    local.add_argument("--provider-executable")
 
     reference = subparsers.add_parser("reference-build")
     reference.add_argument("--output", type=_path)
@@ -123,45 +107,6 @@ def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=("codex", "claude"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort")
-
-
-def _runtime(
-    definition: BenchmarkDefinition,
-    args: argparse.Namespace,
-) -> RuntimeDefaults:
-    defaults = definition.runtime
-    return RuntimeDefaults(
-        timeout_seconds=(
-            args.timeout_seconds
-            if getattr(args, "timeout_seconds", None) is not None
-            else defaults.timeout_seconds
-        ),
-        finalization_seconds=(
-            args.finalization_seconds
-            if getattr(args, "finalization_seconds", None) is not None
-            else defaults.finalization_seconds
-        ),
-        retry_initial_seconds=defaults.retry_initial_seconds,
-        retry_max_seconds=defaults.retry_max_seconds,
-        provider_exit_grace_seconds=defaults.provider_exit_grace_seconds,
-        backend_shutdown_grace_seconds=(
-            defaults.backend_shutdown_grace_seconds
-        ),
-        max_attempts=defaults.max_attempts,
-        max_activity_interval_seconds=(
-            defaults.max_activity_interval_seconds
-        ),
-        submission_poll_seconds=defaults.submission_poll_seconds,
-    )
-
-
-def _settings_from_metadata(trial: Path) -> ProviderSettings:
-    metadata = json.loads((trial / "metadata/manifest.json").read_text())
-    return ProviderSettings(
-        provider=str(metadata["provider"]),
-        model=str(metadata["model"]),
-        effort=metadata.get("effort"),
-    )
 
 
 def execute(
@@ -198,15 +143,6 @@ def execute(
                 identity,
             )
         }
-    if args.command == "trial-run":
-        return run_trial(
-            definition,
-            contract,
-            args.trial,
-            _settings_from_metadata(args.trial),
-            runtime=_runtime(definition, args),
-            executable=args.provider_executable,
-        )
     if args.command == "trial-evaluate":
         return evaluate_trial(definition, contract, args.trial)
     if args.command == "trial-assess":
@@ -244,37 +180,6 @@ def execute(
             results_path.with_name("run-report.html"),
         )
         return assessment_index
-    if args.command == "local-run":
-        identity = TrialIdentity(
-            test_id=args.test_id or new_test_id(args.provider),
-            provider=args.provider,
-            model=args.model,
-            effort=args.effort,
-        )
-        trial = create_trial(
-            definition,
-            contract,
-            args.tests_root,
-            identity,
-        )
-        state = run_trial(
-            definition,
-            contract,
-            trial,
-            ProviderSettings(
-                provider=args.provider,
-                model=args.model,
-                effort=args.effort,
-            ),
-            runtime=_runtime(definition, args),
-            executable=args.provider_executable,
-        )
-        evaluation = evaluate_trial(definition, contract, trial)
-        return {
-            "trial": trial,
-            "status": state["status"],
-            "evaluation": evaluation,
-        }
     if args.command == "reference-build":
         if definition.reference is None:
             raise ValueError("benchmark does not define a reference bundle")

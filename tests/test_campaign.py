@@ -37,6 +37,7 @@ ROOT = Path(__file__).parents[1]
 
 class ImmediateBackend:
     name = "fake"
+    agent_isolation = "container"
 
     def __init__(self) -> None:
         self.handles: dict[str, BackendHandle] = {}
@@ -194,6 +195,10 @@ class MixedStateBackend(ImmediateBackend):
         return BackendSnapshot(phase="running")
 
 
+class HostProcessBackend(ImmediateBackend):
+    agent_isolation = "host"
+
+
 def _workload(
     trial: Path,
     campaign_trial: CampaignTrial,
@@ -207,6 +212,25 @@ def _workload(
         command=("unused",),
         timeout_seconds=10,
     )
+
+
+def test_campaign_rejects_host_process_backend(tmp_path: Path) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="unsafe",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("unsafe-a", "codex", "model-a"),),
+    )
+
+    with pytest.raises(ValueError, match="container isolation boundary"):
+        CampaignRunner(
+            definition,
+            contract,
+            plan,
+            HostProcessBackend(),
+            workload_factory=_workload,
+        )
 
 
 def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
@@ -803,9 +827,15 @@ def test_campaign_backend_deadline_includes_shutdown_grace(
             trials=(trial,),
         ),
         definition,
-        "local",
+        "container",
     )
 
+    assert workload.command[:3] == (
+        "python",
+        "-m",
+        "brunner.agent_cli",
+    )
+    assert workload.command[3] == "/brunner/trial"
     assert workload.timeout_seconds == (
         definition.runtime.timeout_seconds
         + definition.runtime.backend_shutdown_grace_seconds

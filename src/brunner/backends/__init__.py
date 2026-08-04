@@ -2,6 +2,7 @@ from brunner.backends.base import (
     BackendCapacity,
     BackendHandle,
     BackendSnapshot,
+    CONTAINER_ISOLATION,
     ExecutionBackend,
     WorkloadSpec,
 )
@@ -10,16 +11,15 @@ from brunner.backends.kubernetes import (
     KubernetesBackend,
     KubernetesProfile,
 )
-from brunner.backends.local import LocalBackend
 
 __all__ = [
     "BackendCapacity",
     "BackendHandle",
     "BackendSnapshot",
+    "CONTAINER_ISOLATION",
     "ContainerBackend",
     "ExecutionBackend",
     "KubernetesBackend",
     "KubernetesProfile",
-    "LocalBackend",
     "WorkloadSpec",
 ]

@@ -19,6 +19,7 @@ BACKEND_PHASES = frozenset(
         "cleaned",
     }
 )
+CONTAINER_ISOLATION = "container"
 
 
 def native_resource_name(
@@ -144,6 +145,7 @@ class BackendCapacity:
 
 class ExecutionBackend(Protocol):
     name: str
+    agent_isolation: str
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle: ...
 
