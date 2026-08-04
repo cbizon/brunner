@@ -56,7 +56,6 @@ class WorkloadSpec:
     trial: Path
     command: tuple[str, ...]
     timeout_seconds: float
-    environment: dict[str, str] = field(default_factory=dict)
     image: str | None = None
     cpu: str | None = None
     memory: str | None = None

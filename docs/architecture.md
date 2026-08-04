@@ -398,6 +398,9 @@ Campaign reconciliation:
 - Regenerates `index.html` after each transition with live elapsed time,
   backend warnings, usage, timing, and report links
 
-No campaign environment values are serialized. A plan may name environment
-variables to pass at submission time; their values are read from the current
-process environment.
+Campaign trials contain no environment passthrough. OCI credential variables
+are configured on `ContainerBackend` and inherited by name without including
+their values in command arguments. Kubernetes credentials are represented only
+as Secret name/key references. Explicit non-secret proxy or certificate
+settings may be configured on a backend profile; no environment values are
+stored in campaign state.

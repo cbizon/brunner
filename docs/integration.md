@@ -582,7 +582,13 @@ def build_campaign(definition, contract):
         definition,
         contract,
         plan,
-        ContainerBackend(max_parallel=2),
+        ContainerBackend(
+            max_parallel=2,
+            inherited_environment=("OPENAI_API_KEY",),
+            nonsecret_environment={
+                "HTTPS_PROXY": "http://proxy.internal:3128",
+            },
+        ),
     )
 ```
 
@@ -622,9 +628,20 @@ artifact-reader images must contain Brunner; the agent image also needs the
 selected provider CLI. The benchmark package, evaluator, and references are
 not required in the agent image.
 
-Provider secrets should be inherited from the local environment or referenced
-through `KubernetesProfile.secret_environment`. Do not place secret values in
-campaign objects.
+Campaign trials do not accept environment-variable names or values. Provider
+credentials and deployment networking belong to the backend configuration:
+
+- `ContainerBackend.inherited_environment` names credentials that must exist in
+  the orchestrator environment. Brunner passes `--env NAME` to the OCI runtime,
+  never `--env NAME=value`, so secret values are absent from command arguments
+  and campaign state.
+- `KubernetesProfile.secret_environment` maps container variable names to
+  Kubernetes Secret name/key references.
+- `ContainerBackend.nonsecret_environment` and
+  `KubernetesProfile.nonsecret_environment` are for explicit non-secret
+  deployment settings such as proxy addresses or certificate paths.
+
+Do not put secret values in non-secret environment mappings.
 
 `campaign-step` returns a persisted `paused_backend_connectivity` state when
 the backend cannot be reached. `campaign-run` keeps waiting and retries until
