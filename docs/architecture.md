@@ -176,6 +176,12 @@ and Kubernetes backends provide that boundary. Campaign construction rejects
 backends that do not declare container isolation; Brunner does not support
 running candidate agents as host processes.
 
+Kubernetes candidate and helper pods do not mount service-account tokens. They
+run as UID/GID 1000 with the runtime-default seccomp profile, all Linux
+capabilities dropped, privilege escalation disabled, and a read-only container
+root. The trial PVC and an ephemeral `/tmp` volume are their only writable
+mounts. Agent and artifact-reader images must support this non-root contract.
+
 Remote jobs run `python -m brunner.agent_cli` inside the agent container. That
 internal module does not import the benchmark package. Evaluator source and
 trusted references do not need to be present in the agent image.
