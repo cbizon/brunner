@@ -384,6 +384,7 @@ done
 result='{"verdict":"pass","criterion":{"applicability":"applicable","rating":"correct","confidence":"high","summary":"Evidence supports the result.","evidence":[{"source":"metric","path":"evaluation/results.json","finding":"exact_match=1"}]}}'
 printf '%s\n' "$result" > "$final"
 printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","criterion":{"applicability":"applicable","rating":"correct","confidence":"high","summary":"Evidence supports the result.","evidence":[{"source":"metric","path":"evaluation/results.json","finding":"exact_match=1"}]}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}'
+printf '%s\n' 'harmless reviewer warning' >&2
 """
     )
     reviewer.chmod(0o755)
@@ -420,6 +421,11 @@ printf '%s\n' '{"type":"turn.completed","structured_output":{"verdict":"pass","c
     assert assessment_result["method"]["executable"] == str(reviewer)
     assert assessment_result["usage"]["total_tokens"] == 5
     assert assessment_result["attempts"][0]["status"] == "complete"
+    assert "failure" not in assessment_result["attempts"][0]
+    assert "harmless reviewer warning" in (
+        trial
+        / "assessments/model-review/reviewer/attempts/0001.stderr.log"
+    ).read_text()
     assert assessment_result["reports"] == [
         {
             "path": "evaluation/model-review.json",

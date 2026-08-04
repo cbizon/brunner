@@ -878,6 +878,8 @@ def _run_reviewer(
                     errors = _validation_errors(schema, candidate)
                     if not errors:
                         write_json_atomic(output_path, candidate)
+                        attempt.pop("failure", None)
+                        attempt.pop("terminal", None)
                         attempt["status"] = "complete"
                         attempts.append(attempt)
                         usage = None

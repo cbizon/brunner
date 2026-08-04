@@ -99,6 +99,12 @@ def _raw_details(label: str, value: object) -> str:
     )
 
 
+def _attempt_failure(attempt: dict[str, Any]) -> str:
+    if attempt.get("status") != "failed":
+        return ""
+    return str(attempt.get("failure", "") or "")
+
+
 def write_run_report(trial: Path, output: Path) -> Path:
     metadata = _load_optional(trial / "metadata/manifest.json") or {}
     status = _load_optional(trial / "status.json") or {}
@@ -178,7 +184,7 @@ def write_run_report(trial: Path, output: Path) -> Path:
         f"<td>{html.escape(str(attempt.get('mode', '')))}</td>"
         f"<td>{html.escape(str(attempt.get('status', '')))}</td>"
         f"<td>{html.escape(str(attempt.get('return_code', '')))}</td>"
-        f"<td>{html.escape(str(attempt.get('failure', '') or ''))}</td>"
+        f'<td class="diagnostic">{html.escape(_attempt_failure(attempt))}</td>'
         "</tr>"
         for attempt in attempts
         if isinstance(attempt, dict)
@@ -243,6 +249,7 @@ th,td {{ padding:10px; border:1px solid var(--line); text-align:left;
   vertical-align:top; }}
 pre {{ overflow:auto; background:#20251f; color:#f5f0df; padding:16px; }}
 a {{ color:var(--green); }}
+.diagnostic {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
 details {{ margin-top:12px; background:var(--panel); border:1px solid var(--line); }}
 summary {{ cursor:pointer; padding:12px 16px; color:var(--green); font-weight:bold; }}
 details pre {{ margin:0; border-top:1px solid var(--line); }}

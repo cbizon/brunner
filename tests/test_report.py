@@ -11,7 +11,12 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
 
-def _report_fixture(tmp_path: Path, *, display_title: str | None = None) -> str:
+def _report_fixture(
+    tmp_path: Path,
+    *,
+    display_title: str | None = None,
+    attempts: list[dict[str, object]] | None = None,
+) -> str:
     trial = tmp_path / "trial"
     output = trial / "evaluation/run-report.html"
     metadata = {
@@ -28,14 +33,18 @@ def _report_fixture(tmp_path: Path, *, display_title: str | None = None) -> str:
         trial / "status.json",
         {
             "status": "complete",
-            "attempts": [
-                {
-                    "number": 1,
-                    "mode": "initial",
-                    "status": "complete",
-                    "return_code": 0,
-                }
-            ],
+            "attempts": (
+                attempts
+                if attempts is not None
+                else [
+                    {
+                        "number": 1,
+                        "mode": "initial",
+                        "status": "complete",
+                        "return_code": 0,
+                    }
+                ]
+            ),
         },
     )
     _write_json(
@@ -145,3 +154,32 @@ def test_run_report_renders_optional_display_title(tmp_path: Path) -> None:
 
     assert "<h1>Monkeybench &lt;Canary&gt;</h1>" in report
     assert "<title>Monkeybench &lt;Canary&gt;</title>" in report
+
+
+def test_run_report_only_labels_failed_attempts_as_failures(
+    tmp_path: Path,
+) -> None:
+    report = _report_fixture(
+        tmp_path,
+        attempts=[
+            {
+                "number": 1,
+                "mode": "initial",
+                "status": "complete",
+                "return_code": 0,
+                "failure": "harmless stderr warning",
+            },
+            {
+                "number": 2,
+                "mode": "resume",
+                "status": "failed",
+                "return_code": 1,
+                "failure": "actual failure",
+            },
+        ],
+    )
+
+    assert "harmless stderr warning" not in report
+    assert "actual failure" in report
+    assert 'class="diagnostic"' in report
+    assert "overflow-wrap:anywhere" in report

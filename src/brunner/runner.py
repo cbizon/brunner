@@ -1334,6 +1334,17 @@ def _run_configured_trial(
                     )
                     final_response = None
                 if final_response is not None:
+                    # A valid current structured response is authoritative.
+                    # Provider stderr can contain recovered tool diagnostics
+                    # and startup warnings that are not attempt failures.
+                    for key in (
+                        "failure",
+                        "api_status",
+                        "failure_reason",
+                        "wait_category",
+                        "retry_at_epoch",
+                    ):
+                        attempt.pop(key, None)
                     attempt["status"] = provider_status
                     write_json_atomic(
                         transcript / "final.json",

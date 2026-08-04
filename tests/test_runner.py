@@ -1163,6 +1163,7 @@ printf '%s\n' '{"schema_version":"1.0","output":"result.txt"}' > submission/mani
 printf '%s\n' '{"status":"complete","submission_manifest":"submission/manifest.json","completed_units":["uppercase"],"limitations":[]}' > submission/run-status.json
 cp submission/run-status.json "$final"
 printf '%s\n' '{"type":"turn.completed"}'
+printf '%s\n' 'harmless provider warning' >&2
 """,
     )
 
@@ -1180,6 +1181,10 @@ printf '%s\n' '{"type":"turn.completed"}'
     )
 
     assert state["status"] == "complete"
+    assert "failure" not in state["attempts"][0]
+    assert "harmless provider warning" in (
+        trial / "transcript/attempts/0001.stderr.log"
+    ).read_text()
 
 
 def test_soft_deadline_waits_for_declared_external_activity(
