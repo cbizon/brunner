@@ -384,9 +384,14 @@ Campaign reconciliation:
   resumes without changing remote workloads
 - Collects artifacts for both successful and failed workloads
 - Recovers interrupted collection and evaluation phases after a crash
+- Counts a collection attempt only after the backend transfer returns or
+  reports a non-connectivity failure; an orchestrator crash or connectivity
+  pause while `collect()` is in progress does not consume the retry limit
 - Relaunches retryable infrastructure failures against existing persistent
   agent state with a bounded restart count
 - Retries interrupted artifact transfers with a bounded, configurable policy
+- Uses the same persisted cleanup transition for initial and resumed cleanup,
+  including identical completion and failure events
 - Keeps integrity and evaluation failures durable instead of retrying them
 - Continues healthy running or pending trials when another needs attention
 - Flags a trial the backend still reports as pending or running past

@@ -651,6 +651,9 @@ workloads while disconnected.
 Artifact-transfer interruptions retain verified partial files and retry after
 `collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
 identity, path, and other integrity failures are not retried automatically.
+Only completed backend collection calls and non-connectivity collection
+failures consume that attempt limit. Orchestrator interruption and backend
+connectivity pauses leave the in-progress collection attempt uncharged.
 An empty remote log response does not overwrite a previously recovered
 workload log. Kubernetes snapshots include relevant warning events for
 pending PVCs and artifact-reader mount failures, and the campaign dashboard

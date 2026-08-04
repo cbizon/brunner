@@ -367,6 +367,16 @@ class CampaignRunner:
                 entry["collection_warning"] = (
                     "collection was interrupted before completion"
                 )
+                in_progress = entry.pop("collection_attempt", None)
+                if in_progress is None:
+                    # Before collection_attempt existed, entering collecting
+                    # charged the attempt before collect() was called. Undo
+                    # that legacy in-progress charge during recovery.
+                    attempts = entry.setdefault("attempts", {})
+                    attempts["collection"] = max(
+                        0,
+                        int(attempts.get("collection", 0)) - 1,
+                    )
             elif phase == "evaluating":
                 entry["phase"] = "evaluation_pending"
                 entry["evaluation_error"] = (
@@ -733,6 +743,64 @@ class CampaignRunner:
         self._save(state)
         return restarted
 
+    def _begin_collection_attempt(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+    ) -> int:
+        attempt_number = int(entry["attempts"]["collection"]) + 1
+        entry["phase"] = "collecting"
+        entry["collection_attempt"] = {
+            "number": attempt_number,
+            "started_at": _now(),
+        }
+        entry.pop("next_collection_attempt_at", None)
+        self._save(state)
+        return attempt_number
+
+    @staticmethod
+    def _finish_collection_attempt(
+        entry: dict[str, Any],
+        attempt_number: int,
+    ) -> None:
+        entry["attempts"]["collection"] = attempt_number
+        entry.pop("collection_attempt", None)
+
+    def _cleanup_entry(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+        handle: BackendHandle,
+    ) -> None:
+        entry["phase"] = "cleanup_pending"
+        self._save(state)
+        try:
+            self.backend.cleanup(handle)
+        except BackendConnectivityError:
+            raise
+        except BackendError as error:
+            entry["phase"] = "attention_required"
+            entry["cleanup_error"] = str(error)
+            self._event(
+                state,
+                "cleanup_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return
+        entry["phase"] = "complete"
+        entry["completed_at"] = _now()
+        entry["backend_workload_live"] = False
+        entry.pop("cleanup_error", None)
+        self._event(
+            state,
+            "trial_complete",
+            f"trial finished with outcome {entry['outcome']}",
+            test_id=entry["test_id"],
+        )
+        self._save(state)
+
     def _collect_and_evaluate(
         self,
         state: dict[str, Any],
@@ -743,10 +811,7 @@ class CampaignRunner:
         destination = self.root / "collected" / entry["test_id"]
         entry["backend_phase"] = backend_phase
         if entry["phase"] != "evaluation_pending":
-            entry["phase"] = "collecting"
-            entry["attempts"]["collection"] += 1
-            entry.pop("next_collection_attempt_at", None)
-            self._save(state)
+            attempt_number = self._begin_collection_attempt(state, entry)
             try:
                 collection = self.backend.collect(
                     handle,
@@ -757,6 +822,7 @@ class CampaignRunner:
             except BackendConnectivityError:
                 raise
             except ArtifactTransferError as error:
+                self._finish_collection_attempt(entry, attempt_number)
                 attempts = int(entry["attempts"]["collection"])
                 if attempts < self.plan.collection_max_attempts:
                     next_attempt = datetime.now(UTC) + timedelta(
@@ -796,6 +862,7 @@ class CampaignRunner:
                 IntegrityError,
                 OSError,
             ) as error:
+                self._finish_collection_attempt(entry, attempt_number)
                 entry["phase"] = "collection_failed"
                 entry["collection_error"] = str(error)
                 self._event(
@@ -806,6 +873,7 @@ class CampaignRunner:
                 )
                 self._save(state)
                 return
+            self._finish_collection_attempt(entry, attempt_number)
             entry["collection"] = {
                 key: str(value) if isinstance(value, Path) else value
                 for key, value in collection.items()
@@ -889,34 +957,7 @@ class CampaignRunner:
             and evaluation["required_assessments_complete"]
             else "failed"
         )
-        entry["phase"] = "cleanup_pending"
-        self._save(state)
-        try:
-            self.backend.cleanup(handle)
-        except BackendConnectivityError:
-            raise
-        except BackendError as error:
-            entry["phase"] = "attention_required"
-            entry["cleanup_error"] = str(error)
-            self._event(
-                state,
-                "cleanup_failed",
-                str(error),
-                test_id=entry["test_id"],
-            )
-            self._save(state)
-            return
-        entry["phase"] = "complete"
-        entry["completed_at"] = _now()
-        entry["backend_workload_live"] = False
-        entry.pop("cleanup_error", None)
-        self._event(
-            state,
-            "trial_complete",
-            f"trial finished with outcome {entry['outcome']}",
-            test_id=entry["test_id"],
-        )
-        self._save(state)
+        self._cleanup_entry(state, entry, handle)
 
     def advance(self) -> dict[str, Any]:
         with self._campaign_lock():
@@ -978,23 +1019,9 @@ class CampaignRunner:
             handle = _handle_from_dict(handle_value)
             if entry["phase"] == "cleanup_pending":
                 try:
-                    self.backend.cleanup(handle)
+                    self._cleanup_entry(state, entry, handle)
                 except BackendConnectivityError as error:
                     return self._pause_connectivity(state, error)
-                except BackendError as error:
-                    entry["phase"] = "attention_required"
-                    entry["cleanup_error"] = str(error)
-                    continue
-                entry["phase"] = "complete"
-                entry["completed_at"] = _now()
-                entry["backend_workload_live"] = False
-                entry.pop("cleanup_error", None)
-                self._event(
-                    state,
-                    "cleanup_complete",
-                    "backend cleanup completed",
-                    test_id=entry["test_id"],
-                )
                 continue
             if entry["phase"] == "collection_pending":
                 backend_phase = str(
