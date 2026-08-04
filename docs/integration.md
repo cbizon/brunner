@@ -702,3 +702,8 @@ campaign-run         Reconcile until complete, paused, or attention required
 Remote backends invoke `python -m brunner.agent_cli` inside the agent
 container. The module reads only staged trial metadata and does not import
 benchmark code; it is intentionally not installed as a public console command.
+It handles `SIGTERM` and `SIGINT` as graceful interruption requests, terminating
+the active provider process group and persisting resumable state before exit.
+Provider retry and subscription-reset waits are absolute deadlines in the
+trial's `status.json`, so replacing a pod or restarting the agent does not
+bypass or restart an existing wait.

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 from brunner.definition import RuntimeDefaults
@@ -31,7 +34,8 @@ def main() -> None:
             (args.trial / "metadata/agent-run.json").read_text()
         )
         defaults = RuntimeDefaults(**staged["runtime"])
-        runtime = RuntimeDefaults(
+        runtime = replace(
+            defaults,
             timeout_seconds=(
                 args.timeout_seconds
                 if args.timeout_seconds is not None
@@ -42,25 +46,34 @@ def main() -> None:
                 if args.finalization_seconds is not None
                 else defaults.finalization_seconds
             ),
-            retry_initial_seconds=defaults.retry_initial_seconds,
-            retry_max_seconds=defaults.retry_max_seconds,
-            provider_exit_grace_seconds=(
-                defaults.provider_exit_grace_seconds
-            ),
-            backend_shutdown_grace_seconds=(
-                defaults.backend_shutdown_grace_seconds
-            ),
         )
-    state = run_staged_trial(
-        args.trial,
-        ProviderSettings(
-            provider=identity.provider,
-            model=identity.model,
-            effort=identity.effort,
-        ),
-        runtime=runtime,
-        executable=args.provider_executable,
-    )
+    stop_requested = threading.Event()
+
+    def request_stop(
+        _signum: int,
+        _frame: object,
+    ) -> None:
+        stop_requested.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_stop)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        state = run_staged_trial(
+            args.trial,
+            ProviderSettings(
+                provider=identity.provider,
+                model=identity.model,
+                effort=identity.effort,
+            ),
+            runtime=runtime,
+            executable=args.provider_executable,
+            stop_requested=stop_requested,
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     print(json.dumps(state, indent=2))
 
 
