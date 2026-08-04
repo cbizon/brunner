@@ -62,13 +62,9 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
   contract-check
 ```
 
-Run a benchmark locally with an installed provider CLI:
-
-```sh
-UV_CACHE_DIR=.uv-cache uv run brunner \
-  --benchmark examples.text_benchmark.definition \
-  local-run ./runs --provider codex --model MODEL
-```
+Candidate agents run only through campaign backends that provide an outer
+container isolation boundary. Brunner supports OCI containers and Kubernetes;
+it does not provide host-process or local campaign execution.
 
 Materialize a harmless candidate-visible example resource before staging:
 

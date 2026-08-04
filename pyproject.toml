@@ -11,7 +11,6 @@ dependencies = [
 [project.scripts]
 brunner = "brunner.cli:main"
 brunner-activity = "brunner.activity_cli:main"
-brunner-agent = "brunner.agent_cli:main"
 
 [dependency-groups]
 dev = [

@@ -434,6 +434,7 @@ def test_standard_review_artifacts_cannot_be_overwritten(
 
 class ReviewBackend:
     name = "review"
+    agent_isolation = "container"
 
     def __init__(self) -> None:
         self.cleaned: set[str] = set()

@@ -164,8 +164,8 @@ brunner \
 ```
 
 With no `materialize_command`, Brunner retains the existing direct challenge
-copy behavior. `stage`, `trial-create`, `local-run`, and every campaign backend
-share this same staging path.
+copy behavior. `stage`, `trial-create`, and every container-isolated campaign
+backend share this same staging path.
 
 ## Standard Qualitative Review
 
@@ -186,8 +186,8 @@ qualitative_review=QualitativeReviewDefinition(
 
 When configured, every evaluation path runs the review after the deterministic
 evaluator and before campaign cleanup. This includes `trial-evaluate`,
-`trial-assess`, `local-run`, and local, container, or Kubernetes campaigns.
-Trial creation records the review contract before execution.
+`trial-assess`, and container or Kubernetes campaigns. Trial creation records
+the review contract before execution.
 
 Brunner writes:
 
@@ -551,7 +551,7 @@ definition and contract:
 from pathlib import Path
 
 from brunner import CampaignPlan, CampaignRunner, CampaignTrial
-from brunner.backends import LocalBackend
+from brunner.backends import ContainerBackend
 
 
 def build_campaign(definition, contract):
@@ -572,6 +572,7 @@ def build_campaign(definition, contract):
                 effort="high",
             ),
         ),
+        backend_image="my-benchmark-agent:latest",
         max_parallel=2,
         included_artifact_groups=frozenset({"debug"}),
         collection_retry_seconds=60,
@@ -581,8 +582,8 @@ def build_campaign(definition, contract):
         definition,
         contract,
         plan,
-        LocalBackend(max_parallel=2),
-)
+        ContainerBackend(max_parallel=2),
+    )
 ```
 
 The first `CampaignTrial` argument is the caller-owned trial ID. Brunner does
@@ -613,11 +614,13 @@ brunner --benchmark my_benchmark.definition \
   campaign-run my_benchmark.campaign --poll-seconds 10
 ```
 
-For OCI execution, use `ContainerBackend` and set `backend_image` on the plan.
-For Kubernetes, construct `KubernetesBackend(KubernetesProfile(...))`. Agent
-and artifact-reader images must contain Brunner; the agent image also needs
-the selected provider CLI. The benchmark package, evaluator, and references
-are not required in the agent image.
+Campaign backends must declare `agent_isolation = "container"`;
+`CampaignRunner` rejects host-process backends. For OCI execution, use
+`ContainerBackend` and set `backend_image` on the plan. For Kubernetes,
+construct `KubernetesBackend(KubernetesProfile(...))`. Agent and
+artifact-reader images must contain Brunner; the agent image also needs the
+selected provider CLI. The benchmark package, evaluator, and references are
+not required in the agent image.
 
 Provider secrets should be inherited from the local environment or referenced
 through `KubernetesProfile.secret_environment`. Do not place secret values in
@@ -669,10 +672,8 @@ contract-check       Validate contract and print digest
 contract-render      Render the generated output-requirements prompt section
 stage                Stage an isolated challenge
 trial-create         Create a durable trial
-trial-run            Run a trial with a loaded benchmark definition
 trial-evaluate       Run trusted evaluation
 trial-assess         Rerun configured assessments over existing evaluation
-local-run            Create, run, and evaluate locally
 reference-build      Build a reference manifest
 reference-validate   Verify a reference bundle
 campaign-init        Create campaign state and trials
@@ -680,5 +681,6 @@ campaign-step        Reconcile one campaign iteration
 campaign-run         Reconcile until complete, paused, or attention required
 ```
 
-Remote backends invoke `brunner-agent`, which reads only staged trial metadata
-and does not import benchmark code.
+Remote backends invoke `python -m brunner.agent_cli` inside the agent
+container. The module reads only staged trial metadata and does not import
+benchmark code; it is intentionally not installed as a public console command.

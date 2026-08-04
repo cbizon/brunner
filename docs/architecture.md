@@ -162,21 +162,23 @@ benchmark-owned.
 
 Candidate processes execute inside the selected backend's isolation boundary
 and without inherited user configuration or external tool connections. Codex
-uses its workspace-write sandbox. Claude bypasses its interactive permission
-system and relies on the outer container or Kubernetes workload isolation,
-matching the proven granular benchmark execution model and avoiding unsupported
-nested user-namespace sandboxes. Runner-owned metadata, backend, evaluation,
+uses its workspace-write sandbox on the initial invocation. Resumed Codex
+sessions inherit that sandbox because `codex exec resume` does not accept the
+`--sandbox` option. Claude bypasses its interactive permission system and
+relies on the outer container or Kubernetes workload isolation, matching the
+proven granular benchmark execution model and avoiding unsupported nested
+user-namespace sandboxes. Runner-owned metadata, backend, evaluation,
 assessment, usage, and status paths are snapshotted around every attempt. Any
 mutation is restored and terminates the trial as a provider error.
 
 Claude candidate runs therefore require an outer isolation boundary. Container
-and Kubernetes backends provide that boundary. The local backend inherits the
-orchestrator user's operating-system permissions and should run Claude only in
-an equivalently isolated or disposable environment.
+and Kubernetes backends provide that boundary. Campaign construction rejects
+backends that do not declare container isolation; Brunner does not support
+running candidate agents as host processes.
 
-Remote jobs run `brunner-agent`, which does not import the benchmark package.
-Evaluator source and trusted references do not need to be present in the
-agent image.
+Remote jobs run `python -m brunner.agent_cli` inside the agent container. That
+internal module does not import the benchmark package. Evaluator source and
+trusted references do not need to be present in the agent image.
 
 Evaluation can run as a trusted host subprocess or in
 `EvaluationDefinition.image`. Container evaluation uses:
@@ -303,17 +305,12 @@ submit -> inspect -> logs -> collect -> cleanup
                    capacity
 ```
 
-`LocalBackend` launches a detached state-writing worker. The worker can only
-record its own PID after its interpreter has started, so the launcher records
-`launcher.json` with its process ID and eventual exit code, and captures the
-worker's output to `backend/local/worker.log`. A worker that dies before it
-takes ownership of the state file is therefore reported as failed instead of
-leaving the trial pending forever. `ContainerBackend`
-bind-mounts the trial into an OCI runtime. `KubernetesBackend` creates a PVC,
-stages the trial through a helper pod, creates a Job, and recovers files
-through reader pods. Helper pods explicitly use `/tmp` as their working
-directory so an image working directory beneath `/brunner/trial` cannot create
-unwritable paths when the trial PVC is mounted.
+Campaign backends must declare `agent_isolation = "container"`.
+`ContainerBackend` bind-mounts the trial into an OCI runtime.
+`KubernetesBackend` creates a PVC, stages the trial through a helper pod,
+creates a Job, and recovers files through reader pods. Helper pods explicitly
+use `/tmp` as their working directory so an image working directory beneath
+`/brunner/trial` cannot create unwritable paths when the trial PVC is mounted.
 
 The backend workload deadline is the agent hard deadline plus
 `backend_shutdown_grace_seconds`; the outer backend therefore does not kill

@@ -117,10 +117,11 @@ class CodexAdapter:
                 settings.model,
             ]
         )
-        if context.read_only:
-            command.extend(("--sandbox", "read-only"))
-        else:
-            command.extend(("--sandbox", "workspace-write"))
+        if not context.resume_session:
+            if context.read_only:
+                command.extend(("--sandbox", "read-only"))
+            else:
+                command.extend(("--sandbox", "workspace-write"))
         if settings.effort is not None:
             command.extend(
                 ("-c", f"model_reasoning_effort={json.dumps(settings.effort)}")
