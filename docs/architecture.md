@@ -287,13 +287,25 @@ leader frees its PID, so a recycled PID could in principle make the group
 check report a stranger's group. That residual race is accepted: losing the
 orphan-reaping guarantee is the worse failure.
 
-A trial stops after `max_attempts` provider invocations. Without that bound a
-provider that fails immediately would retry for the whole trial window and
-bury the original failure.
+A trial stops after `max_attempts` provider process launches. An attempt is
+checkpointed before launch and again immediately after `Popen` succeeds, so an
+orchestrator or pod interruption before the provider starts does not consume
+the cap. Without that bound a provider that fails immediately would retry for
+the whole trial window and bury the original failure.
 
 Rejected subscription boundaries are distinct from ordinary retry backoff.
 When a provider exposes a reset epoch, Brunner waits directly for that
-boundary and records the interval as `subscription_wait`.
+boundary and records the interval as `subscription_wait`. The absolute
+`retry_not_before_epoch` and the following exponential-backoff value are stored
+in `status.json` before waiting. A restarted agent therefore waits only for the
+remaining interval instead of retrying immediately or restarting the full
+delay.
+
+The remote agent CLI converts `SIGTERM` and `SIGINT` into the runner's stop
+event. The active provider process group is terminated, the attempt and
+`interrupted` state are persisted, and a later backend restart resumes from
+that state. A signal received during retry waiting preserves the absolute retry
+boundary.
 
 Foreground tool intervals come from provider lifecycle events. The remainder
 of an active provider attempt is `agent_active`, which includes model/API

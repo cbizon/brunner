@@ -375,6 +375,7 @@ def run_attempt(
         DEFAULT_MAX_ACTIVITY_INTERVAL_SECONDS
     ),
     submission_poll_seconds: float = 2.0,
+    process_started: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     terminal_seen = threading.Event()
     terminal_succeeded = threading.Event()
@@ -552,6 +553,7 @@ def run_attempt(
             combined_error.write(message)
             combined_error.flush()
             return {
+                "provider_started": False,
                 "return_code": 127,
                 "provider_return_code": 127,
                 "terminal_result_seen": False,
@@ -571,6 +573,12 @@ def run_attempt(
                 "model_mismatch": None,
                 "observed_response": None,
             }
+        if process_started is not None:
+            try:
+                process_started()
+            except BaseException:
+                terminate_process(process)
+                raise
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -776,6 +784,7 @@ def run_attempt(
     else:
         return_code = provider_return_code
     return {
+        "provider_started": True,
         "return_code": return_code,
         "provider_return_code": provider_return_code,
         "terminal_result_seen": terminal_seen.is_set(),
@@ -865,6 +874,35 @@ def load_state(
         "finalization_started": False,
         "attempts": [],
     }
+
+
+def clear_retry_state(state: dict[str, Any]) -> None:
+    for key in (
+        "retry_not_before_epoch",
+        "retry_backoff_seconds",
+        "next_retry_seconds",
+        "next_retry_category",
+    ):
+        state.pop(key, None)
+
+
+def launched_attempt_count(attempts: list[dict[str, Any]]) -> int:
+    # Attempts written before provider_started was introduced necessarily
+    # reached the provider invocation path, so count them for compatibility.
+    return sum(
+        attempt.get("provider_started", True) is not False
+        for attempt in attempts
+    )
+
+
+def next_attempt_number(attempts: list[dict[str, Any]]) -> int:
+    return max(
+        (
+            int(attempt.get("number", index))
+            for index, attempt in enumerate(attempts, start=1)
+        ),
+        default=0,
+    ) + 1
 
 
 def _valid_response(
@@ -1046,6 +1084,7 @@ def _run_configured_trial(
         write_terminal_artifacts(trial, state, adapter)
         return state
     (transcript / "final.json").unlink(missing_ok=True)
+    state.pop("completed_at", None)
 
     run_environment = os.environ.copy()
     run_environment.update(environment or {})
@@ -1055,7 +1094,9 @@ def _run_configured_trial(
     run_environment[ACTIVITY_LOG_ENV] = str(external_timing_events)
     Path(run_environment["CODEX_HOME"]).mkdir(parents=True, exist_ok=True)
     stop_requested = stop_requested or threading.Event()
-    retry_seconds = runtime.retry_initial_seconds
+    retry_seconds = float(
+        state.get("retry_backoff_seconds", runtime.retry_initial_seconds)
+    )
     work_deadline = state["deadline_epoch"] - runtime.finalization_seconds
     combined_events = transcript / "events.jsonl"
     combined_stderr = transcript / "stderr.log"
@@ -1070,20 +1111,83 @@ def _run_configured_trial(
             state["finalization_started"] = True
             state["finalization_started_at"] = utc_now()
             state["status"] = "finalizing"
-            state.pop("next_retry_seconds", None)
+            clear_retry_state(state)
             timing_recorder.emit("finalization_started")
             write_json_atomic(state_path, state)
             retry_seconds = runtime.retry_initial_seconds
             continue
 
-        attempt_number = len(state["attempts"]) + 1
-        if attempt_number > runtime.max_attempts:
+        retry_not_before = state.get("retry_not_before_epoch")
+        if isinstance(retry_not_before, (int, float)):
+            now = time.time()
+            wait_until = min(float(retry_not_before), phase_deadline)
+            wait_seconds = max(0.0, wait_until - now)
+            wait_category = str(
+                state.get("next_retry_category") or "runner_retry_wait"
+            )
+            state["status"] = "retrying"
+            state["next_retry_seconds"] = max(
+                0.0,
+                float(retry_not_before) - now,
+            )
+            write_json_atomic(state_path, state)
+            retry_activity_id = (
+                f"retry-{next_attempt_number(state['attempts'])}-"
+                f"{time.time_ns()}"
+            )
+            timing_recorder.emit(
+                "activity",
+                phase="start",
+                category=wait_category,
+                activity_id=retry_activity_id,
+                label=(
+                    "provider subscription boundary"
+                    if wait_category == "subscription_wait"
+                    else "runner retry backoff"
+                ),
+                source="runner",
+                attempt=(
+                    state["attempts"][-1]["number"]
+                    if state["attempts"]
+                    else None
+                ),
+            )
+            stopped = stop_requested.wait(wait_seconds)
+            timing_recorder.emit(
+                "activity",
+                phase="end",
+                category=wait_category,
+                activity_id=retry_activity_id,
+                source="runner",
+                attempt=(
+                    state["attempts"][-1]["number"]
+                    if state["attempts"]
+                    else None
+                ),
+            )
+            if stopped:
+                state["status"] = "interrupted"
+                state["completed_at"] = utc_now()
+                state["next_retry_seconds"] = max(
+                    0.0,
+                    float(retry_not_before) - time.time(),
+                )
+                write_json_atomic(state_path, state)
+                write_terminal_artifacts(trial, state, adapter)
+                return state
+            if time.time() >= float(retry_not_before):
+                clear_retry_state(state)
+                write_json_atomic(state_path, state)
+            continue
+
+        attempt_number = next_attempt_number(state["attempts"])
+        if launched_attempt_count(state["attempts"]) >= runtime.max_attempts:
             # A provider that fails immediately would otherwise retry for the
             # whole trial window and bury the original failure.
             state["status"] = "provider_error"
             state["failure"] = (
                 f"provider did not succeed within {runtime.max_attempts} "
-                "attempts"
+                "attempts that launched"
             )
             state["completed_at"] = utc_now()
             write_json_atomic(state_path, state)
@@ -1113,6 +1217,7 @@ def _run_configured_trial(
         attempt = {
             "number": attempt_number,
             "status": "running",
+            "provider_started": False,
             "mode": (
                 "finalize"
                 if finalizing
@@ -1173,6 +1278,18 @@ def _run_configured_trial(
                 is None
             )
 
+        def mark_provider_started() -> None:
+            started = timing_recorder.emit(
+                "provider_process_started",
+                attempt=attempt_number,
+            )
+            attempt["provider_started"] = True
+            attempt["provider_started_at"] = started["recorded_at"]
+            write_json_atomic(state_path, state)
+            # The tamper detector must expect this runner-authored checkpoint
+            # without accepting any concurrent changes elsewhere.
+            protected_control_plane["status.json"] = state_path.read_bytes()
+
         outcome = run_attempt(
             adapter=adapter,
             command=provider_command.command,
@@ -1197,6 +1314,7 @@ def _run_configured_trial(
                 runtime.max_activity_interval_seconds
             ),
             submission_poll_seconds=runtime.submission_poll_seconds,
+            process_started=mark_provider_started,
         )
         for stale in outcome.get("stale_activity_intervals", ()):
             timing_recorder.emit(
@@ -1412,43 +1530,7 @@ def _run_configured_trial(
         )
         state["next_retry_seconds"] = wait_seconds
         state["next_retry_category"] = wait_category
-        write_json_atomic(state_path, state)
-        retry_activity_id = f"retry-{attempt_number}"
-        timing_recorder.emit(
-            "activity",
-            phase="start",
-            category=wait_category,
-            activity_id=retry_activity_id,
-            label=(
-                "provider subscription boundary"
-                if wait_category == "subscription_wait"
-                else "runner retry backoff"
-            ),
-            source="runner",
-            attempt=attempt_number,
-        )
-        if stop_requested.wait(wait_seconds):
-            timing_recorder.emit(
-                "activity",
-                phase="end",
-                category=wait_category,
-                activity_id=retry_activity_id,
-                source="runner",
-                attempt=attempt_number,
-            )
-            state["status"] = "interrupted"
-            state["completed_at"] = utc_now()
-            write_json_atomic(state_path, state)
-            write_terminal_artifacts(trial, state, adapter)
-            return state
-        timing_recorder.emit(
-            "activity",
-            phase="end",
-            category=wait_category,
-            activity_id=retry_activity_id,
-            source="runner",
-            attempt=attempt_number,
-        )
+        state["retry_not_before_epoch"] = now + requested_wait
         if resume_unavailable or output_repair_required:
             retry_seconds = runtime.retry_initial_seconds
         elif wait_category == "runner_retry_wait":
@@ -1458,6 +1540,9 @@ def _run_configured_trial(
             )
         else:
             retry_seconds = runtime.retry_initial_seconds
+        state["retry_backoff_seconds"] = retry_seconds
+        write_json_atomic(state_path, state)
+        continue
 
     state["status"] = "timeout" if not stop_requested.is_set() else "interrupted"
     if state["status"] == "timeout":

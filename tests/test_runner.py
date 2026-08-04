@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -478,6 +479,7 @@ def test_provider_launch_failure_is_persisted(
     assert state["status"] == "provider_error"
     assert persisted == state
     assert state["attempts"][0]["return_code"] == 127
+    assert state["attempts"][0]["provider_started"] is False
     assert str(missing_executable) in state["attempts"][0]["launch_error"]
     assert "provider launch failed" in state["failure"]
 
@@ -559,6 +561,128 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
     assert state["attempts"][0]["wait_category"] == "subscription_wait"
     assert elapsed < 1
     assert timing["summary"]["subscription_wait_seconds"] > 0
+
+
+def test_subscription_wait_survives_runner_restart(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "durable-subscription",
+            "codex",
+            "fake-model",
+            None,
+        ),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+import time
+
+marker = pathlib.Path(".retried")
+if not marker.exists():
+    marker.write_text("1")
+    print(json.dumps({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": time.time() + 0.6,
+            "overageDisabledReason": "org_level_disabled",
+        },
+    }), flush=True)
+    print(json.dumps({"type": "turn.failed"}), flush=True)
+    raise SystemExit(1)
+
+arguments = sys.argv[1:]
+final = pathlib.Path(arguments[arguments.index("--output-last-message") + 1])
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+    runtime = RuntimeDefaults(
+        timeout_seconds=5,
+        finalization_seconds=1,
+        retry_initial_seconds=2,
+        retry_max_seconds=2,
+        provider_exit_grace_seconds=0.05,
+    )
+    stop_requested = threading.Event()
+    result: dict[str, object] = {}
+
+    def run_until_stopped() -> None:
+        result["state"] = run_trial(
+            benchmark,
+            contract,
+            trial,
+            ProviderSettings(provider="codex", model="fake-model"),
+            executable=str(binary),
+            runtime=runtime,
+            stop_requested=stop_requested,
+        )
+
+    runner = threading.Thread(target=run_until_stopped)
+    runner.start()
+    status_path = trial / "status.json"
+    wait_deadline = time.monotonic() + 3
+    while time.monotonic() < wait_deadline:
+        if status_path.is_file():
+            persisted = json.loads(status_path.read_text())
+            if "retry_not_before_epoch" in persisted:
+                break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("runner did not persist the subscription wait")
+    stop_requested.set()
+    runner.join(timeout=5)
+    assert not runner.is_alive()
+    interrupted = result["state"]
+    assert isinstance(interrupted, dict)
+
+    assert interrupted["status"] == "interrupted"
+    assert len(interrupted["attempts"]) == 1
+    retry_not_before = interrupted["retry_not_before_epoch"]
+    assert retry_not_before > time.time()
+    assert interrupted["next_retry_category"] == "subscription_wait"
+
+    remaining_wait = max(0.0, retry_not_before - time.time())
+    resumed_at = time.monotonic()
+    completed = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="fake-model"),
+        executable=str(binary),
+        runtime=runtime,
+    )
+    resumed_elapsed = time.monotonic() - resumed_at
+
+    assert completed["status"] == "complete"
+    assert len(completed["attempts"]) == 2
+    assert resumed_elapsed >= max(0.0, remaining_wait - 0.08)
+    assert "retry_not_before_epoch" not in completed
+    assert all(attempt["provider_started"] for attempt in completed["attempts"])
 
 
 def test_claude_runner_waits_for_captured_subscription_reset(
@@ -1597,5 +1721,163 @@ def test_trial_stops_after_max_attempts(tmp_path: Path) -> None:
     )
 
     assert state["status"] == "provider_error"
-    assert "3 attempts" in state["failure"]
+    assert "3 attempts that launched" in state["failure"]
     assert len(state["attempts"]) == 3
+    assert all(attempt["provider_started"] for attempt in state["attempts"])
+
+
+def test_interrupted_attempt_that_never_launched_does_not_consume_cap(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("uncharged-attempt", "codex", "model-a", None),
+    )
+    runtime = RuntimeDefaults(
+        timeout_seconds=5,
+        finalization_seconds=1,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.01,
+        max_attempts=1,
+        provider_exit_grace_seconds=0.05,
+    )
+    stopped = threading.Event()
+    stopped.set()
+    interrupted = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="model-a"),
+        runtime=runtime,
+        stop_requested=stopped,
+    )
+    interrupted["status"] = "running"
+    interrupted.pop("completed_at", None)
+    interrupted["attempts"] = [
+        {
+            "number": 1,
+            "status": "running",
+            "provider_started": False,
+        }
+    ]
+    (trial / "status.json").write_text(json.dumps(interrupted))
+
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+final = pathlib.Path(arguments[arguments.index("--output-last-message") + 1])
+submission = pathlib.Path("submission")
+submission.mkdir(exist_ok=True)
+(submission / "result.txt").write_text("HELLO\n")
+(submission / "manifest.json").write_text(
+    '{"schema_version":"1.0","output":"result.txt"}\n'
+)
+response = {
+    "status": "complete",
+    "submission_manifest": "submission/manifest.json",
+    "completed_units": ["uppercase"],
+    "limitations": [],
+}
+(submission / "run-status.json").write_text(json.dumps(response))
+final.write_text(json.dumps(response))
+print(json.dumps({"type": "turn.completed"}), flush=True)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(provider="codex", model="model-a"),
+        runtime=runtime,
+        executable=str(binary),
+    )
+
+    assert state["status"] == "complete"
+    assert [attempt["number"] for attempt in state["attempts"]] == [1, 2]
+    assert state["attempts"][0]["status"] == "interrupted"
+    assert state["attempts"][0]["provider_started"] is False
+    assert state["attempts"][1]["provider_started"] is True
+
+
+def test_agent_cli_handles_sigterm_as_graceful_interruption(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("agent-sigterm", "codex", "model-a", None),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        "import time\ntime.sleep(30)\n",
+    )
+    environment = os.environ.copy()
+    source_root = str(ROOT / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (source_root, environment.get("PYTHONPATH"))
+        if part
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "brunner.agent_cli",
+            str(trial),
+            "--provider-executable",
+            str(binary),
+        ],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    status_path = trial / "status.json"
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            if status_path.is_file():
+                status = json.loads(status_path.read_text())
+                if (
+                    status.get("attempts")
+                    and status["attempts"][-1].get("provider_started")
+                ):
+                    break
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("provider process did not start")
+
+        assert process.poll() is None
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert process.returncode == 0, stderr
+    state = json.loads(status_path.read_text())
+    assert json.loads(stdout)["status"] == "interrupted"
+    assert state["status"] == "interrupted"
+    assert state["attempts"][-1]["provider_started"] is True
+    assert state["attempts"][-1]["forced_termination_reason"] == (
+        "stop_requested"
+    )
