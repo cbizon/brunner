@@ -16,8 +16,10 @@ from brunner import (
     EvaluationDefinition,
 )
 from brunner.assessment import (
+    _codex_provider_schema,
     _preflight_provider_schema,
     _resolved_provider_schema,
+    _trial_evidence_matches,
     run_assessments,
 )
 from brunner.contract import load_output_contract
@@ -464,6 +466,53 @@ def test_provider_schema_inlines_only_referenced_common_definitions() -> None:
     assert resolved["properties"]["criterion"]["$ref"] == (
         "#/$defs/brunnerAssessmentCommon__criterion"
     )
+
+
+def test_codex_provider_schema_flattens_unsupported_composition() -> None:
+    source = json.loads(
+        (
+            ROOT
+            / "src/brunner/qualitative/qualitative-review.schema.json"
+        ).read_text()
+    )
+    provider_schema = _codex_provider_schema(
+        _resolved_provider_schema(source)
+    )
+    encoded = json.dumps(provider_schema)
+    criterion = provider_schema["$defs"]["criterion"]
+
+    assert '"allOf"' not in encoded
+    assert '"if"' not in encoded
+    assert '"then"' not in encoded
+    assert '"not"' not in encoded
+    assert criterion["type"] == "object"
+    assert criterion["additionalProperties"] is False
+    assert set(criterion["required"]) == set(criterion["properties"])
+    assert criterion["properties"]["rating"] == {
+        "$ref": "#/$defs/rating"
+    }
+    _preflight_provider_schema("codex", provider_schema)
+
+
+def test_trial_evidence_glob_selects_source_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    package = trial / "workspace/package"
+    package.mkdir(parents=True)
+    (trial / "workspace/main.py").write_text("print('main')\n")
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (trial / "workspace/trajectory.npz").write_bytes(b"artifact")
+
+    matches = _trial_evidence_matches(
+        trial,
+        "workspace/**/*.py",
+    )
+
+    assert [relative for relative, _ in matches] == [
+        "workspace/main.py",
+        "workspace/package/helper.py",
+    ]
 
 
 def test_codex_schema_preflight_rejects_typeless_definition_container() -> None:

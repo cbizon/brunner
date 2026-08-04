@@ -229,6 +229,36 @@ def _safe_trial_path(
     return path
 
 
+def _trial_evidence_matches(
+    trial: Path,
+    configured_path: str,
+) -> list[tuple[str, Path]]:
+    path_value = Path(configured_path)
+    if (
+        not configured_path
+        or path_value.is_absolute()
+        or ".." in path_value.parts
+    ):
+        raise AssessmentError(
+            f"assessment path must be relative: {configured_path!r}"
+        )
+    if not any(character in configured_path for character in "*?["):
+        return [
+            (
+                path_value.as_posix(),
+                _safe_trial_path(trial, configured_path),
+            )
+        ]
+
+    matches = []
+    for candidate in sorted(trial.glob(configured_path)):
+        relative = candidate.relative_to(trial).as_posix()
+        matches.append(
+            (relative, _safe_trial_path(trial, relative))
+        )
+    return matches
+
+
 def _timing_facts(trial: Path) -> dict[str, Any]:
     accounting_path = trial / "timing/accounting.json"
     if accounting_path.is_file():
@@ -565,6 +595,103 @@ def _resolved_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return selected
 
 
+def _merge_provider_schema(
+    selected: dict[str, Any],
+    addition: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(selected)
+    for key, value in addition.items():
+        current = merged.get(key)
+        if (
+            key in {"$defs", "properties"}
+            and isinstance(current, dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = {**current, **value}
+        elif (
+            key == "required"
+            and isinstance(current, list)
+            and isinstance(value, list)
+        ):
+            merged[key] = list(dict.fromkeys((*current, *value)))
+        else:
+            merged[key] = value
+    return merged
+
+
+def _codex_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    unsupported = {"allOf", "else", "if", "not", "then"}
+
+    def local_reference(reference: str) -> Any:
+        if reference == "#":
+            return schema
+        if not reference.startswith("#/"):
+            return None
+        selected: Any = schema
+        for raw_part in reference.removeprefix("#/").split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if isinstance(selected, dict) and part in selected:
+                selected = selected[part]
+            elif isinstance(selected, list) and part.isdigit():
+                index = int(part)
+                if index >= len(selected):
+                    return None
+                selected = selected[index]
+            else:
+                return None
+        return selected
+
+    def rewrite(
+        value: Any,
+        resolving: frozenset[str] = frozenset(),
+    ) -> Any:
+        if isinstance(value, list):
+            return [rewrite(item, resolving) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        selected = {
+            key: rewrite(item, resolving)
+            for key, item in value.items()
+            if key not in unsupported
+        }
+        branches = value.get("allOf")
+        if not isinstance(branches, list):
+            return selected
+        for branch in branches:
+            expanded = branch
+            if isinstance(branch, dict):
+                reference = branch.get("$ref")
+                if isinstance(reference, str):
+                    target = local_reference(reference)
+                    if target is not None:
+                        if reference in resolving:
+                            raise ProviderSchemaError(
+                                "Codex reviewer schema has a recursive "
+                                f"allOf reference: {reference}"
+                            )
+                        expanded = _merge_provider_schema(
+                            rewrite(
+                                target,
+                                resolving | {reference},
+                            ),
+                            rewrite(
+                                {
+                                    key: item
+                                    for key, item in branch.items()
+                                    if key != "$ref"
+                                },
+                                resolving,
+                            ),
+                        )
+            rewritten = rewrite(expanded, resolving)
+            if isinstance(rewritten, dict):
+                selected = _merge_provider_schema(selected, rewritten)
+        return selected
+
+    return rewrite(schema)
+
+
 def _schema_references(value: Any, path: str = "<root>") -> list[tuple[str, str]]:
     references = []
     if isinstance(value, list):
@@ -714,7 +841,12 @@ def _run_reviewer(
     adapter = get_provider(assessment.reviewer.provider)
     settings = adapter.validate_settings(assessment.reviewer)
     resolved_schema = _resolved_provider_schema(schema)
-    _preflight_provider_schema(settings.provider, resolved_schema)
+    provider_schema = (
+        _codex_provider_schema(resolved_schema)
+        if settings.provider == "codex"
+        else resolved_schema
+    )
+    _preflight_provider_schema(settings.provider, provider_schema)
     with tempfile.TemporaryDirectory(
         prefix=f"brunner-{assessment.assessment_id}-"
     ) as temporary:
@@ -733,7 +865,7 @@ def _run_reviewer(
         )
         write_json_atomic(
             resolved_schema_path,
-            resolved_schema,
+            provider_schema,
         )
         run_environment = {
             key: value
@@ -1038,44 +1170,60 @@ def _prepare_workspace(
     if definition.evaluation.results_path not in trial_evidence_paths:
         trial_evidence_paths.append(definition.evaluation.results_path)
     deterministic_evaluation = _deterministic_evaluation(evaluation)
-    for relative in trial_evidence_paths:
-        source = _safe_trial_path(trial, relative)
-        record: dict[str, Any] = {
-            "source": "trial",
-            "original_path": relative,
-        }
-        if not source.exists():
-            record["available"] = False
-            evidence.append(record)
-            continue
-        destination = evidence_root / "trial" / relative
-        if relative == definition.evaluation.results_path:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            selected_evaluation = deterministic_evaluation
-            if assessment.redact_candidate_identity:
-                selected_evaluation, item_count = _redact_json(
-                    deterministic_evaluation,
-                    candidate_identity=candidate_identity,
-                )
-                redacted_fields += item_count
-            write_json_atomic(destination, selected_evaluation)
-        else:
-            redacted_fields += _copy_path(
-                source,
-                destination,
-                candidate_identity=candidate_identity,
-                redact_identity=assessment.redact_candidate_identity,
+    copied_evidence = set()
+    for configured_path in trial_evidence_paths:
+        matches = _trial_evidence_matches(trial, configured_path)
+        if not matches:
+            evidence.append(
+                {
+                    "source": "trial",
+                    "original_path": configured_path,
+                    "available": False,
+                }
             )
-        record.update(
-            {
-                "available": True,
-                **_path_record(
-                    destination,
-                    destination.relative_to(workspace),
-                ),
+            continue
+        for relative, source in matches:
+            if relative in copied_evidence:
+                continue
+            copied_evidence.add(relative)
+            record: dict[str, Any] = {
+                "source": "trial",
+                "original_path": relative,
             }
-        )
-        evidence.append(record)
+            if configured_path != relative:
+                record["configured_path"] = configured_path
+            if not source.exists():
+                record["available"] = False
+                evidence.append(record)
+                continue
+            destination = evidence_root / "trial" / relative
+            if relative == definition.evaluation.results_path:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                selected_evaluation = deterministic_evaluation
+                if assessment.redact_candidate_identity:
+                    selected_evaluation, item_count = _redact_json(
+                        deterministic_evaluation,
+                        candidate_identity=candidate_identity,
+                    )
+                    redacted_fields += item_count
+                write_json_atomic(destination, selected_evaluation)
+            else:
+                redacted_fields += _copy_path(
+                    source,
+                    destination,
+                    candidate_identity=candidate_identity,
+                    redact_identity=assessment.redact_candidate_identity,
+                )
+            record.update(
+                {
+                    "available": True,
+                    **_path_record(
+                        destination,
+                        destination.relative_to(workspace),
+                    ),
+                }
+            )
+            evidence.append(record)
     for relative in assessment.trusted_evidence_paths:
         source = assessment.material_path(
             relative,

@@ -142,6 +142,10 @@ assert Path("contract/reviewer-prompt.md").is_file()
 assert Path("contract/qualitative-review.schema.json").is_file()
 assert Path("review-input.json").is_file()
 assert Path("resolved-output.schema.json").is_file()
+resolved_schema = json.loads(
+    Path("resolved-output.schema.json").read_text()
+)
+assert '"allOf"' not in json.dumps(resolved_schema)
 arguments = sys.argv[1:]
 final = Path(arguments[arguments.index("--output-last-message") + 1])
 result = json.loads({encoded!r})
