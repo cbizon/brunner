@@ -363,7 +363,8 @@ Campaign reconciliation:
 - Continues healthy running or pending trials when another needs attention
 - Flags a trial the backend still reports as pending or running past
   `trial_timeout_seconds`, which defaults to the backend workload deadline
-  plus `trial_timeout_margin_seconds`
+  plus `trial_timeout_margin_seconds`, while continuing to inspect it until it
+  reaches a terminal state
 - Stops waiting on an unreachable backend after `max_pause_seconds` instead of
   polling a disconnected backend indefinitely
 - Bounds evaluation with `evaluation_timeout_seconds`, shared as one budget

@@ -220,6 +220,19 @@ class MixedStateBackend(ImmediateBackend):
         return BackendSnapshot(phase="running")
 
 
+class EventuallyCompleteBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inspections: dict[str, int] = {}
+
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        count = self.inspections.get(handle.workload_id, 0) + 1
+        self.inspections[handle.workload_id] = count
+        if handle.workload_id == "stuck-a" and count == 1:
+            return BackendSnapshot(phase="running")
+        return BackendSnapshot(phase="succeeded", exit_code=0)
+
+
 class HostProcessBackend(ImmediateBackend):
     agent_isolation = "host"
 
@@ -1113,10 +1126,17 @@ def test_campaign_flags_trial_that_never_leaves_running(
 
     time.sleep(0.1)
     state = runner.advance()
+    repeated = runner.advance()
 
-    assert state["trials"][0]["phase"] == "attention_required"
+    assert state["trials"][0]["phase"] == "running"
     assert "still reports running" in state["trials"][0]["error"]
-    assert state["status"] == "attention_required"
+    assert state["trials"][0]["attention"]["active"] is True
+    assert state["status"] == "running"
+    assert state["has_attention"] is True
+    assert repeated["trials"][0]["phase"] == "running"
+    assert sum(
+        event["type"] == "trial_overdue" for event in repeated["events"]
+    ) == 1
 
 
 def test_campaign_running_trial_within_timeout_is_not_flagged(
@@ -1207,12 +1227,12 @@ def test_campaign_pause_clock_resets_after_connectivity_returns(
     assert "paused_since" not in state
 
 
-def test_overdue_trial_keeps_holding_its_backend_slot(
+def test_overdue_trial_keeps_reconciling_and_holds_its_backend_slot(
     tmp_path: Path,
 ) -> None:
     definition = build_definition()
     contract = load_output_contract(definition.contract_path)
-    backend = StuckBackend()
+    backend = EventuallyCompleteBackend()
     runner = CampaignRunner(
         definition,
         contract,
@@ -1232,11 +1252,31 @@ def test_overdue_trial_keeps_holding_its_backend_slot(
 
     runner.advance()
     time.sleep(0.1)
-    state = runner.advance()
-    by_id = {entry["test_id"]: entry for entry in state["trials"]}
+    overdue = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in overdue["trials"]}
 
     # The overdue workload is still running on the backend, so the second
     # trial must not be submitted on top of it.
-    assert by_id["stuck-a"]["phase"] == "attention_required"
+    assert by_id["stuck-a"]["phase"] == "running"
+    assert by_id["stuck-a"]["attention"]["kind"] == "trial_overdue"
+    assert by_id["stuck-a"]["attention"]["active"] is True
     assert by_id["next-run"]["phase"] == "pending"
     assert len(backend.handles) == 1
+    assert overdue["status"] == "running"
+    assert overdue["has_attention"] is True
+
+    resumed = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in resumed["trials"]}
+
+    assert by_id["stuck-a"]["phase"] == "complete"
+    assert by_id["stuck-a"]["attention"]["active"] is False
+    assert by_id["stuck-a"]["attention"]["resolved_at"]
+    assert by_id["next-run"]["phase"] == "submitted"
+    assert len(backend.handles) == 2
+    assert sum(
+        event["type"] == "trial_overdue" for event in resumed["events"]
+    ) == 1
+    assert any(
+        event["type"] == "trial_overdue_resolved"
+        for event in resumed["events"]
+    )

@@ -932,20 +932,55 @@ class CampaignRunner:
                 entry["phase"] = snapshot.phase
                 overdue = self._overdue_seconds(entry)
                 if overdue is not None:
-                    entry["phase"] = "attention_required"
-                    entry["error"] = (
+                    message = (
                         f"backend still reports {snapshot.phase} "
                         f"{overdue:.0f}s after submission, past the "
                         f"{self._trial_timeout_seconds():.0f}s limit"
                     )
-                    self._event(
-                        state,
-                        "trial_overdue",
-                        entry["error"],
-                        test_id=entry["test_id"],
+                    attention = entry.get("attention")
+                    first_report = not (
+                        isinstance(attention, dict)
+                        and attention.get("kind") == "trial_overdue"
+                        and attention.get("active") is True
                     )
+                    since = (
+                        attention.get("since")
+                        if isinstance(attention, dict)
+                        else None
+                    )
+                    entry["attention"] = {
+                        "kind": "trial_overdue",
+                        "active": True,
+                        "since": since or _now(),
+                        "message": message,
+                        "backend_phase": snapshot.phase,
+                        "overdue_seconds": overdue,
+                    }
+                    entry["error"] = message
+                    if first_report:
+                        self._event(
+                            state,
+                            "trial_overdue",
+                            message,
+                            test_id=entry["test_id"],
+                        )
                 continue
             if snapshot.phase in {"succeeded", "failed"}:
+                attention = entry.get("attention")
+                if (
+                    isinstance(attention, dict)
+                    and attention.get("kind") == "trial_overdue"
+                    and attention.get("active") is True
+                ):
+                    attention["active"] = False
+                    attention["resolved_at"] = _now()
+                    entry.pop("error", None)
+                    self._event(
+                        state,
+                        "trial_overdue_resolved",
+                        f"backend now reports {snapshot.phase}",
+                        test_id=entry["test_id"],
+                    )
                 log_path = Path(entry["trial"]) / "backend/workload.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -1029,6 +1064,11 @@ class CampaignRunner:
                 available -= 1
 
         phases = {entry["phase"] for entry in state["trials"]}
+        active_attention = any(
+            isinstance(entry.get("attention"), dict)
+            and entry["attention"].get("active") is True
+            for entry in state["trials"]
+        )
         if phases == {"complete"}:
             state["status"] = "complete"
             state["completed_at"] = _now()
@@ -1049,6 +1089,7 @@ class CampaignRunner:
             state["has_attention"] = bool(
                 phases & {"attention_required", "collection_failed"}
                 or state.get("scheduler_error")
+                or active_attention
             )
         elif phases & {"attention_required", "collection_failed"}:
             state["status"] = "attention_required"
