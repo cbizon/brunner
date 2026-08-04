@@ -1352,6 +1352,40 @@ def test_campaign_gives_up_after_prolonged_connectivity_loss(
     assert "unreachable" in state["pause_reason"]
 
 
+def test_campaign_waits_indefinitely_for_connectivity_by_default(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="offline-default",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("offline-a", "codex", "model-a"),),
+        ),
+        OfflineBackend(),
+        workload_factory=_workload,
+    )
+
+    first = runner.advance()
+    state_path = tmp_path / "campaign/campaign.json"
+    persisted = json.loads(state_path.read_text())
+    persisted["paused_since"] = "2026-08-01T00:00:00+00:00"
+    state_path.write_text(json.dumps(persisted))
+    later = runner.advance()
+
+    assert first["status"] == "paused_backend_connectivity"
+    assert later["status"] == "paused_backend_connectivity"
+    assert later["has_attention"] is True
+    assert later["paused_since"] == "2026-08-01T00:00:00+00:00"
+    assert sum(
+        event["type"] == "backend_connectivity"
+        for event in later["events"]
+    ) == 1
+
+
 def test_campaign_pause_clock_resets_after_connectivity_returns(
     tmp_path: Path,
     monkeypatch: Any,

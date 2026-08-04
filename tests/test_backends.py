@@ -472,6 +472,64 @@ def test_kubernetes_dns_failure_is_connectivity_error() -> None:
     assert isinstance(error, BackendConnectivityError)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unexpected EOF",
+        "HTTP/2: client connection lost",
+        "Error from server (InternalError): internal server error",
+        "502 Bad Gateway",
+        "429 Too Many Requests",
+    ],
+)
+def test_kubernetes_transient_api_failures_are_connectivity_errors(
+    message: str,
+) -> None:
+    backend = KubernetesBackend(KubernetesProfile())
+
+    error = backend._error(
+        ("get", "jobs"),
+        1,
+        b"",
+        message.encode(),
+    )
+
+    assert isinstance(error, BackendConnectivityError)
+
+
+def test_kubernetes_ambiguous_failure_probes_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(KubernetesProfile())
+    monkeypatch.setattr(
+        backend,
+        "_probe_backend_reachable",
+        lambda: False,
+    )
+
+    disconnected = backend._error(
+        ("get", "jobs"),
+        1,
+        b"",
+        b"transport closed without a status",
+    )
+
+    monkeypatch.setattr(
+        backend,
+        "_probe_backend_reachable",
+        lambda: True,
+    )
+    rejected = backend._error(
+        ("apply", "-f", "-"),
+        1,
+        b"",
+        b"admission webhook rejected this object",
+    )
+
+    assert isinstance(disconnected, BackendConnectivityError)
+    assert isinstance(rejected, BackendRequestError)
+
+
 def test_kubernetes_warning_events_tolerate_null_optional_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

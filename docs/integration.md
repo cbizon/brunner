@@ -652,7 +652,7 @@ Campaigns bound the states a stuck backend can hide in:
 | `trial_timeout_seconds` | Flags a trial the backend still reports pending or running | Backend workload deadline plus `trial_timeout_margin_seconds` |
 | `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
 | `infrastructure_max_restarts` | Relaunches an interrupted backend workload against its existing persistent trial | 2 |
-| `max_pause_seconds` | Stops waiting on an unreachable backend | 1 hour |
+| `max_pause_seconds` | Optional limit before backend disconnection requires manual attention | Unlimited |
 | `evaluation_timeout_seconds` | One budget shared by reference validation, the evaluator, and all assessments | Benchmark evaluation timeout |
 
 Reconciliation is sequential, so an evaluator that hangs blocks every other
