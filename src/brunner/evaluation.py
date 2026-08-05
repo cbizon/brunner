@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator
 from brunner.contract import OutputContract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import ContractError, EvaluationError, IntegrityError
+from brunner.failure import failure_from_exception, failure_record
 from brunner.io import write_json_atomic
 from brunner.reference import validate_reference_manifest
 from brunner.submission import ValidatedSubmission, validate_submission
@@ -181,6 +182,7 @@ def _failure_result(
     provider_status: str | None,
     return_code: int | None,
     traceback_path: str,
+    failure: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": "1.0",
@@ -193,6 +195,7 @@ def _failure_result(
             "message": str(error),
             "traceback": traceback_path,
         },
+        "failure": failure,
         "benchmark_id": definition.benchmark_id,
         "benchmark_version": definition.version,
         "contract_sha256": contract.sha256,
@@ -240,12 +243,24 @@ def evaluate_trial(
 
     validated: ValidatedSubmission | None = None
     return_code = None
+    failure_context = {
+        "operation": "trial_metadata_validation",
+        "domain": "integrity",
+        "reason": "TrialMetadataInvalid",
+        "disposition": "attention",
+    }
     try:
         metadata = json.loads((trial / "metadata/manifest.json").read_text())
         if metadata.get("contract_sha256") != contract.sha256:
             raise ContractError(
                 "trial contract digest differs from evaluator contract"
             )
+        failure_context = {
+            "operation": "submission_validation",
+            "domain": "candidate",
+            "reason": "CandidateSubmissionInvalid",
+            "disposition": "candidate_failed",
+        }
         validated = validate_submission(trial / "workspace", contract)
         environment = os.environ.copy()
         environment.update(
@@ -262,6 +277,12 @@ def evaluate_trial(
             }
         )
         if definition.reference is not None:
+            failure_context = {
+                "operation": "reference_validation",
+                "domain": "integrity",
+                "reason": "ReferenceValidationFailed",
+                "disposition": "attention",
+            }
             reference_manifest_path = (
                 definition.reference.root
                 / definition.reference.manifest_path
@@ -288,6 +309,12 @@ def evaluate_trial(
                 reference_manifest_path.resolve()
             )
             if definition.reference.validate_command:
+                failure_context = {
+                    "operation": "reference_validation_command",
+                    "domain": "evaluation",
+                    "reason": "ReferenceValidatorFailed",
+                    "disposition": "attention",
+                }
                 reference_return_code = _run_evaluator(
                     definition.reference.validate_command,
                     cwd=definition.reference.root,
@@ -305,6 +332,12 @@ def evaluate_trial(
                         "reference validation command exited "
                         f"{reference_return_code}"
                     )
+        failure_context = {
+            "operation": "evaluator_execution",
+            "domain": "evaluation",
+            "reason": "EvaluatorFailed",
+            "disposition": "attention",
+        }
         command, cwd, process_environment = evaluator_invocation(
             definition,
             contract,
@@ -347,6 +380,19 @@ def evaluate_trial(
         for report in reports:
             _safe_report_path(trial, str(report["path"]))
         result["reports"] = reports
+        if result["status"] == "failed" and "failure" not in result:
+            result["failure"] = failure_record(
+                operation="benchmark_evaluation",
+                domain="candidate",
+                reason="BenchmarkEvaluationFailed",
+                message=str(
+                    result.get("error")
+                    or result.get("summary")
+                    or "trusted evaluation reported failure"
+                ),
+                disposition="candidate_failed",
+                retryable=False,
+            )
         result.update(
             {
                 "benchmark_id": definition.benchmark_id,
@@ -371,16 +417,21 @@ def evaluate_trial(
         )
         error_path.unlink(missing_ok=True)
         write_json_atomic(results_path, result)
-    except (
-        ContractError,
-        EvaluationError,
-        IntegrityError,
-        FileNotFoundError,
-        json.JSONDecodeError,
-        OSError,
-        TimeoutError,
-    ) as error:
+    except Exception as error:
         error_path.write_text(traceback.format_exc())
+        failure = failure_from_exception(
+            error,
+            operation=str(failure_context["operation"]),
+            domain=str(failure_context["domain"]),
+            reason=str(failure_context["reason"]),
+            disposition=str(failure_context["disposition"]),
+            retryable=False,
+            resource=(
+                "evaluation_runtime"
+                if failure_context["domain"] == "evaluation"
+                else None
+            ),
+        )
         result = _failure_result(
             definition,
             contract,
@@ -388,6 +439,7 @@ def evaluate_trial(
             provider_status=provider_status,
             return_code=return_code,
             traceback_path=str(error_path.relative_to(trial)),
+            failure=failure,
         )
         write_json_atomic(results_path, result)
     from brunner.assessment import run_assessments
@@ -404,8 +456,38 @@ def evaluate_trial(
         "required_assessments_complete"
     ]
     result["assessments"] = assessment_index["assessments"]
+    if "failure" in assessment_index:
+        result["assessment_failure"] = assessment_index["failure"]
     write_json_atomic(results_path, result)
     from brunner.report import write_run_report
 
-    write_run_report(trial, results_path.with_name("run-report.html"))
+    try:
+        report_path = write_run_report(
+            trial,
+            results_path.with_name("run-report.html"),
+        )
+    except Exception as error:
+        result["report"] = {
+            "status": "failed",
+            "failure": failure_from_exception(
+                error,
+                operation="run_report",
+                domain="reporting",
+                reason="RunReportFailed",
+                disposition="attention",
+                retryable=False,
+                resource="orchestrator_filesystem",
+            ),
+        }
+    else:
+        result["report"] = {
+            "status": "complete",
+            "path": str(report_path.relative_to(trial)),
+        }
+    try:
+        write_json_atomic(results_path, result)
+    except OSError:
+        # The authoritative evaluation and assessment result was persisted
+        # before presentation. Reporting metadata must not block cleanup.
+        pass
     return result

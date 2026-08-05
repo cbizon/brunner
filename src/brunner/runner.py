@@ -390,7 +390,18 @@ def run_attempt(
     active_provider_activities: set[str] = set()
     provider_event_index = 0
     prompt_delivery_errors: list[str] = []
+    timing_recording_errors: list[str] = []
     prompt_delivery_done = threading.Event()
+
+    def emit_timing(event: str, **details: Any) -> None:
+        if timing_recorder is None or timing_recording_errors:
+            return
+        try:
+            timing_recorder.emit(event, **details)
+        except (OSError, ValueError) as error:
+            timing_recording_errors.append(
+                f"{type(error).__name__}: {error}"
+            )
 
     def inspect_line(line: str) -> None:
         nonlocal model_mismatch, observed_response, provider_event_index
@@ -402,18 +413,17 @@ def run_attempt(
         if not isinstance(record, dict):
             return
         provider_event_index += 1
-        if timing_recorder is not None:
-            item = record.get("item")
-            timing_recorder.emit(
-                "provider_event_received",
-                epoch_seconds=recorded_epoch,
-                attempt=attempt_number,
-                provider_event_index=provider_event_index,
-                provider_event_type=record.get("type"),
-                provider_item_type=(
-                    item.get("type") if isinstance(item, dict) else None
-                ),
-            )
+        item = record.get("item")
+        emit_timing(
+            "provider_event_received",
+            epoch_seconds=recorded_epoch,
+            attempt=attempt_number,
+            provider_event_index=provider_event_index,
+            provider_event_type=record.get("type"),
+            provider_item_type=(
+                item.get("type") if isinstance(item, dict) else None
+            ),
+        )
         for model_observation in adapter.model_observations(record):
             key = (
                 model_observation.model,
@@ -443,17 +453,16 @@ def run_attempt(
                         "source": model_observation.source,
                         "provider_event_index": provider_event_index,
                     }
-            if timing_recorder is not None:
-                timing_recorder.emit(
-                    "provider_model_observed",
-                    epoch_seconds=recorded_epoch,
-                    attempt=attempt_number,
-                    provider_event_index=provider_event_index,
-                    requested_model=requested_model,
-                    observed_model=model_observation.model,
-                    source=model_observation.source,
-                    matches=matches,
-                )
+            emit_timing(
+                "provider_model_observed",
+                epoch_seconds=recorded_epoch,
+                attempt=attempt_number,
+                provider_event_index=provider_event_index,
+                requested_model=requested_model,
+                observed_model=model_observation.model,
+                source=model_observation.source,
+                matches=matches,
+            )
         for activity in adapter.activity_observations(record):
             with activity_lock:
                 if activity.phase == "start":
@@ -471,17 +480,16 @@ def run_attempt(
                         activity.activity_id,
                         None,
                     )
-            if timing_recorder is not None:
-                timing_recorder.emit(
-                    "activity",
-                    epoch_seconds=recorded_epoch,
-                    phase=activity.phase,
-                    category=activity.category,
-                    activity_id=activity.activity_id,
-                    label=activity.label,
-                    source="provider",
-                    attempt=attempt_number,
-                )
+            emit_timing(
+                "activity",
+                epoch_seconds=recorded_epoch,
+                phase=activity.phase,
+                category=activity.category,
+                activity_id=activity.activity_id,
+                label=activity.label,
+                source="provider",
+                attempt=attempt_number,
+            )
         observation = adapter.observe_record(record)
         with observation_lock:
             if observation.final_response is not None:
@@ -567,6 +575,7 @@ def run_attempt(
                 "prompt_delivery_error": None,
                 "stream_pump_incomplete": False,
                 "dropped_output_lines": 0,
+                "timing_recording_error": None,
                 "stale_activity_intervals": [],
                 "requested_model": requested_model,
                 "observed_models": [],
@@ -797,6 +806,11 @@ def run_attempt(
         "launch_error": None,
         "stream_pump_incomplete": stream_pump_incomplete,
         "dropped_output_lines": dropped_output_lines,
+        "timing_recording_error": (
+            timing_recording_errors[0]
+            if timing_recording_errors
+            else None
+        ),
         "stale_activity_intervals": (
             activity_tracker.stale_intervals()
             if activity_tracker is not None

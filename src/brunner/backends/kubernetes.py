@@ -727,6 +727,7 @@ class KubernetesBackend:
                 helper_labels,
             )
         )
+        primary_error: Exception | None = None
         try:
             self._wait_for_pod(
                 pod_name,
@@ -740,8 +741,18 @@ class KubernetesBackend:
                     "/brunner/trial"
                 ),
             )
-        finally:
+        except Exception as error:
+            primary_error = error
+        try:
             self._delete_and_wait("pod", pod_name)
+        except Exception as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"trial stager cleanup also failed: {cleanup_error}"
+            )
+        if primary_error is not None:
+            raise primary_error
 
     @staticmethod
     def _state_path(trial: Path) -> Path:
@@ -1067,10 +1078,16 @@ class KubernetesBackend:
         job = self._get("job", handle.native_id, check=False)
         if job is None:
             return BackendSnapshot(
-                phase="pending" if pvc is not None else "unknown",
+                phase="unknown",
                 reason="JobMissing",
                 message="workload job has not been created or was deleted",
                 warnings=tuple(warnings),
+                details={
+                    "claim_phase": (
+                        pvc.get("status", {}).get("phase") if pvc else None
+                    ),
+                    "retryable_infrastructure": False,
+                },
             )
         pod = self._pod_for_handle(handle)
         terminated = self._terminated_container(pod)
@@ -1318,7 +1335,14 @@ class KubernetesBackend:
                     else None
                 ),
             )
-            self._delete_and_wait("pod", name)
+            try:
+                self._delete_and_wait("pod", name)
+            except BackendConnectivityError:
+                raise
+            except BackendError as cleanup_error:
+                error.add_note(
+                    f"artifact reader cleanup also failed: {cleanup_error}"
+                )
             detail = str(error)
             if event_warnings:
                 detail += "; Kubernetes warning: " + event_warnings[-1]
@@ -1360,11 +1384,31 @@ class KubernetesBackend:
             "/brunner/trial",
             encoded,
         )
-        value = json.loads(result.stdout)
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise IntegrityError(
+                "remote artifact inventory is not valid JSON"
+            ) from error
         if not isinstance(value, dict):
             raise IntegrityError(
                 "remote artifact inventory is not an object"
             )
+        for name, metadata in value.items():
+            relative = Path(name)
+            if (
+                not isinstance(name, str)
+                or not name
+                or relative.is_absolute()
+                or ".." in relative.parts
+            ):
+                raise IntegrityError(
+                    f"remote artifact inventory has unsafe path: {name!r}"
+                )
+            if not isinstance(metadata, dict):
+                raise IntegrityError(
+                    f"remote artifact metadata is not an object: {name}"
+                )
         return value
 
     def _read_remote(
@@ -1474,6 +1518,8 @@ class KubernetesBackend:
         for attempt in range(1, attempts + 1):
             pod = None
             node = None
+            result = None
+            primary_error: Exception | None = None
             try:
                 pod, node = self._reader(
                     handle,
@@ -1491,37 +1537,60 @@ class KubernetesBackend:
                     state = json.loads(state_path.read_text())
                     state["artifacts_collected_at"] = _now()
                     write_json_atomic(state_path, state)
-                return result
-            except BackendConnectivityError:
-                raise
-            except ReaderMountError as error:
-                failures.append(f"attempt {attempt}: {error}")
-                if error.node and error.node not in excluded_nodes:
-                    excluded_nodes.append(error.node)
-            except (
-                ArtifactTransferError,
-                BackendRequestError,
-                IntegrityError,
-            ) as error:
-                failures.append(f"attempt {attempt}: {error}")
-                if node and node not in excluded_nodes:
-                    excluded_nodes.append(node)
-            finally:
-                if pod is not None:
+            except Exception as error:
+                primary_error = error
+            if pod is not None:
+                try:
                     self._delete_and_wait("pod", pod)
+                except Exception as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "artifact reader cleanup also failed: "
+                        f"{cleanup_error}"
+                    )
+            if primary_error is None:
+                if result is None:
+                    raise ArtifactTransferError(
+                        "artifact reader returned no collection result"
+                    )
+                return result
+            if isinstance(primary_error, BackendConnectivityError):
+                raise primary_error
+            if isinstance(primary_error, IntegrityError):
+                raise primary_error
+            if not isinstance(
+                primary_error,
+                (ArtifactTransferError, BackendRequestError),
+            ):
+                raise primary_error
+            failures.append(f"attempt {attempt}: {primary_error}")
+            if (
+                isinstance(primary_error, ReaderMountError)
+                and primary_error.node
+                and primary_error.node not in excluded_nodes
+            ):
+                excluded_nodes.append(primary_error.node)
+            elif node and node not in excluded_nodes:
+                excluded_nodes.append(node)
         raise ArtifactTransferError(
             "artifact reader failed after retries; partial files and PVC "
             "were preserved: " + "; ".join(failures)
         )
 
     def cleanup(self, handle: BackendHandle) -> None:
-        snapshot = self.inspect(handle)
         state_path = self._state_path(handle.trial)
         state = (
             json.loads(state_path.read_text())
             if state_path.is_file()
             else {}
         )
+        retain_storage = False
+        if (
+            self.profile.retain_failed_storage
+            and not state.get("artifacts_collected_at")
+        ):
+            retain_storage = self.inspect(handle).phase == "failed"
         workload_name = native_resource_name(
             handle.workload_id,
             handle.trial,
@@ -1538,11 +1607,7 @@ class KubernetesBackend:
         self._delete_helper_pods(helper_workloads, "trial-stager")
         self._delete_helper_pods(helper_workloads, "artifact-reader")
         self._delete_and_wait("job", handle.native_id)
-        if (
-            snapshot.phase == "failed"
-            and self.profile.retain_failed_storage
-            and not state.get("artifacts_collected_at")
-        ):
+        if retain_storage:
             state["storage_retained"] = True
             state["storage_retained_at"] = _now()
             if state_path.parent.is_dir():

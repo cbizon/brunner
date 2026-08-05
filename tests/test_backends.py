@@ -18,7 +18,11 @@ from brunner.backends.kubernetes import (
     render_pvc,
 )
 from brunner.definition import ArtifactPolicy
-from brunner.errors import BackendConnectivityError, BackendRequestError
+from brunner.errors import (
+    BackendConnectivityError,
+    BackendRequestError,
+    IntegrityError,
+)
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -911,7 +915,6 @@ def test_kubernetes_eviction_event_overrides_successful_container(
             ],
         },
     }
-
     def get_resource(
         kind: str,
         name: str | None = None,
@@ -968,6 +971,37 @@ def test_kubernetes_eviction_event_overrides_successful_container(
         "Evicted: Pod ephemeral local storage usage exceeds "
         "the total limit of containers 256Mi.",
     )
+
+
+def test_kubernetes_missing_job_is_unknown_even_when_pvc_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, name=None, **kwargs: (
+            {"status": {"phase": "Bound"}} if kind == "pvc" else None
+        ),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "unknown"
+    assert snapshot.reason == "JobMissing"
+    assert snapshot.details["claim_phase"] == "Bound"
 
 
 def test_kubernetes_restart_reuses_pvc_without_restaging(
@@ -1476,6 +1510,88 @@ def test_kubernetes_collect_surfaces_reader_cleanup_disconnect(
             handle,
             tmp_path / "collected",
             policy=ArtifactPolicy(),
+        )
+
+
+def test_kubernetes_collection_does_not_retry_integrity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+            reader_attempts=3,
+        )
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="case-1",
+        native_id="case-1-job",
+        trial=trial,
+        metadata={"claim_name": "case-1-data"},
+    )
+    reader_calls = 0
+
+    def reader(*args: object, **kwargs: object) -> tuple[str, str]:
+        nonlocal reader_calls
+        reader_calls += 1
+        return f"reader-{reader_calls}", "node-a"
+
+    monkeypatch.setattr(
+        backend,
+        "_delete_helper_pods",
+        lambda names, role: None,
+    )
+    monkeypatch.setattr(backend, "_reader", reader)
+    monkeypatch.setattr(
+        backend,
+        "_collect_from_reader",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            IntegrityError("artifact checksum mismatch")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_delete_and_wait",
+        lambda kind, name: None,
+    )
+
+    with pytest.raises(IntegrityError, match="checksum mismatch"):
+        backend.collect(
+            handle,
+            tmp_path / "collected",
+            policy=ArtifactPolicy(),
+        )
+
+    assert reader_calls == 1
+
+
+def test_kubernetes_remote_inventory_rejects_malformed_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    monkeypatch.setattr(
+        backend,
+        "_run_bytes",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            b"not-json",
+            b"",
+        ),
+    )
+
+    with pytest.raises(IntegrityError, match="not valid JSON"):
+        backend._remote_inventory(
+            "reader",
+            ArtifactPolicy(),
+            frozenset(),
         )
 
 

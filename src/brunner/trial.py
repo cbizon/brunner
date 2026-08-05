@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,30 +47,44 @@ def create_trial(
     identity: TrialIdentity,
 ) -> Path:
     definition.validate()
-    trial = tests_root.resolve() / identity.test_id
-    trial.mkdir(parents=True, exist_ok=False)
+    tests_root = tests_root.resolve()
+    tests_root.mkdir(parents=True, exist_ok=True)
+    trial = tests_root / identity.test_id
+    if trial.exists():
+        raise FileExistsError(f"trial already exists: {trial}")
+    temporary = Path(
+        tempfile.mkdtemp(
+            dir=tests_root,
+            prefix=f".{identity.test_id}.creating-",
+        )
+    )
     try:
         for name in TRIAL_DIRECTORIES:
-            (trial / name).mkdir()
+            (temporary / name).mkdir()
         staged = stage_challenge(
             definition,
             contract,
-            trial / "workspace",
+            temporary / "workspace",
         )
         write_trial_metadata(
             definition,
             contract,
             identity,
-            trial,
+            temporary,
             staged,
         )
-    except Exception as error:
+        marker = temporary / "workspace/.brunner-challenge.json"
+        marker_value = json.loads(marker.read_text())
+        marker_value["workspace"] = str(trial / "workspace")
+        write_json_atomic(marker, marker_value)
+        temporary.replace(trial)
+    except BaseException as error:
         try:
-            shutil.rmtree(trial)
+            shutil.rmtree(temporary)
         except OSError as cleanup_error:
             error.add_note(
                 "failed to remove incomplete trial "
-                f"{trial}: {cleanup_error}"
+                f"{temporary}: {cleanup_error}"
             )
         raise
     return trial

@@ -391,6 +391,12 @@ with `infrastructure_max_restarts`.
 
 ## Campaign State
 
+The normative failure taxonomy, operation matrix, resource-ownership rules, and
+fault-injection requirements are defined in
+[`failure-model.md`](failure-model.md). Every external operation must translate
+failure into a durable record before returning control to campaign
+reconciliation.
+
 Campaign trial IDs are supplied explicitly by the benchmark. They are not
 derived from provider, model, effort, or a run count. `campaign.json` records
 the contract identity, append-only trial list, handles, snapshots, collection
@@ -402,6 +408,9 @@ separates:
 - `benchmark`: whether trusted evaluation ran and whether it succeeded
 - `outcome`: overall campaign result
 - `failure_class`: `infrastructure` or `benchmark` when the outcome failed
+- `failure`: canonical operation, domain, reason, disposition, retryability,
+  cleanup obligation, and diagnostics
+- `failures`: bounded append-only history of prior failure records
 
 Every initialize, step, and continuous run holds an exclusive operating-system
 lock on `campaign.lock`. A second orchestrator fails immediately with the
@@ -409,6 +418,10 @@ recorded PID and hostname instead of racing state writes or submissions. The
 kernel releases the lock automatically when its process exits or crashes; the
 lock file's owner record is diagnostic and is not itself treated as proof that
 an orchestrator is alive.
+
+Each campaign-state transition atomically replaces both `campaign.json` and
+`campaign.json.bak`. If the primary JSON is unreadable, initialization loads
+the last valid backup and records an explicit state-recovery failure and event.
 
 Campaign reconciliation:
 
@@ -432,7 +445,8 @@ Campaign reconciliation:
   including Pod and Job events captured before that generation is deleted
 - Retries interrupted artifact transfers with a bounded, configurable policy
 - Uses the same persisted cleanup transition for initial and resumed cleanup,
-  including identical completion and failure events
+  including identical completion and retry events; non-connectivity cleanup
+  failures remain `cleanup_pending` instead of becoming a dead manual state
 - Keeps integrity and evaluation failures durable instead of retrying them
 - Continues healthy running or pending trials when another needs attention
 - Flags a trial the backend still reports as pending or running past
@@ -458,6 +472,13 @@ Campaign reconciliation:
   deterministic evaluation
 - Regenerates `index.html` after each transition with live elapsed time,
   backend warnings, usage, timing, and report links
+- Treats dashboard and run-report generation as non-authoritative
+  presentation; reporting failure is recorded but cannot block cleanup
+- Converts unknown persisted phases and unexpected backend exceptions into
+  explicit attention states rather than silently leaving the campaign running
+- Records backend capacity exhaustion as a visible scheduler wait
+- Recovers an unreadable primary campaign state from the last atomic backup and
+  records that recovery in campaign state
 
 Campaign trials contain no environment passthrough. OCI credential variables
 are configured on `ContainerBackend` and inherited by name without including

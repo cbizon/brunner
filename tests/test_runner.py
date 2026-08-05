@@ -9,6 +9,9 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
+from brunner import agent_cli
 from brunner.contract import load_output_contract
 from brunner.definition import (
     BenchmarkDefinition,
@@ -87,6 +90,43 @@ def test_run_attempt_terminates_process_after_terminal_result(
     assert outcome["return_code"] == 0
     assert outcome["terminal_result_seen"] is True
     assert outcome["lingering_processes_terminated"] is True
+
+
+def test_timing_write_failure_does_not_hide_terminal_result(
+    tmp_path: Path,
+) -> None:
+    class FailingTimingRecorder:
+        def emit(self, event: str, **details: object) -> None:
+            raise OSError("timing volume is full")
+
+    events = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    combined_events = tmp_path / "combined.jsonl"
+    combined_stderr = tmp_path / "combined.stderr.log"
+    script = (
+        "import json;"
+        "print(json.dumps({'type':'turn.completed'}),flush=True)"
+    )
+
+    outcome = run_attempt(
+        adapter=CodexAdapter(),
+        command=(sys.executable, "-c", script),
+        workspace=tmp_path,
+        environment=os.environ.copy(),
+        prompt="",
+        attempt_events=events,
+        attempt_stderr=stderr,
+        combined_events=combined_events,
+        combined_stderr=combined_stderr,
+        deadline_epoch=time.time() + 5,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.05,
+        timing_recorder=FailingTimingRecorder(),
+    )
+
+    assert outcome["terminal_result_seen"] is True
+    assert outcome["return_code"] == 0
+    assert "timing volume is full" in outcome["timing_recording_error"]
 
 
 def test_success_event_without_ready_output_does_not_terminate_work(
@@ -1900,3 +1940,92 @@ def test_agent_cli_handles_sigterm_as_graceful_interruption(
     assert termination["retryable_infrastructure"] is True
     assert termination["signal"] == signal.SIGTERM
     assert termination["process_exit_code"] == 128 + signal.SIGTERM
+
+
+def test_agent_cli_persists_bootstrap_failure(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("agent-bootstrap", "codex", "model-a", None),
+    )
+    (trial / "metadata/manifest.json").write_text("{not-json")
+    environment = os.environ.copy()
+    source_root = str(ROOT / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (source_root, environment.get("PYTHONPATH"))
+        if part
+    )
+    termination_log = tmp_path / "termination.log"
+    environment["BRUNNER_TERMINATION_LOG"] = str(termination_log)
+
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "brunner.agent_cli",
+            str(trial),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert process.returncode == 1
+    state = json.loads((trial / "status.json").read_text())
+    assert state["status"] == "provider_error"
+    assert state["harness_failure"]["domain"] == "orchestrator"
+    assert state["harness_failure"]["reason"] == "AgentHarnessFailed"
+    termination = json.loads(termination_log.read_text())[
+        "brunner_pipeline"
+    ]
+    assert termination["provider_result_present"] is False
+    assert termination["harness_failure"]["reason"] == "AgentHarnessFailed"
+
+
+def test_agent_cli_preserves_existing_attempts_on_harness_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("agent-preserve", "codex", "model-a", None),
+    )
+    existing = {
+        "schema_version": "2.0",
+        "status": "running",
+        "attempts": [{"number": 1, "status": "running"}],
+    }
+    (trial / "status.json").write_text(json.dumps(existing))
+    monkeypatch.setattr(
+        agent_cli,
+        "run_staged_trial",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("post-attempt bookkeeping failed")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["brunner-agent", str(trial)],
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        agent_cli.main()
+
+    assert captured.value.code == 1
+    state = json.loads((trial / "status.json").read_text())
+    assert state["status"] == "provider_error"
+    assert state["attempts"] == existing["attempts"]
+    assert state["harness_failure"]["reason"] == "AgentHarnessFailed"

@@ -225,6 +225,29 @@ raise SystemExit(7)
     assert not workspace.exists()
 
 
+def test_materializer_failure_bounds_captured_output(
+    tmp_path: Path,
+) -> None:
+    benchmark, _ = materialized_definition(
+        tmp_path,
+        """
+import sys
+
+print("x" * 100_000)
+print("y" * 100_000, file=sys.stderr)
+raise SystemExit(9)
+""",
+    )
+    contract = load_output_contract(benchmark.contract_path)
+
+    with pytest.raises(ChallengeMaterializationError) as captured:
+        stage_challenge(benchmark, contract, tmp_path / "workspace")
+
+    message = str(captured.value)
+    assert "truncated" in message
+    assert len(message) < 45_000
+
+
 def test_materializer_timeout_aborts_staging(tmp_path: Path) -> None:
     benchmark, _ = materialized_definition(
         tmp_path,
@@ -338,6 +361,50 @@ def test_no_materializer_preserves_staging_output(tmp_path: Path) -> None:
     ).read_bytes() == (
         tmp_path / "second-workspace/input.txt"
     ).read_bytes()
+
+
+def test_no_materializer_rejects_source_symlink(tmp_path: Path) -> None:
+    challenge_root = tmp_path / "challenge"
+    shutil.copytree(EXAMPLE_ROOT / "challenge", challenge_root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must not become candidate-visible")
+    (challenge_root / "outside-link.txt").symlink_to(outside)
+    benchmark = replace(
+        definition(),
+        challenge=replace(definition().challenge, root=challenge_root),
+    )
+    contract = load_output_contract(benchmark.contract_path)
+
+    with pytest.raises(IntegrityError, match="symlink"):
+        stage_challenge(benchmark, contract, tmp_path / "workspace")
+
+    assert not (tmp_path / "workspace").exists()
+
+
+def test_interrupted_trial_creation_never_publishes_partial_trial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    tests_root = tmp_path / "trials"
+    monkeypatch.setattr(
+        "brunner.trial.stage_challenge",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt()
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        create_trial(
+            benchmark,
+            contract,
+            tests_root,
+            TrialIdentity("interrupted", "codex", "test-model", None),
+        )
+
+    assert not (tests_root / "interrupted").exists()
+    assert list(tests_root.glob(".interrupted.creating-*")) == []
 
 
 def test_trial_creation_uses_materialized_challenge(tmp_path: Path) -> None:

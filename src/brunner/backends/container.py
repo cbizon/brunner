@@ -252,7 +252,16 @@ class ContainerBackend:
                 ("inspect", handle.native_id),
                 message,
             )
-        state = json.loads(result.stdout)
+        try:
+            state = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise BackendRequestError(
+                "container runtime returned invalid inspection JSON"
+            ) from error
+        if not isinstance(state, dict):
+            raise BackendRequestError(
+                "container runtime inspection result is not an object"
+            )
         if state.get("Running"):
             phase = "running"
         elif state.get("Status") == "created":
