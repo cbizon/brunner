@@ -630,11 +630,11 @@ artifact-reader images must contain Brunner; the agent image also needs the
 selected provider CLI. The benchmark package, evaluator, and references are
 not required in the agent image.
 
-Kubernetes workload requests and limits are independent. Set
-`cpu_request`/`memory_request` to the scheduler reservation and
-`cpu_limit`/`memory_limit` to the permitted burst ceiling. Omit a limit when
-the namespace policy should provide it or when no hard cap is desired. Brunner
-does not copy requests into limits.
+Kubernetes workload requests and limits are independent. Set `cpu_request`,
+`memory_request`, and `ephemeral_storage_request` to scheduler reservations;
+set `cpu_limit`, `memory_limit`, and `ephemeral_storage_limit` to permitted
+burst ceilings. Omit a limit when the namespace policy should provide it or
+when no hard cap is desired. Brunner does not copy requests into limits.
 
 ```python
 plan = CampaignPlan(
@@ -643,16 +643,19 @@ plan = CampaignPlan(
     cpu_limit="8",
     memory_request="8Gi",
     memory_limit="32Gi",
+    ephemeral_storage_request="1Gi",
+    ephemeral_storage_limit="3Gi",
 )
 ```
 
-`WorkloadSpec.cpu` and `WorkloadSpec.memory` remain compatibility shorthands
-that set both Kubernetes request and limit when no explicit side is supplied.
-Either side can be overridden incrementally, so existing code can add only
-`cpu_limit` and `memory_limit` to become burstable. New benchmark code should
-use the explicit request and limit fields. For OCI execution, explicit
-`cpu_limit` and `memory_limit` take precedence; request fields have no effect
-because an OCI runtime has no scheduler reservation.
+`WorkloadSpec.cpu`, `WorkloadSpec.memory`, and `WorkloadSpec.storage` remain
+compatibility shorthands that set both Kubernetes request and limit when no
+explicit side is supplied. Either side can be overridden incrementally, so
+existing code can add only limit fields to become burstable. New benchmark
+code should use the explicit request and limit fields. For OCI execution,
+explicit `cpu_limit` and `memory_limit` take precedence; request and ephemeral
+storage fields have no effect because an OCI runtime has no scheduler
+reservation or portable ephemeral-storage limit.
 
 Campaign trials do not accept environment-variable names or values. Provider
 credentials and deployment networking belong to the backend configuration:

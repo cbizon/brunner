@@ -53,6 +53,8 @@ def test_kubernetes_resources_preserve_secret_boundary(
         cpu_limit="8",
         memory_request="16Gi",
         memory_limit="64Gi",
+        ephemeral_storage_request="1Gi",
+        ephemeral_storage_limit="3Gi",
     )
     labels = {"app.kubernetes.io/name": "brunner"}
 
@@ -106,8 +108,16 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert proxy["value"] == "http://proxy.internal:3128"
     assert termination_log["value"] == "/dev/termination-log"
     assert pod_spec["containers"][0]["resources"] == {
-        "requests": {"cpu": "2", "memory": "16Gi"},
-        "limits": {"cpu": "8", "memory": "64Gi"},
+        "requests": {
+            "cpu": "2",
+            "memory": "16Gi",
+            "ephemeral-storage": "1Gi",
+        },
+        "limits": {
+            "cpu": "8",
+            "memory": "64Gi",
+            "ephemeral-storage": "3Gi",
+        },
     }
     encoded = json.dumps(job)
     assert "provider-credentials" in encoded
@@ -183,6 +193,37 @@ def test_kubernetes_legacy_requests_allow_explicit_burst_limits(
     assert resources == {
         "requests": {"cpu": "2", "memory": "8Gi"},
         "limits": {"cpu": "8", "memory": "32Gi"},
+    }
+
+
+def test_kubernetes_legacy_storage_sets_request_and_limit(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="legacy-storage",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        storage="2Gi",
+    )
+
+    job = render_job(
+        "legacy-storage",
+        "legacy-storage-data",
+        workload,
+        KubernetesProfile(namespace="benchmarks"),
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    resources = job["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]
+    assert resources == {
+        "requests": {"ephemeral-storage": "2Gi"},
+        "limits": {"ephemeral-storage": "2Gi"},
     }
 
 
@@ -834,6 +875,99 @@ def test_kubernetes_complete_job_preserves_infrastructure_failure(
         "pod": list(events["trial-pod"]),
     }
     assert f"{expected_reason}: agent terminated" in snapshot.warnings
+
+
+def test_kubernetes_eviction_event_overrides_successful_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    pod = {
+        "metadata": {"name": "trial-pod", "uid": "pod-uid"},
+        "spec": {"nodeName": "node-a"},
+        "status": {
+            "phase": "Succeeded",
+            "containerStatuses": [
+                {
+                    "name": "agent",
+                    "state": {
+                        "terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if kind == "pvc":
+            return {"status": {"phase": "Bound"}}
+        if kind == "job":
+            return {
+                "metadata": {"name": "trial-job", "uid": "job-uid"},
+                "status": {"conditions": [{"type": "Complete"}]},
+            }
+        if kind == "pods":
+            return {"items": [pod]}
+        raise AssertionError((kind, name, kwargs))
+
+    events = {
+        "trial-job": (
+            {
+                "type": "Normal",
+                "reason": "Completed",
+                "message": "Job completed",
+            },
+        ),
+        "trial-pod": (
+            {
+                "type": "Warning",
+                "reason": "Evicted",
+                "message": (
+                    "Pod ephemeral local storage usage exceeds "
+                    "the total limit of containers 256Mi."
+                ),
+            },
+        ),
+    }
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_events",
+        lambda name, uid, required=False: events.get(name, ()),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.reason == "Evicted"
+    assert snapshot.message == (
+        "Pod ephemeral local storage usage exceeds "
+        "the total limit of containers 256Mi."
+    )
+    assert snapshot.exit_code == 0
+    assert snapshot.details["retryable_infrastructure"] is True
+    assert snapshot.warnings == (
+        "Evicted: Pod ephemeral local storage usage exceeds "
+        "the total limit of containers 256Mi.",
+    )
 
 
 def test_kubernetes_restart_reuses_pvc_without_restaging(

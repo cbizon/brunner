@@ -1156,6 +1156,8 @@ def test_default_workload_factory_preserves_burst_resources(
             cpu_limit="8",
             memory_request="8Gi",
             memory_limit="32Gi",
+            ephemeral_storage_request="1Gi",
+            ephemeral_storage_limit="3Gi",
         ),
         definition,
         "kubernetes",
@@ -1165,6 +1167,8 @@ def test_default_workload_factory_preserves_burst_resources(
     assert workload.cpu_limit == "8"
     assert workload.memory_request == "8Gi"
     assert workload.memory_limit == "32Gi"
+    assert workload.ephemeral_storage_request == "1Gi"
+    assert workload.ephemeral_storage_limit == "3Gi"
 
 
 def test_campaign_recovers_interrupted_collection(

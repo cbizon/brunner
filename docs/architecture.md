@@ -350,25 +350,28 @@ artifacts. Container and Kubernetes resource names include a digest of the
 caller-owned workload identity and trial path, preventing normalization or
 truncation collisions.
 
-`WorkloadSpec` carries independent CPU and memory request and limit fields.
-Kubernetes renders them independently, allowing a low scheduler reservation
-and a higher burst ceiling instead of forcing Guaranteed QoS by setting
-requests equal to limits. Legacy `cpu` and `memory` values are Kubernetes
-request-and-limit shorthands when neither explicit side overrides them, which
-preserves existing callers. OCI runtimes have no scheduler-request concept, so
-the container backend applies only explicit limits or the legacy values as
-limits. GPU counts remain equal requests and limits because Kubernetes
-extended resources are not overcommitted.
+`WorkloadSpec` carries independent CPU, memory, and ephemeral-storage request
+and limit fields. Kubernetes renders them independently, allowing a low
+scheduler reservation and a higher burst ceiling instead of forcing
+Guaranteed QoS by setting requests equal to limits. Legacy `cpu`, `memory`,
+and `storage` values are Kubernetes request-and-limit shorthands when neither
+explicit side overrides them, which preserves existing callers. OCI runtimes
+have no scheduler-request concept, so the container backend applies only
+explicit CPU and memory limits or the legacy values as limits. Ephemeral
+storage settings are Kubernetes-only. GPU counts remain equal requests and
+limits because Kubernetes extended resources are not overcommitted.
 
 Kubernetes distinguishes connectivity failures from rejected requests and
 workload failures. The agent writes a compact pipeline summary to Kubernetes'
 termination log. Inspection treats that summary, the container signal, and
 termination reasons such as `OOMKilled` as authoritative even if the Job says
-`Complete` or the recorded container exit code is zero. It reports pending
-PVCs, inspects terminated init/main containers, preserves previously recovered
-workload logs, and captures terminal Job and Pod events in the persisted
-backend snapshot before cleanup. It also includes Kubernetes warning events
-for pending storage and failed artifact readers. It retries artifact readers,
+`Complete` or the recorded container exit code is zero. Terminal warning
+events such as `Evicted` likewise override an otherwise successful Job. It
+reports pending PVCs, inspects terminated init/main containers, preserves
+previously recovered workload logs, and captures terminal Job and Pod events
+in the persisted backend snapshot before cleanup. It also includes Kubernetes
+warning events for pending storage and failed artifact readers. It retries
+artifact readers,
 excludes failed reader nodes when rescheduling, resumes partial files by byte
 offset, and verifies every SHA-256. Before helper creation and final cleanup,
 Brunner finds stale stager and reader pods by workload/role labels and waits

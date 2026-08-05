@@ -298,16 +298,26 @@ def render_job(
     limits = {}
     cpu_request = workload.cpu_request or workload.cpu
     memory_request = workload.memory_request or workload.memory
+    ephemeral_storage_request = (
+        workload.ephemeral_storage_request or workload.storage
+    )
     if cpu_request:
         requests["cpu"] = cpu_request
     if memory_request:
         requests["memory"] = memory_request
+    if ephemeral_storage_request:
+        requests["ephemeral-storage"] = ephemeral_storage_request
     cpu_limit = workload.cpu_limit or workload.cpu
     memory_limit = workload.memory_limit or workload.memory
+    ephemeral_storage_limit = (
+        workload.ephemeral_storage_limit or workload.storage
+    )
     if cpu_limit:
         limits["cpu"] = cpu_limit
     if memory_limit:
         limits["memory"] = memory_limit
+    if ephemeral_storage_limit:
+        limits["ephemeral-storage"] = ephemeral_storage_limit
     if workload.gpu:
         requests["nvidia.com/gpu"] = str(workload.gpu)
         limits["nvidia.com/gpu"] = str(workload.gpu)
@@ -1129,32 +1139,12 @@ class KubernetesBackend:
         failed_condition = conditions.get("Failed", {})
         job_failure_reason = failed_condition.get("reason")
         pod_failure_reason = pod_status.get("reason")
-        retryable_evidence = (
-            brunner_pipeline.get("retryable_infrastructure") is True
-            if brunner_incomplete
-            else (
-                exit_code not in {None, 0}
-                or termination_signal != 0
-                or reason in RETRYABLE_CONTAINER_FAILURES
-                or pod_failure_reason
-                in {
-                    "Evicted",
-                    "NodeLost",
-                    "Shutdown",
-                }
-                or job_failure_reason == "BackoffLimitExceeded"
-            )
-        )
-        retryable_infrastructure = bool(
-            phase == "failed"
-            and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
-            and reason not in NON_RETRYABLE_CONTAINER_FAILURES
-            and retryable_evidence
-        )
         kubernetes_events: dict[str, list[dict[str, Any]]] = {
             "job": [],
             "pod": [],
         }
+        event_failure_reason = None
+        event_failure_message = None
         if phase in {"succeeded", "failed"}:
             job_metadata = job.get("metadata", {})
             pod_metadata = pod.get("metadata", {}) if pod else {}
@@ -1187,6 +1177,13 @@ class KubernetesBackend:
             ):
                 if event.get("type") != "Warning":
                     continue
+                event_reason = event.get("reason")
+                if (
+                    event_failure_reason is None
+                    and event_reason in RETRYABLE_CONTAINER_FAILURES
+                ):
+                    event_failure_reason = str(event_reason)
+                    event_failure_message = str(event.get("message") or "")
                 detail = ": ".join(
                     str(value)
                     for value in (
@@ -1197,6 +1194,32 @@ class KubernetesBackend:
                 )
                 if detail and detail not in warnings:
                     warnings.append(detail)
+        if phase == "succeeded" and event_failure_reason is not None:
+            phase = "failed"
+            reason = event_failure_reason
+            message = event_failure_message
+        retryable_evidence = (
+            brunner_pipeline.get("retryable_infrastructure") is True
+            if brunner_incomplete
+            else (
+                exit_code not in {None, 0}
+                or termination_signal != 0
+                or reason in RETRYABLE_CONTAINER_FAILURES
+                or pod_failure_reason
+                in {
+                    "Evicted",
+                    "NodeLost",
+                    "Shutdown",
+                }
+                or job_failure_reason == "BackoffLimitExceeded"
+            )
+        )
+        retryable_infrastructure = bool(
+            phase == "failed"
+            and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
+            and reason not in NON_RETRYABLE_CONTAINER_FAILURES
+            and retryable_evidence
+        )
         return BackendSnapshot(
             phase=phase,
             reason=reason,
