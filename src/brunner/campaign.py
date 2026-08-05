@@ -24,10 +24,14 @@ from brunner.errors import (
     ArtifactTransferError,
     BackendConnectivityError,
     BackendError,
-    BrunnerError,
     IntegrityError,
 )
 from brunner.evaluation import evaluate_trial
+from brunner.failure import (
+    attach_failure,
+    failure_from_exception,
+    failure_record,
+)
 from brunner.io import write_json_atomic
 from brunner.pipeline import summarize_pipeline_state
 from brunner.trial import TrialIdentity, create_trial, load_trial_identity
@@ -43,6 +47,26 @@ WorkloadFactory = Callable[
     ],
     WorkloadSpec,
 ]
+
+TRIAL_PHASES = frozenset(
+    {
+        "attention_required",
+        "cleanup_pending",
+        "collecting",
+        "collection_failed",
+        "collection_pending",
+        "collection_retry_wait",
+        "complete",
+        "evaluating",
+        "evaluation_pending",
+        "infrastructure_retrying",
+        "pending",
+        "running",
+        "submission_retry_wait",
+        "submitted",
+        "submitting",
+    }
+)
 
 
 def _now() -> str:
@@ -112,8 +136,11 @@ class CampaignPlan:
     ephemeral_storage_request: str | None = None
     ephemeral_storage_limit: str | None = None
     included_artifact_groups: frozenset[str] = frozenset()
+    submission_retry_seconds: float = 60.0
+    submission_max_attempts: int = 3
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
+    cleanup_retry_seconds: float = 60.0
     infrastructure_max_restarts: int = 2
     trial_timeout_seconds: float | None = None
     trial_timeout_margin_seconds: float = 5 * 60
@@ -137,6 +164,14 @@ class CampaignPlan:
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"campaign {name} cannot be empty")
+        if self.submission_retry_seconds < 0:
+            raise ValueError(
+                "campaign submission_retry_seconds must not be negative"
+            )
+        if self.submission_max_attempts < 1:
+            raise ValueError(
+                "campaign submission_max_attempts must be positive"
+            )
         if self.collection_retry_seconds < 0:
             raise ValueError(
                 "campaign collection_retry_seconds must not be negative"
@@ -144,6 +179,10 @@ class CampaignPlan:
         if self.collection_max_attempts < 1:
             raise ValueError(
                 "campaign collection_max_attempts must be positive"
+            )
+        if self.cleanup_retry_seconds < 0:
+            raise ValueError(
+                "campaign cleanup_retry_seconds must not be negative"
             )
         if self.infrastructure_max_restarts < 0:
             raise ValueError(
@@ -199,8 +238,11 @@ class CampaignPlan:
             "included_artifact_groups": sorted(
                 self.included_artifact_groups
             ),
+            "submission_retry_seconds": self.submission_retry_seconds,
+            "submission_max_attempts": self.submission_max_attempts,
             "collection_retry_seconds": self.collection_retry_seconds,
             "collection_max_attempts": self.collection_max_attempts,
+            "cleanup_retry_seconds": self.cleanup_retry_seconds,
             "infrastructure_max_restarts": (
                 self.infrastructure_max_restarts
             ),
@@ -283,6 +325,7 @@ class CampaignRunner:
         self.workload_factory = workload_factory
         self.root = plan.root.resolve()
         self.state_path = self.root / "campaign.json"
+        self.state_backup_path = self.root / "campaign.json.bak"
         self.dashboard_path = self.root / "index.html"
         self.lock_path = self.root / "campaign.lock"
         self._lock_depth = 0
@@ -339,7 +382,24 @@ class CampaignRunner:
     def _initialize(self) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
         if self.state_path.is_file():
-            state = json.loads(self.state_path.read_text())
+            recovered_from_backup = False
+            try:
+                state = json.loads(self.state_path.read_text())
+            except (json.JSONDecodeError, OSError) as primary_error:
+                if not self.state_backup_path.is_file():
+                    raise RuntimeError(
+                        f"campaign state is unreadable: {self.state_path}"
+                    ) from primary_error
+                try:
+                    state = json.loads(self.state_backup_path.read_text())
+                except (json.JSONDecodeError, OSError) as backup_error:
+                    raise RuntimeError(
+                        "campaign state and backup are both unreadable: "
+                        f"{self.state_path}, {self.state_backup_path}"
+                    ) from backup_error
+                recovered_from_backup = True
+            if not isinstance(state, dict):
+                raise RuntimeError("campaign state must be a JSON object")
             expected = {
                 "campaign_id": self.plan.campaign_id,
                 "benchmark_id": self.definition.benchmark_id,
@@ -356,19 +416,45 @@ class CampaignRunner:
                 raise RuntimeError(
                     f"campaign identity changed: {mismatches}"
                 )
-            state["schema_version"] = "2.0"
+            state["schema_version"] = "2.1"
             state.pop("plan_sha256", None)
             state.setdefault("trials", [])
             state.setdefault("events", [])
+            if recovered_from_backup:
+                state["state_recovery"] = {
+                    "source": str(self.state_backup_path),
+                    "recovered_at": _now(),
+                }
+                attach_failure(
+                    state,
+                    failure_record(
+                        operation="campaign_state_load",
+                        domain="orchestrator",
+                        reason="CampaignStateRecoveredFromBackup",
+                        message=(
+                            "primary campaign state was unreadable; "
+                            "recovered the last valid atomic backup"
+                        ),
+                        disposition="attention",
+                        retryable=False,
+                        resource="orchestrator_filesystem",
+                    ),
+                )
+                self._event(
+                    state,
+                    "campaign_state_recovered",
+                    "recovered unreadable campaign state from atomic backup",
+                )
+            normalized = self._normalize_trial_phases(state)
             recovered = self._recover_in_progress_phases(state)
             added = self._sync_plan_trials(state)
-            if added or recovered:
+            if added or recovered or normalized:
                 state["status"] = "running"
             self._save(state)
             return state
 
         state = {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "campaign_id": self.plan.campaign_id,
             "benchmark_id": self.definition.benchmark_id,
             "benchmark_version": self.definition.version,
@@ -383,6 +469,37 @@ class CampaignRunner:
         self._sync_plan_trials(state)
         self._save(state)
         return state
+
+    def _normalize_trial_phases(self, state: dict[str, Any]) -> int:
+        normalized = 0
+        for entry in state.get("trials", []):
+            if not isinstance(entry, dict):
+                raise RuntimeError("campaign trials must be JSON objects")
+            phase = entry.get("phase")
+            if phase in TRIAL_PHASES:
+                continue
+            attach_failure(
+                entry,
+                failure_record(
+                    operation="campaign_state_load",
+                    domain="orchestrator",
+                    reason="InvalidCampaignPhase",
+                    message=f"unknown persisted trial phase: {phase!r}",
+                    disposition="attention",
+                    retryable=False,
+                ),
+            )
+            entry["invalid_phase"] = phase
+            entry["phase"] = "attention_required"
+            entry["error"] = f"unknown persisted trial phase: {phase!r}"
+            self._event(
+                state,
+                "invalid_campaign_phase",
+                entry["error"],
+                test_id=entry.get("test_id"),
+            )
+            normalized += 1
+        return normalized
 
     def _recover_in_progress_phases(
         self,
@@ -446,6 +563,7 @@ class CampaignRunner:
                 attempts = existing.setdefault("attempts", {})
                 attempts.setdefault("submission", 0)
                 attempts.setdefault("collection", 0)
+                attempts.setdefault("cleanup", 0)
                 attempts.setdefault("infrastructure", 0)
                 actual = {
                     "provider": existing.get("provider"),
@@ -533,6 +651,7 @@ class CampaignRunner:
                 "attempts": {
                     "submission": 0,
                     "collection": 0,
+                    "cleanup": 0,
                     "infrastructure": 0,
                 },
             }
@@ -550,9 +669,40 @@ class CampaignRunner:
     def _save(self, state: dict[str, Any]) -> None:
         state["updated_at"] = _now()
         write_json_atomic(self.state_path, state)
+        write_json_atomic(self.state_backup_path, state)
         from brunner.dashboard import write_campaign_dashboard
 
-        write_campaign_dashboard(state, self.dashboard_path)
+        try:
+            write_campaign_dashboard(state, self.dashboard_path)
+        except Exception as error:
+            state["dashboard"] = {
+                "status": "failed",
+                "failure": failure_from_exception(
+                    error,
+                    operation="campaign_dashboard",
+                    domain="reporting",
+                    reason="CampaignDashboardFailed",
+                    disposition="attention",
+                    retryable=False,
+                    resource="orchestrator_filesystem",
+                ),
+            }
+            try:
+                write_json_atomic(self.state_path, state)
+                write_json_atomic(self.state_backup_path, state)
+            except OSError:
+                # The authoritative state was written before presentation.
+                # A second persistence failure must not erase that transition.
+                pass
+        else:
+            previous = state.get("dashboard")
+            if isinstance(previous, dict) and previous.get("status") == "failed":
+                state["dashboard"] = {
+                    "status": "complete",
+                    "generated_at": _now(),
+                }
+                write_json_atomic(self.state_path, state)
+                write_json_atomic(self.state_backup_path, state)
 
     @staticmethod
     def _event(
@@ -656,13 +806,36 @@ class CampaignRunner:
         entry: dict[str, Any],
     ) -> BackendHandle | None:
         trial = Path(entry["trial"])
-        workload = self.workload_factory(
-            trial,
-            self._campaign_trial(entry),
-            self.plan,
-            self.definition,
-            self.backend.name,
-        )
+        try:
+            workload = self.workload_factory(
+                trial,
+                self._campaign_trial(entry),
+                self.plan,
+                self.definition,
+                self.backend.name,
+            )
+        except Exception as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="workload_configuration",
+                    domain="configuration",
+                    reason="WorkloadConfigurationFailed",
+                    disposition="attention",
+                    retryable=False,
+                ),
+            )
+            self._event(
+                state,
+                "workload_configuration_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
         entry["phase"] = "submitting"
         entry["attempts"]["submission"] += 1
         entry.pop("error", None)
@@ -672,22 +845,110 @@ class CampaignRunner:
         except BackendConnectivityError:
             raise
         except BackendError as error:
-            entry["phase"] = "attention_required"
             entry["error"] = str(error)
+            attempts = int(entry["attempts"]["submission"])
+            retryable = attempts < self.plan.submission_max_attempts
+            if retryable:
+                retry_at = datetime.now(UTC) + timedelta(
+                    seconds=self.plan.submission_retry_seconds
+                )
+                entry["phase"] = "submission_retry_wait"
+                entry["next_submission_attempt_at"] = retry_at.isoformat()
+            else:
+                entry["phase"] = "attention_required"
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_submit",
+                    domain="backend",
+                    reason=(
+                        "BackendSubmissionRetry"
+                        if retryable
+                        else "BackendSubmissionFailed"
+                    ),
+                    disposition="retry" if retryable else "attention",
+                    retryable=retryable,
+                    cleanup_required=True,
+                ),
+            )
             self._event(
                 state,
-                "submission_failed",
-                str(error),
+                (
+                    "submission_retry_scheduled"
+                    if retryable
+                    else "submission_failed"
+                ),
+                (
+                    f"submission attempt {attempts} failed; "
+                    f"retrying at {entry['next_submission_attempt_at']}: "
+                    f"{error}"
+                    if retryable
+                    else str(error)
+                ),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
+        except Exception as error:
+            entry["error"] = str(error)
+            attempts = int(entry["attempts"]["submission"])
+            retryable = attempts < self.plan.submission_max_attempts
+            if retryable:
+                retry_at = datetime.now(UTC) + timedelta(
+                    seconds=self.plan.submission_retry_seconds
+                )
+                entry["phase"] = "submission_retry_wait"
+                entry["next_submission_attempt_at"] = retry_at.isoformat()
+            else:
+                entry["phase"] = "attention_required"
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_submit",
+                    domain="orchestrator",
+                    reason=(
+                        "UnclassifiedBackendSubmissionRetry"
+                        if retryable
+                        else "UnclassifiedBackendSubmissionFailure"
+                    ),
+                    disposition="retry" if retryable else "attention",
+                    retryable=retryable,
+                    cleanup_required=True,
+                ),
+            )
+            self._event(
+                state,
+                (
+                    "submission_retry_scheduled"
+                    if retryable
+                    else "submission_failed"
+                ),
+                (
+                    f"submission attempt {attempts} failed; "
+                    f"retrying at {entry['next_submission_attempt_at']}: "
+                    f"{error}"
+                    if retryable
+                    else str(error)
+                ),
                 test_id=entry["test_id"],
             )
             self._save(state)
             return None
         entry["handle"] = handle.to_dict()
         entry["phase"] = "submitted"
+        entry.pop("next_submission_attempt_at", None)
         submitted_at = handle.metadata.get("submitted_at")
         entry["submitted_at"] = (
             submitted_at if isinstance(submitted_at, str) else _now()
         )
+        failure = entry.get("failure")
+        if (
+            isinstance(failure, dict)
+            and failure.get("operation") == "backend_submit"
+        ):
+            entry.pop("failure", None)
         self._event(
             state,
             "trial_submitted",
@@ -708,13 +969,37 @@ class CampaignRunner:
         restart = getattr(self.backend, "restart", None)
         if not callable(restart):
             return None
-        workload = self.workload_factory(
-            Path(entry["trial"]),
-            self._campaign_trial(entry),
-            self.plan,
-            self.definition,
-            self.backend.name,
-        )
+        try:
+            workload = self.workload_factory(
+                Path(entry["trial"]),
+                self._campaign_trial(entry),
+                self.plan,
+                self.definition,
+                self.backend.name,
+            )
+        except Exception as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="workload_configuration",
+                    domain="configuration",
+                    reason="WorkloadConfigurationFailed",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                ),
+            )
+            self._event(
+                state,
+                "workload_configuration_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
         resuming = entry["phase"] == "infrastructure_retrying"
         retry_history = entry.setdefault("infrastructure_retries", [])
         if resuming:
@@ -763,6 +1048,42 @@ class CampaignRunner:
         except BackendError as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_restart",
+                    domain="backend",
+                    reason="BackendRestartFailed",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                ),
+            )
+            retry_record["error"] = str(error)
+            self._event(
+                state,
+                "infrastructure_retry_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
+        except Exception as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_restart",
+                    domain="orchestrator",
+                    reason="UnclassifiedBackendRestartFailure",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                ),
+            )
             retry_record["error"] = str(error)
             self._event(
                 state,
@@ -828,18 +1149,39 @@ class CampaignRunner:
         handle: BackendHandle,
     ) -> None:
         entry["phase"] = "cleanup_pending"
+        entry["attempts"]["cleanup"] = (
+            int(entry["attempts"].get("cleanup", 0)) + 1
+        )
         self._save(state)
         try:
             self.backend.cleanup(handle)
         except BackendConnectivityError:
             raise
-        except BackendError as error:
-            entry["phase"] = "attention_required"
+        except Exception as error:
             entry["cleanup_error"] = str(error)
+            entry["next_cleanup_attempt_at"] = (
+                datetime.now(UTC)
+                + timedelta(seconds=self.plan.cleanup_retry_seconds)
+            ).isoformat()
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_cleanup",
+                    domain="cleanup",
+                    reason="BackendCleanupFailed",
+                    disposition="retry",
+                    retryable=True,
+                    cleanup_required=True,
+                ),
+            )
             self._event(
                 state,
-                "cleanup_failed",
-                str(error),
+                "cleanup_retry_scheduled",
+                (
+                    f"cleanup attempt {entry['attempts']['cleanup']} failed; "
+                    f"retrying at {entry['next_cleanup_attempt_at']}: {error}"
+                ),
                 test_id=entry["test_id"],
             )
             self._save(state)
@@ -848,6 +1190,13 @@ class CampaignRunner:
         entry["completed_at"] = _now()
         entry["backend_workload_live"] = False
         entry.pop("cleanup_error", None)
+        entry.pop("next_cleanup_attempt_at", None)
+        failure = entry.get("failure")
+        if (
+            isinstance(failure, dict)
+            and failure.get("operation") == "backend_cleanup"
+        ):
+            entry.pop("failure", None)
         self._event(
             state,
             "trial_complete",
@@ -888,6 +1237,18 @@ class CampaignRunner:
                     entry["next_collection_attempt_at"] = (
                         next_attempt.isoformat()
                     )
+                    attach_failure(
+                        entry,
+                        failure_from_exception(
+                            error,
+                            operation="artifact_collection",
+                            domain="backend",
+                            reason="ArtifactTransferInterrupted",
+                            disposition="retry",
+                            retryable=True,
+                            cleanup_required=True,
+                        ),
+                    )
                     self._event(
                         state,
                         "collection_retry_scheduled",
@@ -901,6 +1262,18 @@ class CampaignRunner:
                     return
                 entry["phase"] = "collection_failed"
                 entry["collection_error"] = str(error)
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="artifact_collection",
+                        domain="backend",
+                        reason="ArtifactTransferExhausted",
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    ),
+                )
                 self._event(
                     state,
                     "collection_failed",
@@ -912,14 +1285,60 @@ class CampaignRunner:
                 )
                 self._save(state)
                 return
-            except (
-                BackendError,
-                IntegrityError,
-                OSError,
-            ) as error:
+            except (BackendError, IntegrityError, OSError) as error:
                 self._finish_collection_attempt(entry, attempt_number)
                 entry["phase"] = "collection_failed"
                 entry["collection_error"] = str(error)
+                if isinstance(error, IntegrityError):
+                    domain = "integrity"
+                    reason = "ArtifactIntegrityFailed"
+                elif isinstance(error, BackendError):
+                    domain = "backend"
+                    reason = "ArtifactCollectionBackendFailed"
+                else:
+                    domain = "orchestrator"
+                    reason = "ArtifactCollectionFilesystemFailed"
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="artifact_collection",
+                        domain=domain,
+                        reason=reason,
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                        resource=(
+                            "orchestrator_filesystem"
+                            if isinstance(error, OSError)
+                            else None
+                        ),
+                    ),
+                )
+                self._event(
+                    state,
+                    "collection_failed",
+                    str(error),
+                    test_id=entry["test_id"],
+                )
+                self._save(state)
+                return
+            except Exception as error:
+                self._finish_collection_attempt(entry, attempt_number)
+                entry["phase"] = "collection_failed"
+                entry["collection_error"] = str(error)
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="artifact_collection",
+                        domain="orchestrator",
+                        reason="UnclassifiedArtifactCollectionFailure",
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    ),
+                )
                 self._event(
                     state,
                     "collection_failed",
@@ -984,6 +1403,25 @@ class CampaignRunner:
             }
             entry["outcome"] = "failed"
             entry["failure_class"] = "infrastructure"
+            attach_failure(
+                entry,
+                failure_record(
+                    operation="agent_pipeline",
+                    domain="provider",
+                    reason=reason,
+                    message=(
+                        "agent pipeline did not produce a terminal "
+                        "provider result"
+                    ),
+                    disposition="terminal",
+                    retryable=False,
+                    cleanup_required=True,
+                    details={
+                        "pipeline_status": pipeline.get("status"),
+                        "backend_phase": backend_phase,
+                    },
+                ),
+            )
             self._event(
                 state,
                 "evaluation_skipped",
@@ -1004,14 +1442,22 @@ class CampaignRunner:
                 destination,
                 timeout_seconds=self.plan.evaluation_timeout_seconds,
             )
-        except (
-            BrunnerError,
-            json.JSONDecodeError,
-            OSError,
-            ValueError,
-        ) as error:
+        except Exception as error:
             entry["phase"] = "attention_required"
             entry["evaluation_error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="trusted_evaluation",
+                    domain="evaluation",
+                    reason="TrustedEvaluationFailed",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                    resource="evaluation_runtime",
+                ),
+            )
             self._event(
                 state,
                 "evaluation_failed",
@@ -1037,12 +1483,79 @@ class CampaignRunner:
                 ).with_name("run-report.html")
             ),
         }
+        if isinstance(evaluation.get("failure"), dict):
+            entry["evaluation"]["failure"] = evaluation["failure"]
+        if isinstance(evaluation.get("assessment_failure"), dict):
+            entry["evaluation"]["assessment_failure"] = evaluation[
+                "assessment_failure"
+            ]
+        if isinstance(evaluation.get("report"), dict):
+            entry["evaluation"]["report_status"] = evaluation["report"]
+            if evaluation["report"].get("status") != "complete":
+                entry["evaluation"].pop("report", None)
         entry.pop("evaluation_error", None)
-        benchmark_succeeded = (
-            backend_phase == "succeeded"
-            and evaluation["status"] == "complete"
-            and evaluation["required_assessments_complete"]
-        )
+        evaluation_failure = evaluation.get("failure")
+        assessment_failure = evaluation.get("assessment_failure")
+        benchmark_succeeded: bool | None
+        outcome_failure: dict[str, Any] | None = None
+        if evaluation["status"] != "complete":
+            if (
+                isinstance(evaluation_failure, dict)
+                and evaluation_failure.get("domain") == "candidate"
+            ):
+                benchmark_succeeded = False
+                entry["failure_class"] = "benchmark"
+                outcome_failure = evaluation_failure
+            else:
+                benchmark_succeeded = None
+                entry["failure_class"] = "infrastructure"
+                outcome_failure = (
+                    evaluation_failure
+                    if isinstance(evaluation_failure, dict)
+                    else failure_record(
+                        operation="trusted_evaluation",
+                        domain="evaluation",
+                        reason="TrustedEvaluationIncomplete",
+                        message="trusted evaluation did not complete",
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    )
+                )
+        elif backend_phase != "succeeded":
+            benchmark_succeeded = None
+            entry["failure_class"] = "infrastructure"
+            outcome_failure = failure_record(
+                operation="backend_execution",
+                domain="backend",
+                reason="BackendExecutionFailed",
+                message=(
+                    "backend did not report success even though a terminal "
+                    "provider result was collected"
+                ),
+                disposition="terminal",
+                retryable=False,
+                cleanup_required=True,
+                details={"backend_phase": backend_phase},
+            )
+        elif not evaluation["required_assessments_complete"]:
+            benchmark_succeeded = None
+            entry["failure_class"] = "infrastructure"
+            outcome_failure = (
+                assessment_failure
+                if isinstance(assessment_failure, dict)
+                else failure_record(
+                    operation="qualitative_assessment",
+                    domain="assessment",
+                    reason="RequiredAssessmentIncomplete",
+                    message="a required assessment did not complete",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                )
+            )
+        else:
+            benchmark_succeeded = True
         entry["benchmark"] = {
             "status": evaluation["status"],
             "succeeded": benchmark_succeeded,
@@ -1055,8 +1568,10 @@ class CampaignRunner:
         )
         if benchmark_succeeded:
             entry.pop("failure_class", None)
+            entry.pop("failure", None)
         else:
-            entry["failure_class"] = "benchmark"
+            if outcome_failure is not None:
+                attach_failure(entry, outcome_failure)
         self._cleanup_entry(state, entry, handle)
 
     def advance(self) -> dict[str, Any]:
@@ -1069,8 +1584,25 @@ class CampaignRunner:
         state.pop("pause_reason", None)
 
         for entry in state["trials"]:
-            if entry["phase"] != "submitting" or entry.get("handle"):
+            if (
+                entry["phase"] not in {
+                    "submitting",
+                    "submission_retry_wait",
+                }
+                or entry.get("handle")
+            ):
                 continue
+            if entry["phase"] == "submission_retry_wait":
+                retry_at = entry.get("next_submission_attempt_at")
+                if retry_at:
+                    try:
+                        retry_time = datetime.fromisoformat(str(retry_at))
+                    except ValueError:
+                        retry_time = datetime.now(UTC)
+                    if retry_time.tzinfo is None:
+                        retry_time = retry_time.replace(tzinfo=UTC)
+                    if retry_time > datetime.now(UTC):
+                        continue
             try:
                 self._submit_entry(state, entry)
             except BackendConnectivityError as error:
@@ -1097,7 +1629,8 @@ class CampaignRunner:
 
         for entry in state["trials"]:
             if (
-                entry["phase"] in {"pending", "submitting"}
+                entry["phase"]
+                in {"pending", "submitting", "submission_retry_wait"}
                 and not entry.get("handle")
             ):
                 continue
@@ -1118,6 +1651,16 @@ class CampaignRunner:
                 continue
             handle = _handle_from_dict(handle_value)
             if entry["phase"] == "cleanup_pending":
+                retry_at = entry.get("next_cleanup_attempt_at")
+                if retry_at:
+                    try:
+                        retry_time = datetime.fromisoformat(str(retry_at))
+                    except ValueError:
+                        retry_time = datetime.now(UTC)
+                    if retry_time.tzinfo is None:
+                        retry_time = retry_time.replace(tzinfo=UTC)
+                    if retry_time > datetime.now(UTC):
+                        continue
                 try:
                     self._cleanup_entry(state, entry, handle)
                 except BackendConnectivityError as error:
@@ -1182,6 +1725,40 @@ class CampaignRunner:
             except BackendError as error:
                 entry["phase"] = "attention_required"
                 entry["error"] = str(error)
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="backend_inspection",
+                        domain="backend",
+                        reason="BackendInspectionFailed",
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    ),
+                )
+                self._event(
+                    state,
+                    "inspection_failed",
+                    str(error),
+                    test_id=entry["test_id"],
+                )
+                continue
+            except Exception as error:
+                entry["phase"] = "attention_required"
+                entry["error"] = str(error)
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="backend_inspection",
+                        domain="orchestrator",
+                        reason="UnclassifiedBackendInspectionFailure",
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    ),
+                )
                 self._event(
                     state,
                     "inspection_failed",
@@ -1274,6 +1851,30 @@ class CampaignRunner:
                     return self._pause_connectivity(state, error)
                 except BackendError as error:
                     entry["log_warning"] = str(error)
+                    attach_failure(
+                        entry,
+                        failure_from_exception(
+                            error,
+                            operation="backend_logs",
+                            domain="backend",
+                            reason="BackendLogCollectionFailed",
+                            disposition="attention",
+                            retryable=False,
+                        ),
+                    )
+                except Exception as error:
+                    entry["log_warning"] = str(error)
+                    attach_failure(
+                        entry,
+                        failure_from_exception(
+                            error,
+                            operation="backend_logs",
+                            domain="orchestrator",
+                            reason="UnclassifiedBackendLogFailure",
+                            disposition="attention",
+                            retryable=False,
+                        ),
+                    )
                 else:
                     if workload_logs or not log_path.exists():
                         log_path.write_text(workload_logs)
@@ -1294,26 +1895,42 @@ class CampaignRunner:
                     f"backend returned {snapshot.phase}: "
                     f"{snapshot.reason or snapshot.message or ''}"
                 )
+                attach_failure(
+                    entry,
+                    failure_record(
+                        operation="backend_inspection",
+                        domain="backend",
+                        reason="UnknownBackendPhase",
+                        message=entry["error"],
+                        disposition="attention",
+                        retryable=False,
+                        cleanup_required=True,
+                    ),
+                )
 
         # A trial needing attention normally frees its slot, but not while the
         # backend still reports its workload as pending or running: an overdue
         # trial is still consuming a real slot, and releasing it would let the
         # campaign exceed max_parallel.
         active = sum(
-            bool(entry.get("handle"))
-            and (
-                entry["phase"] in {
-                    "submitted",
-                    "infrastructure_retrying",
-                    "pending",
-                    "running",
-                    "collection_pending",
-                    "collection_retry_wait",
-                    "collecting",
-                    "evaluating",
-                    "cleanup_pending",
-                }
-                or bool(entry.get("backend_workload_live"))
+            entry["phase"] in {"submitting", "submission_retry_wait"}
+            or (
+                bool(entry.get("handle"))
+                and (
+                    entry["phase"]
+                    in {
+                        "submitted",
+                        "infrastructure_retrying",
+                        "pending",
+                        "running",
+                        "collection_pending",
+                        "collection_retry_wait",
+                        "collecting",
+                        "evaluating",
+                        "cleanup_pending",
+                    }
+                    or bool(entry.get("backend_workload_live"))
+                )
             )
             for entry in state["trials"]
         )
@@ -1325,6 +1942,36 @@ class CampaignRunner:
                 return self._pause_connectivity(state, error)
             except BackendError as error:
                 state["scheduler_error"] = str(error)
+                attach_failure(
+                    state,
+                    failure_from_exception(
+                        error,
+                        operation="backend_capacity",
+                        domain="backend",
+                        reason="BackendCapacityFailed",
+                        disposition="attention",
+                        retryable=False,
+                    ),
+                )
+                self._event(
+                    state,
+                    "capacity_failed",
+                    str(error),
+                )
+                available = 0
+            except Exception as error:
+                state["scheduler_error"] = str(error)
+                attach_failure(
+                    state,
+                    failure_from_exception(
+                        error,
+                        operation="backend_capacity",
+                        domain="orchestrator",
+                        reason="UnclassifiedBackendCapacityFailure",
+                        disposition="attention",
+                        retryable=False,
+                    ),
+                )
                 self._event(
                     state,
                     "capacity_failed",
@@ -1333,9 +1980,42 @@ class CampaignRunner:
                 available = 0
             else:
                 state.pop("scheduler_error", None)
+                failure = state.get("failure")
+                if (
+                    isinstance(failure, dict)
+                    and failure.get("operation") == "backend_capacity"
+                ):
+                    state.pop("failure", None)
+                state["backend_capacity"] = capacity.to_dict()
                 available = available_by_plan
                 if capacity.available is not None:
                     available = min(available, capacity.available)
+                if available <= 0:
+                    previous = state.get("scheduler_wait")
+                    state["scheduler_wait"] = {
+                        "kind": "backend_capacity",
+                        "since": (
+                            previous.get("since")
+                            if isinstance(previous, dict)
+                            and previous.get("kind") == "backend_capacity"
+                            else _now()
+                        ),
+                        "capacity": capacity.to_dict(),
+                    }
+                    if not isinstance(previous, dict):
+                        self._event(
+                            state,
+                            "backend_capacity_wait",
+                            "backend reported no available workload capacity",
+                        )
+                else:
+                    if isinstance(state.get("scheduler_wait"), dict):
+                        self._event(
+                            state,
+                            "backend_capacity_resumed",
+                            "backend workload capacity became available",
+                        )
+                    state.pop("scheduler_wait", None)
             for entry in state["trials"]:
                 if available <= 0:
                     break
@@ -1346,6 +2026,11 @@ class CampaignRunner:
                 except BackendConnectivityError as error:
                     return self._pause_connectivity(state, error)
                 if handle is None:
+                    if entry["phase"] in {
+                        "submitting",
+                        "submission_retry_wait",
+                    }:
+                        available -= 1
                     continue
                 available -= 1
 
@@ -1362,6 +2047,7 @@ class CampaignRunner:
         elif phases & {
             "pending",
             "submitting",
+            "submission_retry_wait",
             "submitted",
             "infrastructure_retrying",
             "running",
@@ -1376,14 +2062,33 @@ class CampaignRunner:
             state["has_attention"] = bool(
                 phases & {"attention_required", "collection_failed"}
                 or state.get("scheduler_error")
+                or state.get("scheduler_wait")
+                or any(
+                    entry.get("cleanup_error")
+                    for entry in state["trials"]
+                )
                 or active_attention
             )
         elif phases & {"attention_required", "collection_failed"}:
             state["status"] = "attention_required"
             state["has_attention"] = True
         else:
-            state["status"] = "running"
-            state["has_attention"] = False
+            state["status"] = "attention_required"
+            state["has_attention"] = True
+            attach_failure(
+                state,
+                failure_record(
+                    operation="campaign_aggregation",
+                    domain="orchestrator",
+                    reason="UnhandledCampaignState",
+                    message=(
+                        "campaign phases did not match any lifecycle state: "
+                        f"{sorted(phases)}"
+                    ),
+                    disposition="attention",
+                    retryable=False,
+                ),
+            )
         # Reaching here means no step paused, so the pause clock resets. It
         # must not reset on every attempt, or the pause timeout never fires.
         state.pop("paused_since", None)

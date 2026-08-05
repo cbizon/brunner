@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 from brunner.contract import OutputContract, render_output_requirements
 from brunner.definition import BenchmarkDefinition, ChallengeDefinition
@@ -96,6 +96,17 @@ def _diagnostic_text(value: str | bytes | None) -> str:
     return text
 
 
+def _diagnostic_tail(stream: BinaryIO, *, limit: int = 20_000) -> bytes:
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(max(0, size - limit))
+    value = stream.read(limit)
+    if size <= limit:
+        return value
+    prefix = f"... <truncated {size - limit} bytes>\n".encode()
+    return prefix + value[-max(0, limit - len(prefix)) :]
+
+
 def _materialization_failure(
     challenge: ChallengeDefinition,
     *,
@@ -134,56 +145,68 @@ def _run_materializer(
     if resource_cache is not None:
         environment["BRUNNER_RESOURCE_CACHE"] = resource_cache
     environment["BRUNNER_CHALLENGE_ROOT"] = str(challenge_root)
-    try:
-        process = subprocess.Popen(
-            challenge.materialize_command,
-            cwd=challenge_root,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
-        )
-    except OSError as error:
-        raise ChallengeMaterializationError(
-            "challenge materialization could not start\n"
-            f"command: {shlex.join(challenge.materialize_command)}\n"
-            "exit code: unavailable\n"
-            "stdout:\n<empty>\n"
-            f"stderr:\n{type(error).__name__}: {error}"
-        ) from error
-    try:
-        stdout, stderr = process.communicate(
-            timeout=challenge.materialize_timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        if os.name == "posix":
+    with (
+        tempfile.TemporaryFile() as stdout_stream,
+        tempfile.TemporaryFile() as stderr_stream,
+    ):
+        try:
+            process = subprocess.Popen(
+                challenge.materialize_command,
+                cwd=challenge_root,
+                env=environment,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+                start_new_session=os.name == "posix",
+            )
+        except OSError as error:
+            raise ChallengeMaterializationError(
+                "challenge materialization could not start\n"
+                f"command: {shlex.join(challenge.materialize_command)}\n"
+                "exit code: unavailable\n"
+                "stdout:\n<empty>\n"
+                f"stderr:\n{type(error).__name__}: {error}"
+            ) from error
+        try:
+            process.wait(
+                timeout=challenge.materialize_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
-            process.kill()
-        stdout, stderr = process.communicate()
-        raise _materialization_failure(
-            challenge,
-            exit_code=None,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=True,
-        ) from error
-    if process.returncode != 0:
-        raise _materialization_failure(
-            challenge,
-            exit_code=process.returncode,
-            stdout=stdout,
-            stderr=stderr,
-        )
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise _materialization_failure(
+                challenge,
+                exit_code=None,
+                stdout=_diagnostic_tail(stdout_stream),
+                stderr=_diagnostic_tail(stderr_stream),
+                timed_out=True,
+            ) from error
+        if process.returncode != 0:
+            raise _materialization_failure(
+                challenge,
+                exit_code=process.returncode,
+                stdout=_diagnostic_tail(stdout_stream),
+                stderr=_diagnostic_tail(stderr_stream),
+            )
 
 
 @contextmanager
 def _challenge_source(
     challenge: ChallengeDefinition,
 ) -> Iterator[Path]:
+    assert_isolated_workspace(
+        challenge.root,
+        forbidden_names=challenge.forbidden_names,
+    )
     if not challenge.materialize_command:
         yield challenge.root
         return
@@ -191,10 +214,6 @@ def _challenge_source(
         prefix="brunner-challenge-"
     ) as temporary:
         challenge_root = Path(temporary) / "challenge"
-        assert_isolated_workspace(
-            challenge.root,
-            forbidden_names=challenge.forbidden_names,
-        )
         _copy_challenge(challenge.root, challenge_root)
         _run_materializer(challenge, challenge_root)
         assert_isolated_workspace(

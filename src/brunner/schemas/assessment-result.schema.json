@@ -95,6 +95,79 @@
     },
     "error": {
       "type": "object"
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation",
+        "domain",
+        "reason",
+        "message",
+        "disposition",
+        "retryable",
+        "cleanup_required",
+        "occurred_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain": {
+          "enum": [
+            "assessment",
+            "backend",
+            "candidate",
+            "cleanup",
+            "configuration",
+            "evaluation",
+            "integrity",
+            "orchestrator",
+            "provider",
+            "reporting"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "disposition": {
+          "enum": [
+            "attention",
+            "candidate_failed",
+            "retry",
+            "terminal",
+            "wait"
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "cleanup_required": {
+          "type": "boolean"
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "error_type": {
+          "type": "string"
+        },
+        "resource": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        }
+      }
     }
   }
 }

@@ -28,7 +28,12 @@ from brunner.campaign import (
 from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
 from brunner.dashboard import write_campaign_dashboard
-from brunner.errors import ArtifactTransferError, BackendConnectivityError
+from brunner.errors import (
+    ArtifactTransferError,
+    BackendConnectivityError,
+    BackendRequestError,
+)
+from brunner.failure import failure_record
 from examples.text_benchmark.definition import build_definition
 
 
@@ -207,6 +212,32 @@ class AmbiguousSubmissionBackend(ImmediateBackend):
         return BackendSnapshot(phase="running")
 
 
+class PartialRequestSubmissionBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_calls = 0
+        self.remote_handle: BackendHandle | None = None
+
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        self.submit_calls += 1
+        if self.remote_handle is None:
+            self.remote_handle = super().submit(workload)
+            raise BackendRequestError(
+                "staging helper failed after PVC and Job creation"
+            )
+        return self.remote_handle
+
+
+class RejectedSubmissionBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_calls = 0
+
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        self.submit_calls += 1
+        raise BackendRequestError("workload violates cluster policy")
+
+
 class TransferRetryBackend(ImmediateBackend):
     def collect(
         self,
@@ -243,6 +274,44 @@ class PersistentTransferFailureBackend(ImmediateBackend):
 class EmptyLogBackend(ImmediateBackend):
     def logs(self, handle: BackendHandle) -> str:
         return ""
+
+
+class CleanupRequestFailureBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_attempts = 0
+
+    def cleanup(self, handle: BackendHandle) -> None:
+        self.cleanup_attempts += 1
+        if self.cleanup_attempts == 1:
+            raise BackendRequestError("PVC finalizer is still pending")
+        super().cleanup(handle)
+
+
+class ZeroCapacityBackend(ImmediateBackend):
+    def capacity(self) -> BackendCapacity:
+        return BackendCapacity(
+            limit=1,
+            running=0,
+            pending=1,
+            available=0,
+            details={"reason": "quota exhausted"},
+        )
+
+
+class UnexpectedInspectionBackend(ImmediateBackend):
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        raise RuntimeError("malformed backend response")
+
+
+class UnexpectedCapacityBackend(ImmediateBackend):
+    def capacity(self) -> BackendCapacity:
+        raise RuntimeError("malformed capacity response")
+
+
+class UnexpectedLogsBackend(ImmediateBackend):
+    def logs(self, handle: BackendHandle) -> str:
+        raise RuntimeError("malformed log response")
 
 
 class MixedStateBackend(ImmediateBackend):
@@ -650,6 +719,80 @@ def test_campaign_recovers_ambiguous_submission_by_adopting_workload(
     assert backend.submit_calls == 2
 
 
+def test_campaign_reconciles_partial_nonconnectivity_submission(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = PartialRequestSubmissionBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="partial-request-submit",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("run-a", "codex", "model-a"),
+                CampaignTrial("run-b", "codex", "model-a"),
+            ),
+            max_parallel=1,
+            submission_retry_seconds=0,
+            submission_max_attempts=2,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    waiting = runner.advance()
+    reconciled = runner.advance()
+
+    first = waiting["trials"][0]
+    assert first["phase"] == "submission_retry_wait"
+    assert first["failure"]["disposition"] == "retry"
+    assert waiting["trials"][1]["phase"] == "pending"
+    assert reconciled["trials"][0]["phase"] == "complete"
+    assert reconciled["trials"][1]["phase"] == "submitted"
+    assert backend.submit_calls == 3
+
+
+def test_campaign_bounds_deterministic_submission_retries(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = RejectedSubmissionBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="rejected-submit",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+            submission_retry_seconds=0,
+            submission_max_attempts=2,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    waiting = runner.advance()
+    failed = runner.advance()
+
+    assert waiting["trials"][0]["phase"] == "submission_retry_wait"
+    assert failed["status"] == "attention_required"
+    assert failed["trials"][0]["phase"] == "attention_required"
+    assert failed["trials"][0]["attempts"]["submission"] == 2
+    assert failed["trials"][0]["failure"]["cleanup_required"] is True
+    assert backend.submit_calls == 2
+
+
 def test_campaign_resumes_cleanup_after_connectivity_loss(
     tmp_path: Path,
     monkeypatch: Any,
@@ -689,6 +832,88 @@ def test_campaign_resumes_cleanup_after_connectivity_loss(
         if event["test_id"] == "cleanup-a"
         and event["type"] in {"trial_complete", "cleanup_complete"}
     ] == ["trial_complete"]
+
+
+def test_campaign_retries_nonconnectivity_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = CleanupRequestFailureBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="cleanup-request-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("cleanup-a", "codex", "model-a"),),
+            cleanup_retry_seconds=0,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    waiting = runner.advance()
+    completed = runner.advance()
+
+    entry = waiting["trials"][0]
+    assert waiting["status"] == "running"
+    assert waiting["has_attention"] is True
+    assert entry["phase"] == "cleanup_pending"
+    assert entry["failure"]["domain"] == "cleanup"
+    assert entry["failure"]["disposition"] == "retry"
+    assert completed["status"] == "complete"
+    assert backend.cleanup_attempts == 2
+
+
+def test_campaign_dashboard_failure_does_not_block_cleanup(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    monkeypatch.setattr(
+        "brunner.dashboard.write_campaign_dashboard",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("dashboard filesystem unavailable")
+        ),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ImmediateBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="dashboard-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    runner.advance()
+    completed = runner.advance()
+
+    assert completed["status"] == "complete"
+    assert completed["dashboard"]["status"] == "failed"
+    assert completed["dashboard"]["failure"]["domain"] == "reporting"
+    assert backend.cleaned == {"run-a"}
+    persisted = json.loads(runner.state_path.read_text())
+    assert persisted["status"] == "complete"
 
 
 def test_collection_connectivity_pause_does_not_consume_attempt(
@@ -978,6 +1203,101 @@ def test_required_assessment_failure_marks_campaign_trial_failed(
     assert entry["phase"] == "complete"
     assert entry["outcome"] == "failed"
     assert entry["evaluation"]["assessment_status"] == "failed"
+    assert entry["benchmark"]["succeeded"] is None
+    assert entry["failure_class"] == "infrastructure"
+    assert entry["failure"]["domain"] == "assessment"
+
+
+def test_evaluator_infrastructure_failure_is_not_a_benchmark_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="evaluation-infrastructure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    evaluator_failure = failure_record(
+        operation="evaluator_execution",
+        domain="evaluation",
+        reason="EvaluatorFailed",
+        message="evaluator image could not start",
+        disposition="attention",
+        retryable=False,
+    )
+    monkeypatch.setattr(
+        "brunner.campaign.evaluate_trial",
+        lambda *args, **kwargs: {
+            "status": "failed",
+            "assessment_status": "not_configured",
+            "required_assessments_complete": True,
+            "assessments": [],
+            "failure": evaluator_failure,
+        },
+    )
+
+    runner.advance()
+    completed = runner.advance()
+
+    entry = completed["trials"][0]
+    assert entry["phase"] == "complete"
+    assert entry["outcome"] == "failed"
+    assert entry["benchmark"]["succeeded"] is None
+    assert entry["failure_class"] == "infrastructure"
+    assert entry["failure"]["domain"] == "evaluation"
+
+
+def test_candidate_submission_failure_remains_a_benchmark_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="candidate-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    candidate_failure = failure_record(
+        operation="submission_validation",
+        domain="candidate",
+        reason="CandidateSubmissionInvalid",
+        message="submission manifest is invalid",
+        disposition="candidate_failed",
+        retryable=False,
+    )
+    monkeypatch.setattr(
+        "brunner.campaign.evaluate_trial",
+        lambda *args, **kwargs: {
+            "status": "failed",
+            "assessment_status": "not_configured",
+            "required_assessments_complete": True,
+            "assessments": [],
+            "failure": candidate_failure,
+        },
+    )
+
+    runner.advance()
+    completed = runner.advance()
+
+    entry = completed["trials"][0]
+    assert entry["benchmark"]["succeeded"] is False
+    assert entry["failure_class"] == "benchmark"
+    assert entry["failure"]["domain"] == "candidate"
 
 
 def test_campaign_appends_new_ids_without_invalidating_completed_work(
@@ -1081,6 +1401,216 @@ def test_campaign_rejects_only_conflicting_reuse_of_an_id(
 
     with pytest.raises(RuntimeError, match="identity changed"):
         conflicting.initialize()
+
+
+def test_unknown_persisted_phase_becomes_durable_attention(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="invalid-phase",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    state = runner.initialize()
+    state["trials"][0]["phase"] = "lost_between_dimensions"
+    runner.state_path.write_text(json.dumps(state))
+
+    reconciled = runner.advance()
+
+    entry = reconciled["trials"][0]
+    assert reconciled["status"] == "attention_required"
+    assert entry["phase"] == "attention_required"
+    assert entry["invalid_phase"] == "lost_between_dimensions"
+    assert entry["failure"]["reason"] == "InvalidCampaignPhase"
+
+
+def test_campaign_recovers_corrupt_primary_state_from_backup(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="state-backup",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        ImmediateBackend(),
+        workload_factory=_workload,
+    )
+    runner.initialize()
+    runner.state_path.write_text("{not-json")
+
+    recovered = runner.advance()
+
+    assert recovered["trials"][0]["phase"] == "submitted"
+    assert recovered["state_recovery"]["source"].endswith(
+        "campaign.json.bak"
+    )
+    assert any(
+        event["type"] == "campaign_state_recovered"
+        for event in recovered["events"]
+    )
+    assert json.loads(runner.state_path.read_text())["campaign_id"] == (
+        "state-backup"
+    )
+
+
+def test_zero_backend_capacity_is_visible_in_campaign_state(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ZeroCapacityBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="zero-capacity",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+
+    assert state["status"] == "running"
+    assert state["has_attention"] is True
+    assert state["scheduler_wait"]["kind"] == "backend_capacity"
+    assert state["backend_capacity"]["available"] == 0
+    assert backend.handles == {}
+
+
+def test_unexpected_backend_inspection_failure_is_durable(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="inspection-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        UnexpectedInspectionBackend(),
+        workload_factory=_workload,
+    )
+    runner.advance()
+
+    failed = runner.advance()
+
+    entry = failed["trials"][0]
+    assert failed["status"] == "attention_required"
+    assert entry["phase"] == "attention_required"
+    assert entry["failure"]["reason"] == (
+        "UnclassifiedBackendInspectionFailure"
+    )
+
+
+def test_unexpected_backend_capacity_failure_is_durable(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="capacity-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        UnexpectedCapacityBackend(),
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+
+    assert state["status"] == "running"
+    assert state["has_attention"] is True
+    assert state["failure"]["reason"] == (
+        "UnclassifiedBackendCapacityFailure"
+    )
+
+
+def test_workload_configuration_failure_is_durable(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+
+    def broken_workload(*args: object) -> WorkloadSpec:
+        raise ValueError("invalid campaign image selection")
+
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="workload-configuration",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        ImmediateBackend(),
+        workload_factory=broken_workload,
+    )
+
+    state = runner.advance()
+
+    entry = state["trials"][0]
+    assert state["status"] == "attention_required"
+    assert entry["failure"]["domain"] == "configuration"
+    assert entry["failure"]["reason"] == "WorkloadConfigurationFailed"
+
+
+def test_unexpected_backend_log_failure_does_not_block_collection(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="log-failure",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        ),
+        UnexpectedLogsBackend(),
+        workload_factory=_workload,
+    )
+    runner.advance()
+
+    completed = runner.advance()
+
+    entry = completed["trials"][0]
+    assert completed["status"] == "complete"
+    assert entry["outcome"] == "succeeded"
+    assert entry["log_warning"] == "malformed log response"
+    assert any(
+        failure["reason"] == "UnclassifiedBackendLogFailure"
+        for failure in entry["failures"]
+    )
 
 
 def test_duplicate_matching_ids_in_one_list_are_idempotent(

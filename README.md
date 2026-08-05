@@ -15,6 +15,10 @@ output contract, evaluator, optional reference bundle, artifact policy, and
 runtime defaults. `granular_benchmark` remains an independent historical
 benchmark; this repository does not modify or depend on it.
 
+See [`docs/failure-model.md`](docs/failure-model.md) for the normative failure
+taxonomy, resource-ownership rules, lifecycle operation matrix, and required
+fault-injection coverage.
+
 ## What Is Generic
 
 - Deterministic challenge staging and isolation checks
@@ -23,7 +27,7 @@ benchmark; this repository does not modify or depend on it.
 - Codex and Claude provider adapters
 - Durable retries, session resume, finalization, and timeout handling
 - Cross-provider token normalization and interval-based time accounting
-- Local, OCI-container, and Kubernetes execution backends
+- OCI-container and Kubernetes execution backends
 - Resumable checksum-verified artifact collection
 - Trusted host or evaluator-container execution
 - Packaged evidence-bound qualitative review contract and HTML report

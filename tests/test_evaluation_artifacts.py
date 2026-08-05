@@ -93,6 +93,127 @@ def test_evaluate_trial_uses_contract_validated_input(
     assert (trial / "evaluation/run-report.html").is_file()
 
 
+def test_invalid_submission_is_identified_as_candidate_failure(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("invalid-submission", "codex", "fake", None),
+    )
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assert result["status"] == "failed"
+    assert result["failure"]["domain"] == "candidate"
+    assert result["failure"]["reason"] == "CandidateSubmissionInvalid"
+
+
+def test_evaluator_failure_is_identified_as_trusted_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("evaluator-failure", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+    monkeypatch.setattr(
+        evaluation_module,
+        "_run_evaluator",
+        lambda *args, **kwargs: 7,
+    )
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assert result["status"] == "failed"
+    assert result["failure"]["domain"] == "evaluation"
+    assert result["failure"]["reason"] == "EvaluatorFailed"
+
+
+def test_report_failure_does_not_replace_evaluation_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("report-failure", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    monkeypatch.setattr(
+        "brunner.report.write_run_report",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("report volume is full")
+        ),
+    )
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assert result["status"] == "complete"
+    assert result["report"]["status"] == "failed"
+    assert result["report"]["failure"]["domain"] == "reporting"
+
+
+def test_report_metadata_persistence_failure_is_non_gating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("report-write-failure", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(ROOT / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
+    real_write = evaluation_module.write_json_atomic
+    writes = 0
+
+    def fail_final_write(path: Path, value: object) -> None:
+        nonlocal writes
+        if path == trial / "evaluation/results.json":
+            writes += 1
+            if writes == 3:
+                raise OSError("results volume became full during reporting")
+        real_write(path, value)
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "write_json_atomic",
+        fail_final_write,
+    )
+
+    result = evaluate_trial(definition, contract, trial)
+
+    assert result["status"] == "complete"
+    assert result["report"]["status"] == "complete"
+    assert writes == 3
+
+
 def test_reference_manifest_excludes_itself_and_detects_tampering(
     tmp_path: Path,
 ) -> None:

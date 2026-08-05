@@ -681,6 +681,9 @@ Kubernetes helper, Job, and PVC cleanup is synchronous. Brunner removes stale
 staging and artifact-reader pods by workload labels before reuse and does not
 mark a trial complete until deletions finish. If Kubernetes becomes unreachable
 during cleanup, the campaign remains in `cleanup_pending` and retries later.
+Other cleanup failures, including deletion timeouts and finalizers, also remain
+in `cleanup_pending` and retry after `cleanup_retry_seconds`. Cleanup failure
+does not replace an already established pipeline or benchmark result.
 
 Artifact-transfer interruptions retain verified partial files and retry after
 `collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
@@ -706,9 +709,12 @@ Campaigns bound the states a stuck backend can hide in:
 
 | Setting | Purpose | Default |
 | --- | --- | --- |
+| `submission_retry_seconds` | Delay before retrying an ambiguous or partially failed submission | 60 seconds |
+| `submission_max_attempts` | Bounds idempotent submission/adoption attempts | 3 |
 | `trial_timeout_seconds` | Flags a trial the backend still reports pending or running | Backend workload deadline plus `trial_timeout_margin_seconds` |
 | `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
 | `infrastructure_max_restarts` | Relaunches an interrupted backend workload against its existing persistent trial | 2 |
+| `cleanup_retry_seconds` | Delay before retrying failed backend cleanup | 60 seconds |
 | `max_pause_seconds` | Optional limit before backend disconnection requires manual attention | Unlimited |
 | `evaluation_timeout_seconds` | One budget shared by reference validation, the evaluator, and all assessments | Benchmark evaluation timeout |
 
@@ -756,6 +762,13 @@ success. Campaign entries report pipeline status, benchmark status, overall
 outcome, and failure class separately. If collection finds no terminal provider
 result, Brunner preserves the diagnostics but does not evaluate the incomplete
 workspace.
+
+Campaign and evaluation records use the failure contract in
+[`failure-model.md`](failure-model.md). Invalid candidate submissions use the
+`candidate` domain, while evaluator, reference, required assessment, reporting,
+and cleanup failures retain their trusted-infrastructure domains. A required
+reviewer outage therefore makes benchmark success indeterminate instead of
+recording a candidate failure.
 
 Provider retry and subscription-reset waits are absolute deadlines in the
 trial's `status.json`, so replacing a pod or restarting the agent does not

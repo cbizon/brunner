@@ -22,6 +22,7 @@ from referencing import Registry, Resource
 from brunner.contract import OutputContract
 from brunner.definition import AssessmentDefinition, BenchmarkDefinition
 from brunner.errors import AssessmentError, IntegrityError, ProviderSchemaError
+from brunner.failure import failure_from_exception
 from brunner.hashing import sha256_file, sha256_tree
 from brunner.io import load_json_object, write_json_atomic
 from brunner.providers import ProviderRunContext, get_provider
@@ -1547,6 +1548,16 @@ def run_assessment(
                 "message": str(error),
                 "traceback": str(traceback_path.relative_to(trial)),
             },
+            "failure": failure_from_exception(
+                error,
+                operation="qualitative_assessment",
+                domain="assessment",
+                reason="AssessmentFailed",
+                disposition="attention",
+                retryable=False,
+                resource="assessment_runtime",
+                details={"assessment_id": assessment.assessment_id},
+            ),
         }
         if usage is not None:
             result["usage"] = usage
@@ -1595,6 +1606,18 @@ def run_assessments(
         "required_assessments_complete": required_complete,
         "assessments": results,
     }
+    required_failure = next(
+        (
+            result.get("failure")
+            for result in results
+            if result["required"]
+            and result["status"] != "complete"
+            and isinstance(result.get("failure"), dict)
+        ),
+        None,
+    )
+    if required_failure is not None:
+        index["failure"] = required_failure
     if results:
         write_json_atomic(trial / "assessments/index.json", index)
     return index
