@@ -113,6 +113,16 @@ def write_campaign_dashboard(
         for trial in trials
         if trial.get("outcome")
     )
+    pipeline_statuses = Counter(
+        str(trial["pipeline"].get("status"))
+        for trial in trials
+        if isinstance(trial.get("pipeline"), dict)
+    )
+    benchmark_statuses = Counter(
+        str(trial["benchmark"].get("status"))
+        for trial in trials
+        if isinstance(trial.get("benchmark"), dict)
+    )
     cards = "".join(
         (
             '<div class="card">'
@@ -125,6 +135,8 @@ def write_campaign_dashboard(
     rows = []
     for trial in trials:
         evaluation = trial.get("evaluation", {})
+        pipeline = trial.get("pipeline", {})
+        benchmark = trial.get("benchmark", {})
         report = _relative_link(output, evaluation.get("report"))
         report_cell = (
             f'<a href="{html.escape(report)}">report</a>'
@@ -180,7 +192,10 @@ def write_campaign_dashboard(
             f"<td>{html.escape(str(trial.get('effort') or 'default'))}</td>"
             f"<td>{html.escape(str(trial.get('phase', '')))}</td>"
             f"<td>{html.escape(_elapsed(trial, dashboard_now))}</td>"
+            f"<td>{html.escape(str(pipeline.get('status') or ''))}</td>"
+            f"<td>{html.escape(str(benchmark.get('status') or ''))}</td>"
             f"<td>{html.escape(str(trial.get('outcome') or ''))}</td>"
+            f"<td>{html.escape(str(trial.get('failure_class') or ''))}</td>"
             f"<td>{html.escape(str(evaluation.get('assessment_status') or ''))}</td>"
             f"<td>{html.escape(review_rating)}</td>"
             f"<td>{html.escape(review_approach)}</td>"
@@ -240,11 +255,14 @@ a {{ color:var(--green); font-weight:bold; }}
 <h1>{html.escape(str(state.get("campaign_id", "campaign")))}</h1>
 <div class="status">{html.escape(str(state.get("status", "")))}</div>
 <p>{html.escape(str(state.get("benchmark_id", "")))} ·
-{len(trials)} trials · outcomes {html.escape(json.dumps(outcomes))}</p>
+{len(trials)} trials · pipelines {html.escape(json.dumps(pipeline_statuses))} ·
+benchmarks {html.escape(json.dumps(benchmark_statuses))} ·
+outcomes {html.escape(json.dumps(outcomes))}</p>
 <div class="cards">{cards}</div>
 <div class="table"><table>
 <thead><tr><th>Trial</th><th>Provider</th><th>Model</th><th>Effort</th>
-<th>Phase</th><th>Elapsed</th><th>Outcome</th><th>Assessment</th>
+<th>Phase</th><th>Elapsed</th><th>Pipeline</th><th>Benchmark</th>
+<th>Outcome</th><th>Failure class</th><th>Assessment</th>
 <th>Review</th><th>Approach</th><th>Tokens</th>
 <th>Wall s</th><th>Agent s</th><th>External wait s</th>
 <th>Subscription wait s</th><th>Node</th>

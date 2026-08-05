@@ -21,6 +21,10 @@ from brunner.contract import (
 from brunner.definition import BenchmarkDefinition, RuntimeDefaults
 from brunner.errors import ContractError
 from brunner.io import write_json_atomic
+from brunner.pipeline import (
+    PIPELINE_TERMINAL_STATUSES,
+    PROVIDER_FINAL_STATUSES,
+)
 from brunner.providers import (
     ProviderAdapter,
     ProviderRunContext,
@@ -40,10 +44,6 @@ from brunner.timing import (
 from brunner.usage import read_json_records
 
 
-PROVIDER_FINAL_STATUSES = frozenset({"complete", "partial", "failed"})
-PIPELINE_TERMINAL_STATUSES = frozenset(
-    {*PROVIDER_FINAL_STATUSES, "provider_error", "timeout"}
-)
 STREAM_DRAIN_SECONDS = 5.0
 STREAM_CLOSE_SECONDS = 2.0
 PROTECTED_CONTROL_PATHS = (

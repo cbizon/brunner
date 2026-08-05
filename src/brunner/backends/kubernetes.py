@@ -83,6 +83,16 @@ NON_RETRYABLE_CONTAINER_FAILURES = frozenset(
         "StartError",
     }
 )
+RETRYABLE_CONTAINER_FAILURES = frozenset(
+    {
+        "ContainerStatusUnknown",
+        "Evicted",
+        "NodeLost",
+        "OOMKilled",
+        "Shutdown",
+    }
+)
+TERMINATION_LOG_ENV = "BRUNNER_TERMINATION_LOG"
 
 
 class ReaderMountError(BackendRequestError):
@@ -254,6 +264,13 @@ def render_job(
         raise BackendRequestError(
             "Kubernetes workloads require an agent image"
         )
+    if (
+        TERMINATION_LOG_ENV in profile.nonsecret_environment
+        or TERMINATION_LOG_ENV in profile.secret_environment
+    ):
+        raise BackendRequestError(
+            f"{TERMINATION_LOG_ENV} is reserved by Brunner"
+        )
     environment = [
         {"name": key, "value": value}
         for key, value in sorted(profile.nonsecret_environment.items())
@@ -270,16 +287,34 @@ def render_job(
         }
         for name, reference in sorted(profile.secret_environment.items())
     )
+    environment.append(
+        {
+            "name": TERMINATION_LOG_ENV,
+            "value": "/dev/termination-log",
+        }
+    )
     resources: dict[str, dict[str, str]] = {}
-    values = {}
-    if workload.cpu:
-        values["cpu"] = workload.cpu
-    if workload.memory:
-        values["memory"] = workload.memory
+    requests = {}
+    limits = {}
+    cpu_request = workload.cpu_request or workload.cpu
+    memory_request = workload.memory_request or workload.memory
+    if cpu_request:
+        requests["cpu"] = cpu_request
+    if memory_request:
+        requests["memory"] = memory_request
+    cpu_limit = workload.cpu_limit or workload.cpu
+    memory_limit = workload.memory_limit or workload.memory
+    if cpu_limit:
+        limits["cpu"] = cpu_limit
+    if memory_limit:
+        limits["memory"] = memory_limit
     if workload.gpu:
-        values["nvidia.com/gpu"] = str(workload.gpu)
-    if values:
-        resources = {"requests": values, "limits": values}
+        requests["nvidia.com/gpu"] = str(workload.gpu)
+        limits["nvidia.com/gpu"] = str(workload.gpu)
+    if requests:
+        resources["requests"] = requests
+    if limits:
+        resources["limits"] = limits
     container: dict[str, Any] = {
         "name": "agent",
         "image": image,
@@ -510,11 +545,13 @@ class KubernetesBackend:
             )
         return json.loads(result.stdout)
 
-    def _warning_events(
+    def _events(
         self,
         name: str,
         uid: str | None,
-    ) -> tuple[str, ...]:
+        *,
+        required: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
         selectors = [f"involvedObject.name={name}"]
         if uid:
             selectors.append(f"involvedObject.uid={uid}")
@@ -530,14 +567,28 @@ class KubernetesBackend:
             check=False,
         )
         if result.returncode:
+            if required:
+                raise self._error(
+                    (
+                        "get",
+                        "events",
+                        "-n",
+                        self.profile.namespace,
+                        "--field-selector",
+                        ",".join(selectors),
+                    ),
+                    result.returncode,
+                    result.stdout.encode(),
+                    result.stderr.encode(),
+                )
             return ()
         try:
             events = json.loads(result.stdout).get("items", ())
         except (AttributeError, json.JSONDecodeError):
             return ()
-        warnings = []
+        normalized = []
         for event in events:
-            if not isinstance(event, dict) or event.get("type") != "Warning":
+            if not isinstance(event, dict):
                 continue
             series = event.get("series")
             if not isinstance(series, dict):
@@ -547,11 +598,6 @@ class KubernetesBackend:
                 metadata = {}
             reason = str(event.get("reason") or "").strip()
             message = str(event.get("message") or "").strip()
-            detail = ": ".join(
-                value for value in (reason, message) if value
-            )
-            if not detail:
-                continue
             timestamp = str(
                 event.get("eventTime")
                 or series.get("lastObservedTime")
@@ -559,8 +605,61 @@ class KubernetesBackend:
                 or metadata.get("creationTimestamp")
                 or ""
             )
-            warnings.append((timestamp, detail))
-        return tuple(detail for _, detail in sorted(warnings))
+            involved = event.get("involvedObject")
+            if not isinstance(involved, dict):
+                involved = {}
+            source = event.get("source")
+            if not isinstance(source, dict):
+                source = {}
+            normalized.append(
+                (
+                    timestamp,
+                    {
+                        "type": event.get("type"),
+                        "reason": reason or None,
+                        "message": message or None,
+                        "count": event.get("count"),
+                        "timestamp": timestamp or None,
+                        "first_timestamp": event.get("firstTimestamp"),
+                        "last_timestamp": event.get("lastTimestamp"),
+                        "reporting_component": event.get(
+                            "reportingComponent"
+                        ),
+                        "reporting_instance": event.get(
+                            "reportingInstance"
+                        ),
+                        "source_component": source.get("component"),
+                        "source_host": source.get("host"),
+                        "involved_kind": involved.get("kind"),
+                        "involved_name": involved.get("name"),
+                    },
+                )
+            )
+        return tuple(
+            value
+            for _, value in sorted(
+                normalized,
+                key=lambda item: item[0],
+            )
+        )
+
+    def _warning_events(
+        self,
+        name: str,
+        uid: str | None,
+    ) -> tuple[str, ...]:
+        warnings = []
+        for event in self._events(name, uid):
+            if event.get("type") != "Warning":
+                continue
+            detail = ": ".join(
+                str(value)
+                for value in (event.get("reason"), event.get("message"))
+                if value
+            )
+            if detail:
+                warnings.append(detail)
+        return tuple(warnings)
 
     def _wait_for_pod(self, name: str, timeout_seconds: float) -> None:
         result = self._run(
@@ -917,6 +1016,24 @@ class KubernetesBackend:
                     }
         return None
 
+    @staticmethod
+    def _brunner_pipeline(
+        terminated: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if terminated is None:
+            return None
+        message = terminated.get("message")
+        if not isinstance(message, str) or not message.strip():
+            return None
+        try:
+            value = json.loads(message)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        summary = value.get("brunner_pipeline")
+        return summary if isinstance(summary, dict) else None
+
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
         claim_name = str(handle.metadata["claim_name"])
         pvc = self._get("pvc", claim_name, check=False)
@@ -947,6 +1064,7 @@ class KubernetesBackend:
             )
         pod = self._pod_for_handle(handle)
         terminated = self._terminated_container(pod)
+        brunner_pipeline = self._brunner_pipeline(terminated)
         job_status = job.get("status", {})
         conditions = {
             item.get("type"): item
@@ -962,12 +1080,41 @@ class KubernetesBackend:
             phase = "pending"
         reason = None
         message = None
-        exit_code = None
-        if terminated and int(terminated.get("exitCode", 0)) != 0:
+        exit_code = terminated.get("exitCode") if terminated else None
+        termination_reason = terminated.get("reason") if terminated else None
+        termination_signal = (
+            int(terminated.get("signal") or 0) if terminated else 0
+        )
+        brunner_incomplete = bool(
+            brunner_pipeline
+            and brunner_pipeline.get("infrastructure_failure") is True
+        )
+        container_failed = bool(
+            terminated
+            and (
+                int(terminated.get("exitCode") or 0) != 0
+                or termination_signal != 0
+                or termination_reason not in {None, "Completed"}
+                or brunner_incomplete
+            )
+        )
+        if container_failed:
             phase = "failed"
-            reason = terminated.get("reason") or "ContainerFailed"
-            message = terminated.get("message")
-            exit_code = terminated.get("exitCode")
+            if termination_reason in RETRYABLE_CONTAINER_FAILURES:
+                reason = termination_reason
+            elif brunner_incomplete:
+                reason = (
+                    brunner_pipeline.get("infrastructure_reason")
+                    or "AgentPipelineIncomplete"
+                )
+                message = (
+                    brunner_pipeline.get("failure")
+                    or "Brunner agent did not produce a terminal "
+                    "provider result"
+                )
+            else:
+                reason = termination_reason or "ContainerFailed"
+                message = terminated.get("message")
             container_name = terminated.get("container")
             if container_name:
                 warnings.append(
@@ -982,20 +1129,13 @@ class KubernetesBackend:
         failed_condition = conditions.get("Failed", {})
         job_failure_reason = failed_condition.get("reason")
         pod_failure_reason = pod_status.get("reason")
-        retryable_infrastructure = (
-            phase == "failed"
-            and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
-            and reason not in NON_RETRYABLE_CONTAINER_FAILURES
-            and (
+        retryable_evidence = (
+            brunner_pipeline.get("retryable_infrastructure") is True
+            if brunner_incomplete
+            else (
                 exit_code not in {None, 0}
-                or reason
-                in {
-                    "ContainerStatusUnknown",
-                    "Evicted",
-                    "NodeLost",
-                    "OOMKilled",
-                    "Shutdown",
-                }
+                or termination_signal != 0
+                or reason in RETRYABLE_CONTAINER_FAILURES
                 or pod_failure_reason
                 in {
                     "Evicted",
@@ -1005,6 +1145,58 @@ class KubernetesBackend:
                 or job_failure_reason == "BackoffLimitExceeded"
             )
         )
+        retryable_infrastructure = bool(
+            phase == "failed"
+            and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
+            and reason not in NON_RETRYABLE_CONTAINER_FAILURES
+            and retryable_evidence
+        )
+        kubernetes_events: dict[str, list[dict[str, Any]]] = {
+            "job": [],
+            "pod": [],
+        }
+        if phase in {"succeeded", "failed"}:
+            job_metadata = job.get("metadata", {})
+            pod_metadata = pod.get("metadata", {}) if pod else {}
+            kubernetes_events["job"] = list(
+                self._events(
+                    str(job_metadata.get("name") or handle.native_id),
+                    (
+                        str(job_metadata["uid"])
+                        if job_metadata.get("uid") is not None
+                        else None
+                    ),
+                    required=True,
+                )
+            )
+            if pod:
+                kubernetes_events["pod"] = list(
+                    self._events(
+                        str(pod_metadata.get("name") or ""),
+                        (
+                            str(pod_metadata["uid"])
+                            if pod_metadata.get("uid") is not None
+                            else None
+                        ),
+                        required=True,
+                    )
+                )
+            for event in (
+                *kubernetes_events["job"],
+                *kubernetes_events["pod"],
+            ):
+                if event.get("type") != "Warning":
+                    continue
+                detail = ": ".join(
+                    str(value)
+                    for value in (
+                        event.get("reason"),
+                        event.get("message"),
+                    )
+                    if value
+                )
+                if detail and detail not in warnings:
+                    warnings.append(detail)
         return BackendSnapshot(
             phase=phase,
             reason=reason,
@@ -1023,6 +1215,8 @@ class KubernetesBackend:
                 "job_failure_reason": job_failure_reason,
                 "pod_failure_reason": pod_failure_reason,
                 "retryable_infrastructure": retryable_infrastructure,
+                "brunner_pipeline": brunner_pipeline,
+                "kubernetes_events": kubernetes_events,
             },
         )
 

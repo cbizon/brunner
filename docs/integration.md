@@ -573,6 +573,8 @@ def build_campaign(definition, contract):
             ),
         ),
         backend_image="my-benchmark-agent:latest",
+        cpu_limit="8",
+        memory_limit="32Gi",
         max_parallel=2,
         included_artifact_groups=frozenset({"debug"}),
         collection_retry_seconds=60,
@@ -628,6 +630,30 @@ artifact-reader images must contain Brunner; the agent image also needs the
 selected provider CLI. The benchmark package, evaluator, and references are
 not required in the agent image.
 
+Kubernetes workload requests and limits are independent. Set
+`cpu_request`/`memory_request` to the scheduler reservation and
+`cpu_limit`/`memory_limit` to the permitted burst ceiling. Omit a limit when
+the namespace policy should provide it or when no hard cap is desired. Brunner
+does not copy requests into limits.
+
+```python
+plan = CampaignPlan(
+    ...,
+    cpu_request="2",
+    cpu_limit="8",
+    memory_request="8Gi",
+    memory_limit="32Gi",
+)
+```
+
+`WorkloadSpec.cpu` and `WorkloadSpec.memory` remain compatibility shorthands
+that set both Kubernetes request and limit when no explicit side is supplied.
+Either side can be overridden incrementally, so existing code can add only
+`cpu_limit` and `memory_limit` to become burstable. New benchmark code should
+use the explicit request and limit fields. For OCI execution, explicit
+`cpu_limit` and `memory_limit` take precedence; request fields have no effect
+because an OCI runtime has no scheduler reservation.
+
 Campaign trials do not accept environment-variable names or values. Provider
 credentials and deployment networking belong to the backend configuration:
 
@@ -660,9 +686,12 @@ Only completed backend collection calls and non-connectivity collection
 failures consume that attempt limit. Orchestrator interruption and backend
 connectivity pauses leave the in-progress collection attempt uncharged.
 An empty remote log response does not overwrite a previously recovered
-workload log. Kubernetes snapshots include relevant warning events for
-pending PVCs and artifact-reader mount failures, and the campaign dashboard
-shows those warnings with live elapsed time.
+workload log. Terminal Kubernetes snapshots preserve structured Job and Pod
+events before cleanup. They also include relevant warning events for pending
+PVCs and artifact-reader mount failures, and the campaign dashboard shows
+those warnings with live elapsed time. The orchestrator's Kubernetes identity
+must be allowed to read Events. A terminal event-read failure stops
+reconciliation before cleanup rather than silently discarding the diagnostics.
 
 `RuntimeDefaults.timeout_seconds` is the agent's hard deadline.
 `backend_shutdown_grace_seconds` is added only to the enclosing backend
@@ -711,7 +740,20 @@ Remote backends invoke `python -m brunner.agent_cli` inside the agent
 container. The module reads only staged trial metadata and does not import
 benchmark code; it is intentionally not installed as a public console command.
 It handles `SIGTERM` and `SIGINT` as graceful interruption requests, terminating
-the active provider process group and persisting resumable state before exit.
+the active provider process group, recording the signal, persisting resumable
+state, and exiting nonzero. Kubernetes Jobs set
+`BRUNNER_TERMINATION_LOG=/dev/termination-log`; the CLI writes a compact
+pipeline summary there so Job inspection can distinguish a terminal provider
+result from interruption or missing output even when Kubernetes reports an
+inconsistent zero exit code.
+
+An agent exit code of zero means that a current terminal provider result exists
+and trusted evaluation may run. It is pipeline completion, not benchmark
+success. Campaign entries report pipeline status, benchmark status, overall
+outcome, and failure class separately. If collection finds no terminal provider
+result, Brunner preserves the diagnostics but does not evaluate the incomplete
+workspace.
+
 Provider retry and subscription-reset waits are absolute deadlines in the
 trial's `status.json`, so replacing a pod or restarting the agent does not
 bypass or restart an existing wait.
