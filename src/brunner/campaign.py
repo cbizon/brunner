@@ -109,6 +109,8 @@ class CampaignPlan:
     cpu_limit: str | None = None
     memory_request: str | None = None
     memory_limit: str | None = None
+    ephemeral_storage_request: str | None = None
+    ephemeral_storage_limit: str | None = None
     included_artifact_groups: frozenset[str] = frozenset()
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
@@ -130,6 +132,8 @@ class CampaignPlan:
             ("cpu_limit", self.cpu_limit),
             ("memory_request", self.memory_request),
             ("memory_limit", self.memory_limit),
+            ("ephemeral_storage_request", self.ephemeral_storage_request),
+            ("ephemeral_storage_limit", self.ephemeral_storage_limit),
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"campaign {name} cannot be empty")
@@ -190,6 +194,8 @@ class CampaignPlan:
             "cpu_limit": self.cpu_limit,
             "memory_request": self.memory_request,
             "memory_limit": self.memory_limit,
+            "ephemeral_storage_request": self.ephemeral_storage_request,
+            "ephemeral_storage_limit": self.ephemeral_storage_limit,
             "included_artifact_groups": sorted(
                 self.included_artifact_groups
             ),
@@ -237,6 +243,8 @@ def default_workload_factory(
         cpu_limit=plan.cpu_limit,
         memory_request=plan.memory_request,
         memory_limit=plan.memory_limit,
+        ephemeral_storage_request=plan.ephemeral_storage_request,
+        ephemeral_storage_limit=plan.ephemeral_storage_limit,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
 

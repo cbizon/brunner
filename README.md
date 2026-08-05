@@ -32,7 +32,7 @@ benchmark; this repository does not modify or depend on it.
 - Reference bundle manifests and integrity checks
 - Append-only campaign task lists with caller-owned trial IDs
 - Campaign capacity control, recovery, and static dashboards
-- Independent Kubernetes resource requests and burst limits
+- Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
 
 ## Benchmark Slots
 

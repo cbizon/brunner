@@ -59,6 +59,8 @@ class WorkloadSpec:
     cpu_limit: str | None = None
     memory_request: str | None = None
     memory_limit: str | None = None
+    ephemeral_storage_request: str | None = None
+    ephemeral_storage_limit: str | None = None
 
     def validate(self) -> None:
         if not self.workload_id.strip():
@@ -74,10 +76,13 @@ class WorkloadSpec:
         for name, value in (
             ("cpu", self.cpu),
             ("memory", self.memory),
+            ("storage", self.storage),
             ("cpu_request", self.cpu_request),
             ("cpu_limit", self.cpu_limit),
             ("memory_request", self.memory_request),
             ("memory_limit", self.memory_limit),
+            ("ephemeral_storage_request", self.ephemeral_storage_request),
+            ("ephemeral_storage_limit", self.ephemeral_storage_limit),
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"workload {name} cannot be empty")
