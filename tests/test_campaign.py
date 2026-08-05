@@ -57,13 +57,26 @@ class ImmediateBackend:
                 }
             )
         )
+        final_response = {
+            "status": "complete",
+            "submission_manifest": "submission/manifest.json",
+            "completed_units": ["uppercase"],
+            "limitations": [],
+        }
         (submission / "run-status.json").write_text(
+            json.dumps(final_response)
+        )
+        (workload.trial / "status.json").write_text(
             json.dumps(
                 {
                     "status": "complete",
-                    "submission_manifest": "submission/manifest.json",
-                    "completed_units": ["uppercase"],
-                    "limitations": [],
+                    "final_response": final_response,
+                    "attempts": [
+                        {
+                            "status": "complete",
+                            "terminal_result_seen": True,
+                        }
+                    ],
                 }
             )
         )
@@ -287,6 +300,53 @@ class RetryableInfrastructureBackend(ImmediateBackend):
         )
 
 
+class InterruptedInfrastructureBackend(RetryableInfrastructureBackend):
+    def __init__(self) -> None:
+        super().__init__(always_fail=True)
+
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        handle = super().submit(workload)
+        (workload.trial / "status.json").write_text(
+            json.dumps(
+                {
+                    "status": "interrupted",
+                    "attempts": [
+                        {
+                            "status": "interrupted",
+                            "terminal_result_seen": False,
+                            "forced_termination_reason": "stop_requested",
+                        }
+                    ],
+                    "interruption": {
+                        "signal": 15,
+                        "signal_name": "SIGTERM",
+                    },
+                }
+            )
+        )
+        return handle
+
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        return BackendSnapshot(
+            phase="failed",
+            reason="AgentInterrupted",
+            exit_code=143,
+            details={
+                "retryable_infrastructure": True,
+                "brunner_pipeline": {
+                    "status": "interrupted",
+                    "complete": False,
+                    "provider_result_present": False,
+                    "infrastructure_failure": True,
+                    "infrastructure_reason": "AgentInterrupted",
+                    "retryable_infrastructure": True,
+                    "signal": 15,
+                    "signal_name": "SIGTERM",
+                },
+            },
+        )
+
+
 class HostProcessBackend(ImmediateBackend):
     agent_isolation = "host"
 
@@ -437,7 +497,11 @@ def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
     assert len(backend.cleaned) == 2
     dashboard = plan.root / "index.html"
     assert dashboard.is_file()
-    assert "model-a" in dashboard.read_text()
+    rendered = dashboard.read_text()
+    assert "model-a" in rendered
+    assert "<th>Pipeline</th><th>Benchmark</th>" in rendered
+    assert completed["trials"][0]["pipeline"]["status"] == "complete"
+    assert completed["trials"][0]["benchmark"]["succeeded"] is True
 
 
 def test_campaign_materializes_before_backend_submission(
@@ -1076,6 +1140,33 @@ def test_campaign_backend_deadline_includes_shutdown_grace(
     )
 
 
+def test_default_workload_factory_preserves_burst_resources(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    trial = CampaignTrial("burstable", "codex", "model-a")
+    workload = default_workload_factory(
+        tmp_path,
+        trial,
+        CampaignPlan(
+            campaign_id="burstable",
+            root=tmp_path / "campaign",
+            trials=(trial,),
+            cpu_request="2",
+            cpu_limit="8",
+            memory_request="8Gi",
+            memory_limit="32Gi",
+        ),
+        definition,
+        "kubernetes",
+    )
+
+    assert workload.cpu_request == "2"
+    assert workload.cpu_limit == "8"
+    assert workload.memory_request == "8Gi"
+    assert workload.memory_limit == "32Gi"
+
+
 def test_campaign_recovers_interrupted_collection(
     tmp_path: Path,
 ) -> None:
@@ -1355,6 +1446,9 @@ def test_campaign_restarts_retryable_infrastructure_failure(
     assert restarted["trials"][0]["phase"] == "submitted"
     assert restarted["trials"][0]["handle"]["native_id"] == "restart-a-r1"
     assert restarted["trials"][0]["attempts"]["infrastructure"] == 1
+    retry = restarted["trials"][0]["infrastructure_retries"][0]
+    assert retry["generation"] == 1
+    assert retry["previous_snapshot"]["reason"] == "Evicted"
     assert backend.restart_calls == 1
     assert completed["status"] == "complete"
     assert completed["trials"][0]["outcome"] == "succeeded"
@@ -1387,6 +1481,57 @@ def test_campaign_stops_restarting_after_infrastructure_limit(
     assert completed["status"] == "complete"
     assert completed["trials"][0]["outcome"] == "failed"
     assert completed["trials"][0]["attempts"]["infrastructure"] == 1
+
+
+def test_campaign_does_not_evaluate_interrupted_infrastructure_run(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = InterruptedInfrastructureBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="interrupted-limit",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("interrupted-a", "codex", "model-a"),
+            ),
+            infrastructure_max_restarts=1,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+    monkeypatch.setattr(
+        "brunner.campaign.evaluate_trial",
+        lambda *args, **kwargs: pytest.fail(
+            "interrupted agent output must not be evaluated"
+        ),
+    )
+
+    runner.advance()
+    restarted = runner.advance()
+    completed = runner.advance()
+
+    assert restarted["trials"][0]["attempts"]["infrastructure"] == 1
+    entry = completed["trials"][0]
+    assert entry["phase"] == "complete"
+    assert entry["outcome"] == "failed"
+    assert entry["failure_class"] == "infrastructure"
+    assert entry["pipeline"]["status"] == "interrupted"
+    assert entry["pipeline"]["signal_name"] == "SIGTERM"
+    assert entry["benchmark"] == {
+        "status": "not_run",
+        "succeeded": None,
+        "reason": "AgentInterrupted",
+    }
+    assert entry["evaluation"]["status"] == "not_run"
+    assert any(
+        event["type"] == "evaluation_skipped"
+        for event in completed["events"]
+    )
 
 
 def test_campaign_gives_up_after_prolonged_connectivity_loss(

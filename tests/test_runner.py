@@ -1840,6 +1840,8 @@ def test_agent_cli_handles_sigterm_as_graceful_interruption(
         for part in (source_root, environment.get("PYTHONPATH"))
         if part
     )
+    termination_log = tmp_path / "termination.log"
+    environment["BRUNNER_TERMINATION_LOG"] = str(termination_log)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -1880,11 +1882,21 @@ def test_agent_cli_handles_sigterm_as_graceful_interruption(
             process.kill()
             process.wait(timeout=5)
 
-    assert process.returncode == 0, stderr
+    assert process.returncode == 128 + signal.SIGTERM, stderr
     state = json.loads(status_path.read_text())
     assert json.loads(stdout)["status"] == "interrupted"
     assert state["status"] == "interrupted"
+    assert state["interruption"]["signal"] == signal.SIGTERM
+    assert state["interruption"]["signal_name"] == "SIGTERM"
     assert state["attempts"][-1]["provider_started"] is True
     assert state["attempts"][-1]["forced_termination_reason"] == (
         "stop_requested"
     )
+    termination = json.loads(termination_log.read_text())[
+        "brunner_pipeline"
+    ]
+    assert termination["status"] == "interrupted"
+    assert termination["provider_result_present"] is False
+    assert termination["retryable_infrastructure"] is True
+    assert termination["signal"] == signal.SIGTERM
+    assert termination["process_exit_code"] == 128 + signal.SIGTERM

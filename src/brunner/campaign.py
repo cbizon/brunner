@@ -29,6 +29,7 @@ from brunner.errors import (
 )
 from brunner.evaluation import evaluate_trial
 from brunner.io import write_json_atomic
+from brunner.pipeline import summarize_pipeline_state
 from brunner.trial import TrialIdentity, create_trial, load_trial_identity
 
 
@@ -104,6 +105,10 @@ class CampaignPlan:
     max_parallel: int = 1
     backend_image: str | None = None
     provider_executable: str | None = None
+    cpu_request: str | None = None
+    cpu_limit: str | None = None
+    memory_request: str | None = None
+    memory_limit: str | None = None
     included_artifact_groups: frozenset[str] = frozenset()
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
@@ -120,6 +125,14 @@ class CampaignPlan:
             raise ValueError("campaign must contain at least one trial")
         if self.max_parallel < 1:
             raise ValueError("campaign max_parallel must be positive")
+        for name, value in (
+            ("cpu_request", self.cpu_request),
+            ("cpu_limit", self.cpu_limit),
+            ("memory_request", self.memory_request),
+            ("memory_limit", self.memory_limit),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"campaign {name} cannot be empty")
         if self.collection_retry_seconds < 0:
             raise ValueError(
                 "campaign collection_retry_seconds must not be negative"
@@ -173,6 +186,10 @@ class CampaignPlan:
             "max_parallel": self.max_parallel,
             "backend_image": self.backend_image,
             "provider_executable": self.provider_executable,
+            "cpu_request": self.cpu_request,
+            "cpu_limit": self.cpu_limit,
+            "memory_request": self.memory_request,
+            "memory_limit": self.memory_limit,
             "included_artifact_groups": sorted(
                 self.included_artifact_groups
             ),
@@ -216,6 +233,10 @@ def default_workload_factory(
             + definition.runtime.backend_shutdown_grace_seconds
         ),
         image=plan.backend_image,
+        cpu_request=plan.cpu_request,
+        cpu_limit=plan.cpu_limit,
+        memory_request=plan.memory_request,
+        memory_limit=plan.memory_limit,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
 
@@ -687,18 +708,39 @@ class CampaignRunner:
             self.backend.name,
         )
         resuming = entry["phase"] == "infrastructure_retrying"
+        retry_history = entry.setdefault("infrastructure_retries", [])
         if resuming:
             generation = int(entry["attempts"]["infrastructure"])
+            retry_record = next(
+                (
+                    item
+                    for item in retry_history
+                    if isinstance(item, dict)
+                    and item.get("generation") == generation
+                ),
+                None,
+            )
+            if retry_record is None:
+                current = entry.get("infrastructure_retry")
+                retry_record = (
+                    current
+                    if isinstance(current, dict)
+                    else {"generation": generation}
+                )
+                retry_history.append(retry_record)
+            entry["infrastructure_retry"] = retry_record
         else:
             entry["attempts"]["infrastructure"] += 1
             generation = int(entry["attempts"]["infrastructure"])
             entry["phase"] = "infrastructure_retrying"
-            entry["infrastructure_retry"] = {
+            retry_record = {
                 "generation": generation,
                 "started_at": _now(),
                 "previous_handle": handle.to_dict(),
                 "previous_snapshot": entry.get("backend_snapshot"),
             }
+            retry_history.append(retry_record)
+            entry["infrastructure_retry"] = retry_record
             self._event(
                 state,
                 "infrastructure_retry_started",
@@ -713,7 +755,7 @@ class CampaignRunner:
         except BackendError as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
-            entry["infrastructure_retry"]["error"] = str(error)
+            retry_record["error"] = str(error)
             self._event(
                 state,
                 "infrastructure_retry_failed",
@@ -731,8 +773,13 @@ class CampaignRunner:
             else _now()
         )
         entry["backend_workload_live"] = True
-        entry["infrastructure_retry"]["completed_at"] = _now()
-        entry["infrastructure_retry"]["handle"] = restarted.to_dict()
+        retry_record["completed_at"] = _now()
+        retry_record["handle"] = restarted.to_dict()
+        entry.pop("pipeline", None)
+        entry.pop("benchmark", None)
+        entry.pop("evaluation", None)
+        entry["outcome"] = None
+        entry.pop("failure_class", None)
         entry.pop("error", None)
         self._event(
             state,
@@ -888,6 +935,58 @@ class CampaignRunner:
             )
             self._save(state)
             return
+        runner_state = _load_optional_object(destination / "status.json")
+        pipeline = summarize_pipeline_state(runner_state)
+        entry["pipeline"] = pipeline
+        usage = _load_optional_object(destination / "usage/usage.json")
+        timing = _load_optional_object(
+            destination / "timing/accounting.json"
+        )
+        if usage is not None:
+            entry["usage"] = {
+                key: usage.get(key)
+                for key in (
+                    "logical_input_tokens",
+                    "uncached_input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "total_tokens",
+                )
+            }
+        if timing is not None and isinstance(timing.get("summary"), dict):
+            entry["timing"] = dict(timing["summary"])
+        if pipeline["provider_result_present"] is not True:
+            reason = str(
+                pipeline.get("infrastructure_reason")
+                or "AgentPipelineIncomplete"
+            )
+            entry["evaluation"] = {
+                "status": "not_run",
+                "assessment_status": "not_run",
+                "required_assessments_complete": False,
+                "assessments": [],
+                "reason": reason,
+            }
+            entry["benchmark"] = {
+                "status": "not_run",
+                "succeeded": None,
+                "reason": reason,
+            }
+            entry["outcome"] = "failed"
+            entry["failure_class"] = "infrastructure"
+            self._event(
+                state,
+                "evaluation_skipped",
+                (
+                    "trusted evaluation skipped because the agent pipeline "
+                    f"did not produce a terminal provider result: {reason}"
+                ),
+                test_id=entry["test_id"],
+            )
+            self._cleanup_entry(state, entry, handle)
+            return
         entry["phase"] = "evaluating"
         self._save(state)
         try:
@@ -913,25 +1012,6 @@ class CampaignRunner:
             )
             self._save(state)
             return
-        usage = _load_optional_object(destination / "usage/usage.json")
-        timing = _load_optional_object(
-            destination / "timing/accounting.json"
-        )
-        if usage is not None:
-            entry["usage"] = {
-                key: usage.get(key)
-                for key in (
-                    "logical_input_tokens",
-                    "uncached_input_tokens",
-                    "cache_read_input_tokens",
-                    "cache_write_input_tokens",
-                    "output_tokens",
-                    "reasoning_output_tokens",
-                    "total_tokens",
-                )
-            }
-        if timing is not None and isinstance(timing.get("summary"), dict):
-            entry["timing"] = dict(timing["summary"])
         entry["evaluation"] = {
             "status": evaluation["status"],
             "assessment_status": evaluation["assessment_status"],
@@ -950,13 +1030,25 @@ class CampaignRunner:
             ),
         }
         entry.pop("evaluation_error", None)
-        entry["outcome"] = (
-            "succeeded"
-            if backend_phase == "succeeded"
+        benchmark_succeeded = (
+            backend_phase == "succeeded"
             and evaluation["status"] == "complete"
             and evaluation["required_assessments_complete"]
+        )
+        entry["benchmark"] = {
+            "status": evaluation["status"],
+            "succeeded": benchmark_succeeded,
+            "assessment_status": evaluation["assessment_status"],
+        }
+        entry["outcome"] = (
+            "succeeded"
+            if benchmark_succeeded
             else "failed"
         )
+        if benchmark_succeeded:
+            entry.pop("failure_class", None)
+        else:
+            entry["failure_class"] = "benchmark"
         self._cleanup_entry(state, entry, handle)
 
     def advance(self) -> dict[str, Any]:
@@ -1090,6 +1182,9 @@ class CampaignRunner:
                 )
                 continue
             entry["backend_snapshot"] = snapshot.to_dict()
+            snapshot_pipeline = snapshot.details.get("brunner_pipeline")
+            if isinstance(snapshot_pipeline, dict):
+                entry["pipeline"] = snapshot_pipeline
             entry["backend_workload_live"] = snapshot.phase in {
                 "pending",
                 "running",

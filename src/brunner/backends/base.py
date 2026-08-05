@@ -55,6 +55,10 @@ class WorkloadSpec:
     gpu: int = 0
     storage: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    cpu_request: str | None = None
+    cpu_limit: str | None = None
+    memory_request: str | None = None
+    memory_limit: str | None = None
 
     def validate(self) -> None:
         if not self.workload_id.strip():
@@ -67,6 +71,16 @@ class WorkloadSpec:
             raise ValueError("workload timeout must be positive")
         if self.gpu < 0:
             raise ValueError("workload gpu count cannot be negative")
+        for name, value in (
+            ("cpu", self.cpu),
+            ("memory", self.memory),
+            ("cpu_request", self.cpu_request),
+            ("cpu_limit", self.cpu_limit),
+            ("memory_request", self.memory_request),
+            ("memory_limit", self.memory_limit),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"workload {name} cannot be empty")
 
 
 @dataclass(frozen=True)

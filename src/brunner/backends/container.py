@@ -186,10 +186,12 @@ class ContainerBackend:
             arguments.extend(("--env", f"{key}={value}"))
         for key in sorted(self.inherited_environment):
             arguments.extend(("--env", key))
-        if workload.cpu:
-            arguments.extend(("--cpus", workload.cpu))
-        if workload.memory:
-            arguments.extend(("--memory", workload.memory))
+        cpu_limit = workload.cpu_limit or workload.cpu
+        memory_limit = workload.memory_limit or workload.memory
+        if cpu_limit:
+            arguments.extend(("--cpus", cpu_limit))
+        if memory_limit:
+            arguments.extend(("--memory", memory_limit))
         if workload.gpu:
             arguments.extend(("--gpus", str(workload.gpu)))
         arguments.extend(

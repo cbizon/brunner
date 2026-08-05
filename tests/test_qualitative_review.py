@@ -207,13 +207,26 @@ def _write_valid_submission(trial: Path) -> None:
             }
         )
     )
+    final_response = {
+        "status": "complete",
+        "submission_manifest": "submission/manifest.json",
+        "completed_units": ["uppercase"],
+        "limitations": [],
+    }
     (submission / "run-status.json").write_text(
+        json.dumps(final_response)
+    )
+    (trial / "status.json").write_text(
         json.dumps(
             {
                 "status": "complete",
-                "submission_manifest": "submission/manifest.json",
-                "completed_units": ["uppercase"],
-                "limitations": [],
+                "final_response": final_response,
+                "attempts": [
+                    {
+                        "status": "complete",
+                        "terminal_result_seen": True,
+                    }
+                ],
             }
         )
     )

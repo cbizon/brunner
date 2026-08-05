@@ -304,8 +304,14 @@ delay.
 The remote agent CLI converts `SIGTERM` and `SIGINT` into the runner's stop
 event. The active provider process group is terminated, the attempt and
 `interrupted` state are persisted, and a later backend restart resumes from
-that state. A signal received during retry waiting preserves the absolute retry
-boundary.
+that state. The CLI records the actual signal and exits with the conventional
+`128 + signal` status instead of converting interruption into process success.
+A signal received during retry waiting preserves the absolute retry boundary.
+
+Agent process exit zero means only that Brunner has a current terminal provider
+result that can be evaluated. It does not mean the candidate passed the
+benchmark. Timeout, provider failure without a terminal result, interruption,
+and other incomplete pipeline states exit nonzero.
 
 Foreground tool intervals come from provider lifecycle events. The remainder
 of an active provider attempt is `agent_active`, which includes model/API
@@ -344,31 +350,55 @@ artifacts. Container and Kubernetes resource names include a digest of the
 caller-owned workload identity and trial path, preventing normalization or
 truncation collisions.
 
-Kubernetes distinguishes connectivity failures from rejected requests and
-workload failures. It reports pending PVCs, inspects terminated init/main
-containers, preserves previously recovered workload logs, and includes
-Kubernetes warning events for pending storage and failed artifact readers. It
-retries artifact readers, excludes failed reader nodes when rescheduling,
-resumes partial files by byte offset, and verifies every SHA-256. Before helper
-creation and final cleanup, Brunner finds stale stager and reader pods by
-workload/role labels and waits for their deletion. Final cleanup likewise waits
-for Job and eligible PVC deletion; connectivity loss leaves campaign cleanup
-pending rather than silently leaking resources. A failed workload's PVC is
-retained until artifact collection succeeds.
+`WorkloadSpec` carries independent CPU and memory request and limit fields.
+Kubernetes renders them independently, allowing a low scheduler reservation
+and a higher burst ceiling instead of forcing Guaranteed QoS by setting
+requests equal to limits. Legacy `cpu` and `memory` values are Kubernetes
+request-and-limit shorthands when neither explicit side overrides them, which
+preserves existing callers. OCI runtimes have no scheduler-request concept, so
+the container backend applies only explicit limits or the legacy values as
+limits. GPU counts remain equal requests and limits because Kubernetes
+extended resources are not overcommitted.
 
-Failed Kubernetes Jobs whose agent process was interrupted by eviction, node
-loss, OOM termination, or another nonzero container exit can be relaunched
-against the same staged PVC. Restart Jobs use deterministic generation names,
-so an ambiguous restart response is adoptable. Deadline expiry and container
-configuration failures are terminal rather than retried. The campaign bounds
-automatic restart generations with `infrastructure_max_restarts`.
+Kubernetes distinguishes connectivity failures from rejected requests and
+workload failures. The agent writes a compact pipeline summary to Kubernetes'
+termination log. Inspection treats that summary, the container signal, and
+termination reasons such as `OOMKilled` as authoritative even if the Job says
+`Complete` or the recorded container exit code is zero. It reports pending
+PVCs, inspects terminated init/main containers, preserves previously recovered
+workload logs, and captures terminal Job and Pod events in the persisted
+backend snapshot before cleanup. It also includes Kubernetes warning events
+for pending storage and failed artifact readers. It retries artifact readers,
+excludes failed reader nodes when rescheduling, resumes partial files by byte
+offset, and verifies every SHA-256. Before helper creation and final cleanup,
+Brunner finds stale stager and reader pods by workload/role labels and waits
+for their deletion. Final cleanup likewise waits for Job and eligible PVC
+deletion; connectivity loss leaves campaign cleanup pending rather than
+silently leaking resources. A failed workload's PVC is retained until artifact
+collection succeeds.
+
+Failed Kubernetes Jobs whose agent process was interrupted by a signal,
+eviction, node loss, OOM termination, or another retryable infrastructure event
+can be relaunched against the same staged PVC. This classification does not
+depend on a nonzero container exit code. Restart Jobs use deterministic
+generation names, so an ambiguous restart response is adoptable. Deadline
+expiry, terminal provider/configuration failures, and container configuration
+failures are not retried. The campaign bounds automatic restart generations
+with `infrastructure_max_restarts`.
 
 ## Campaign State
 
 Campaign trial IDs are supplied explicitly by the benchmark. They are not
 derived from provider, model, effort, or a run count. `campaign.json` records
 the contract identity, append-only trial list, handles, snapshots, collection
-attempts, evaluation results, outcomes, and recent events.
+attempts, evaluation results, outcomes, and recent events. Each completed entry
+separates:
+
+- `pipeline`: runner status, terminal-result availability, interruption signal,
+  and infrastructure classification
+- `benchmark`: whether trusted evaluation ran and whether it succeeded
+- `outcome`: overall campaign result
+- `failure_class`: `infrastructure` or `benchmark` when the outcome failed
 
 Every initialize, step, and continuous run holds an exclusive operating-system
 lock on `campaign.lock`. A second orchestrator fails immediately with the
@@ -395,6 +425,8 @@ Campaign reconciliation:
   pause while `collect()` is in progress does not consume the retry limit
 - Relaunches retryable infrastructure failures against existing persistent
   agent state with a bounded restart count
+- Retains an append-only retry history with each generation's backend snapshot,
+  including Pod and Job events captured before that generation is deleted
 - Retries interrupted artifact transfers with a bounded, configurable policy
 - Uses the same persisted cleanup transition for initial and resumed cleanup,
   including identical completion and failure events
@@ -415,7 +447,10 @@ Campaign reconciliation:
   reports its workload as pending or running, so flagging it cannot let the
   campaign exceed `max_parallel`
 - Does not clean up when recovery fails
-- Runs trusted evaluation after verified collection
+- Runs trusted evaluation after verified collection only when the runner
+  produced a current terminal provider result
+- Collects diagnostics but records `benchmark.status = "not_run"` for an
+  interrupted or incomplete agent pipeline
 - Runs the configured standard qualitative review and domain assessments after
   deterministic evaluation
 - Regenerates `index.html` after each transition with live elapsed time,

@@ -49,8 +49,10 @@ def test_kubernetes_resources_preserve_secret_boundary(
         trial=trial,
         command=("brunner-worker",),
         timeout_seconds=61.2,
-        cpu="2",
-        memory="4Gi",
+        cpu_request="2",
+        cpu_limit="8",
+        memory_request="16Gi",
+        memory_limit="64Gi",
     )
     labels = {"app.kubernetes.io/name": "brunner"}
 
@@ -93,10 +95,20 @@ def test_kubernetes_resources_preserve_secret_boundary(
     proxy = next(
         item for item in environment if item["name"] == "HTTPS_PROXY"
     )
+    termination_log = next(
+        item
+        for item in environment
+        if item["name"] == "BRUNNER_TERMINATION_LOG"
+    )
     assert secret["valueFrom"]["secretKeyRef"]["name"] == (
         "provider-credentials"
     )
     assert proxy["value"] == "http://proxy.internal:3128"
+    assert termination_log["value"] == "/dev/termination-log"
+    assert pod_spec["containers"][0]["resources"] == {
+        "requests": {"cpu": "2", "memory": "16Gi"},
+        "limits": {"cpu": "8", "memory": "64Gi"},
+    }
     encoded = json.dumps(job)
     assert "provider-credentials" in encoded
     assert "OPENAI_API_KEY" in encoded
@@ -106,6 +118,72 @@ def test_kubernetes_resources_preserve_secret_boundary(
     ]["nodeSelectorTerms"][0]["matchExpressions"][0]
     assert expression["operator"] == "NotIn"
     assert expression["values"] == ["node-a"]
+
+
+def test_kubernetes_legacy_resources_remain_compatible(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="legacy",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        cpu="500m",
+        memory="4Gi",
+    )
+
+    job = render_job(
+        "legacy",
+        "legacy-data",
+        workload,
+        KubernetesProfile(namespace="benchmarks"),
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    resources = job["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]
+    assert resources == {
+        "requests": {"cpu": "500m", "memory": "4Gi"},
+        "limits": {"cpu": "500m", "memory": "4Gi"},
+    }
+
+
+def test_kubernetes_legacy_requests_allow_explicit_burst_limits(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="burstable",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        cpu="2",
+        cpu_limit="8",
+        memory="8Gi",
+        memory_limit="32Gi",
+    )
+
+    job = render_job(
+        "burstable",
+        "burstable-data",
+        workload,
+        KubernetesProfile(namespace="benchmarks"),
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    resources = job["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]
+    assert resources == {
+        "requests": {"cpu": "2", "memory": "8Gi"},
+        "limits": {"cpu": "8", "memory": "32Gi"},
+    }
 
 
 def test_kubernetes_helper_pod_uses_neutral_working_directory() -> None:
@@ -299,6 +377,56 @@ def test_container_inherits_credentials_without_argv_values(
     assert "OPENAI_API_KEY=super-secret-value" not in run_arguments
     assert not any("super-secret-value" in value for value in run_arguments)
     assert "HTTPS_PROXY=http://proxy.internal:3128" in run_arguments
+
+
+def test_container_enforces_limits_and_ignores_scheduler_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        cpu_request="500m",
+        cpu_limit="2",
+        memory_request="1Gi",
+        memory_limit="4Gi",
+    )
+    backend = ContainerBackend()
+    commands = []
+
+    def run(
+        *arguments: str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        if arguments[0] == "inspect":
+            return subprocess.CompletedProcess(
+                arguments,
+                1,
+                stdout="",
+                stderr="Error: No such object",
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout="container-id\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    backend.submit(workload)
+
+    run_arguments = commands[-1]
+    assert run_arguments[run_arguments.index("--cpus") + 1] == "2"
+    assert run_arguments[run_arguments.index("--memory") + 1] == "4Gi"
+    assert "500m" not in run_arguments
+    assert "1Gi" not in run_arguments
 
 
 def test_container_fails_when_inherited_credential_is_missing(
@@ -564,11 +692,148 @@ def test_kubernetes_snapshot_classifies_infrastructure_restart(
         raise AssertionError((kind, name, kwargs))
 
     monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_events",
+        lambda name, uid, required=False: (),
+    )
 
     snapshot = backend.inspect(handle)
 
     assert snapshot.phase == "failed"
     assert snapshot.details["retryable_infrastructure"] is expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "message", "expected_reason", "expected_retryable"),
+    [
+        ("OOMKilled", None, "OOMKilled", True),
+        (
+            "Completed",
+            json.dumps(
+                {
+                    "brunner_pipeline": {
+                        "status": "interrupted",
+                        "provider_result_present": False,
+                        "infrastructure_failure": True,
+                        "infrastructure_reason": "AgentInterrupted",
+                        "retryable_infrastructure": True,
+                        "signal": 15,
+                        "signal_name": "SIGTERM",
+                    }
+                }
+            ),
+            "AgentInterrupted",
+            True,
+        ),
+        (
+            "Completed",
+            json.dumps(
+                {
+                    "brunner_pipeline": {
+                        "status": "provider_error",
+                        "provider_result_present": False,
+                        "infrastructure_failure": True,
+                        "infrastructure_reason": "AgentProviderError",
+                        "retryable_infrastructure": False,
+                    }
+                }
+            ),
+            "AgentProviderError",
+            False,
+        ),
+    ],
+)
+def test_kubernetes_complete_job_preserves_infrastructure_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    message: str | None,
+    expected_reason: str,
+    expected_retryable: bool,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    terminated = {"exitCode": 0, "reason": reason}
+    if message is not None:
+        terminated["message"] = message
+    pod = {
+        "metadata": {"name": "trial-pod", "uid": "pod-uid"},
+        "spec": {"nodeName": "node-a"},
+        "status": {
+            "phase": "Succeeded",
+            "containerStatuses": [
+                {
+                    "name": "agent",
+                    "state": {"terminated": terminated},
+                }
+            ],
+        },
+    }
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if kind == "pvc":
+            return {"status": {"phase": "Bound"}}
+        if kind == "job":
+            return {
+                "metadata": {"name": "trial-job", "uid": "job-uid"},
+                "status": {"conditions": [{"type": "Complete"}]},
+            }
+        if kind == "pods":
+            return {"items": [pod]}
+        raise AssertionError((kind, name, kwargs))
+
+    events = {
+        "trial-job": (
+            {
+                "type": "Normal",
+                "reason": "Completed",
+                "message": "Job completed",
+            },
+        ),
+        "trial-pod": (
+            {
+                "type": "Warning",
+                "reason": expected_reason,
+                "message": "agent terminated",
+            },
+        ),
+    }
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_events",
+        lambda name, uid, required=False: events.get(name, ()),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.reason == expected_reason
+    assert snapshot.exit_code == 0
+    assert (
+        snapshot.details["retryable_infrastructure"]
+        is expected_retryable
+    )
+    assert snapshot.details["kubernetes_events"] == {
+        "job": list(events["trial-job"]),
+        "pod": list(events["trial-pod"]),
+    }
+    assert f"{expected_reason}: agent terminated" in snapshot.warnings
 
 
 def test_kubernetes_restart_reuses_pvc_without_restaging(
@@ -764,6 +1029,27 @@ def test_kubernetes_warning_events_tolerate_null_optional_objects(
     assert warnings == (
         "FailedMount: storage aggregate is offline",
     )
+
+
+def test_kubernetes_terminal_event_failure_is_not_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr="Error from server (Forbidden): events is forbidden",
+        ),
+    )
+
+    with pytest.raises(BackendRequestError, match="events is forbidden"):
+        backend._events("trial-job", "job-uid", required=True)
 
 
 def test_kubernetes_snapshot_includes_pending_pvc_warning_event(
