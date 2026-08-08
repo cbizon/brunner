@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -132,6 +133,63 @@ def test_kubernetes_resources_preserve_secret_boundary(
     ]["nodeSelectorTerms"][0]["matchExpressions"][0]
     assert expression["operator"] == "NotIn"
     assert expression["values"] == ["node-a"]
+
+
+@pytest.mark.parametrize("chunk_bytes", (0, -1))
+def test_kubernetes_profile_rejects_invalid_artifact_chunk_size(
+    chunk_bytes: int,
+) -> None:
+    with pytest.raises(ValueError, match="artifact_chunk_bytes"):
+        KubernetesProfile(artifact_chunk_bytes=chunk_bytes)
+
+
+def test_kubernetes_collection_uses_configured_artifact_chunk_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"abcdefghij"
+    inventory = {
+        "result.bin": {
+            "type": "file",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    }
+    reads: list[tuple[int, int]] = []
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_chunk_bytes=4,
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+
+    def read_remote(
+        pod: str,
+        relative_path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        reads.append((offset, count))
+        return payload[offset : offset + count]
+
+    monkeypatch.setattr(backend, "_read_remote", read_remote)
+    destination = tmp_path / "collected"
+
+    result = backend._collect_from_reader(
+        "reader",
+        destination,
+        ArtifactPolicy(),
+        frozenset(),
+    )
+
+    assert reads == [(0, 4), (4, 4), (8, 2)]
+    assert (destination / "result.bin").read_bytes() == payload
+    assert result["files"] == 1
 
 
 def test_kubernetes_legacy_resources_remain_compatible(
