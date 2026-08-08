@@ -28,7 +28,8 @@ fault-injection coverage.
 - Durable retries, session resume, finalization, and timeout handling
 - Cross-provider token normalization and interval-based time accounting
 - OCI-container and Kubernetes execution backends
-- Resumable checksum-verified artifact collection
+- Resumable checksum-verified artifact collection with configurable
+  Kubernetes transfer chunks
 - Trusted host or evaluator-container execution
 - Packaged evidence-bound qualitative review contract and HTML report
 - Schema-bound command or model-based post-evaluation assessments

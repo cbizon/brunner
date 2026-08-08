@@ -125,6 +125,13 @@ class KubernetesProfile:
     reader_attempts: int = 3
     retain_failed_storage: bool = True
     command_timeout_seconds: float = 120
+    artifact_chunk_bytes: int = CHUNK_BYTES
+
+    def __post_init__(self) -> None:
+        if self.artifact_chunk_bytes < 1:
+            raise ValueError(
+                "Kubernetes artifact_chunk_bytes must be positive"
+            )
 
 
 def render_pvc(
@@ -1468,7 +1475,10 @@ class KubernetesBackend:
             offset = target.stat().st_size if target.exists() else 0
             with target.open("ab" if offset else "wb") as stream:
                 while offset < expected_size:
-                    count = min(CHUNK_BYTES, expected_size - offset)
+                    count = min(
+                        self.profile.artifact_chunk_bytes,
+                        expected_size - offset,
+                    )
                     data = self._read_remote(
                         pod,
                         name,

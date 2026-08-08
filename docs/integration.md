@@ -630,6 +630,13 @@ artifact-reader images must contain Brunner; the agent image also needs the
 selected provider CLI. The benchmark package, evaluator, and references are
 not required in the agent image.
 
+Kubernetes artifact collection reads each file through resumable
+`kubectl exec` calls. `KubernetesProfile.artifact_chunk_bytes` controls the
+maximum bytes requested by each call, and `command_timeout_seconds` bounds
+that call. Smaller chunks are more resilient on slow or unstable links but
+increase command overhead. Both values apply to the orchestrator-side
+transfer; the remote reader protocol accepts any positive chunk size.
+
 Kubernetes workload requests and limits are independent. Set `cpu_request`,
 `memory_request`, and `ephemeral_storage_request` to scheduler reservations;
 set `cpu_limit`, `memory_limit`, and `ephemeral_storage_limit` to permitted
