@@ -633,9 +633,12 @@ not required in the agent image.
 Kubernetes artifact collection reads each file through resumable
 `kubectl exec` calls. `KubernetesProfile.artifact_chunk_bytes` controls the
 maximum bytes requested by each call, and `command_timeout_seconds` bounds
-that call. Smaller chunks are more resilient on slow or unstable links but
-increase command overhead. Both values apply to the orchestrator-side
-transfer; the remote reader protocol accepts any positive chunk size.
+that call. `artifact_chunk_attempts` retries a failed path, offset, and byte
+count on the same mounted reader before Brunner replaces the reader pod;
+`artifact_chunk_retry_seconds` controls the delay between those retries.
+Smaller chunks are more resilient on slow or unstable links but increase
+command overhead. These values apply to the orchestrator-side transfer; the
+remote reader protocol accepts any positive chunk size.
 
 Kubernetes workload requests and limits are independent. Set `cpu_request`,
 `memory_request`, and `ephemeral_storage_request` to scheduler reservations;

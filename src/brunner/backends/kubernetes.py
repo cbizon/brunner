@@ -126,11 +126,21 @@ class KubernetesProfile:
     retain_failed_storage: bool = True
     command_timeout_seconds: float = 120
     artifact_chunk_bytes: int = CHUNK_BYTES
+    artifact_chunk_attempts: int = 5
+    artifact_chunk_retry_seconds: float = 1
 
     def __post_init__(self) -> None:
         if self.artifact_chunk_bytes < 1:
             raise ValueError(
                 "Kubernetes artifact_chunk_bytes must be positive"
+            )
+        if self.artifact_chunk_attempts < 1:
+            raise ValueError(
+                "Kubernetes artifact_chunk_attempts must be positive"
+            )
+        if self.artifact_chunk_retry_seconds < 0:
+            raise ValueError(
+                "Kubernetes artifact_chunk_retry_seconds must not be negative"
             )
 
 
@@ -1442,6 +1452,48 @@ class KubernetesBackend:
         )
         return result.stdout
 
+    def _read_remote_with_retries(
+        self,
+        pod: str,
+        relative_path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        failures = []
+        for attempt in range(1, self.profile.artifact_chunk_attempts + 1):
+            try:
+                data = self._read_remote(
+                    pod,
+                    relative_path,
+                    offset,
+                    count,
+                )
+                if not data:
+                    raise ArtifactTransferError(
+                        f"remote artifact ended early: {relative_path}"
+                    )
+                return data
+            except (
+                ArtifactTransferError,
+                BackendConnectivityError,
+                BackendRequestError,
+            ) as error:
+                if (
+                    isinstance(error, BackendConnectivityError)
+                    and not self._probe_backend_reachable()
+                ):
+                    raise
+                failures.append(f"attempt {attempt}: {error}")
+                if attempt < self.profile.artifact_chunk_attempts:
+                    time.sleep(
+                        self.profile.artifact_chunk_retry_seconds
+                    )
+        raise ArtifactTransferError(
+            "remote artifact chunk failed after retries: "
+            f"{relative_path} offset={offset} count={count}; "
+            + "; ".join(failures)
+        )
+
     def _collect_from_reader(
         self,
         pod: str,
@@ -1479,16 +1531,12 @@ class KubernetesBackend:
                         self.profile.artifact_chunk_bytes,
                         expected_size - offset,
                     )
-                    data = self._read_remote(
+                    data = self._read_remote_with_retries(
                         pod,
                         name,
                         offset,
                         count,
                     )
-                    if not data:
-                        raise ArtifactTransferError(
-                            f"remote artifact ended early: {name}"
-                        )
                     stream.write(data)
                     stream.flush()
                     offset += len(data)

@@ -143,6 +143,19 @@ def test_kubernetes_profile_rejects_invalid_artifact_chunk_size(
         KubernetesProfile(artifact_chunk_bytes=chunk_bytes)
 
 
+@pytest.mark.parametrize("chunk_attempts", (0, -1))
+def test_kubernetes_profile_rejects_invalid_artifact_chunk_attempts(
+    chunk_attempts: int,
+) -> None:
+    with pytest.raises(ValueError, match="artifact_chunk_attempts"):
+        KubernetesProfile(artifact_chunk_attempts=chunk_attempts)
+
+
+def test_kubernetes_profile_rejects_negative_chunk_retry_delay() -> None:
+    with pytest.raises(ValueError, match="artifact_chunk_retry_seconds"):
+        KubernetesProfile(artifact_chunk_retry_seconds=-1)
+
+
 def test_kubernetes_collection_uses_configured_artifact_chunk_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -167,6 +180,11 @@ def test_kubernetes_collection_uses_configured_artifact_chunk_size(
         "_remote_inventory",
         lambda *args, **kwargs: inventory,
     )
+    monkeypatch.setattr(
+        backend,
+        "_probe_backend_reachable",
+        lambda: True,
+    )
 
     def read_remote(
         pod: str,
@@ -190,6 +208,103 @@ def test_kubernetes_collection_uses_configured_artifact_chunk_size(
     assert reads == [(0, 4), (4, 4), (8, 2)]
     assert (destination / "result.bin").read_bytes() == payload
     assert result["files"] == 1
+
+
+def test_kubernetes_collection_retries_chunk_on_same_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"abcdefghij"
+    inventory = {
+        "result.bin": {
+            "type": "file",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    }
+    reads: list[tuple[str, int, int]] = []
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_chunk_bytes=4,
+            artifact_chunk_attempts=3,
+            artifact_chunk_retry_seconds=0,
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+
+    failed_once = False
+
+    def read_remote(
+        pod: str,
+        relative_path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        nonlocal failed_once
+        reads.append((pod, offset, count))
+        if offset == 4 and not failed_once:
+            failed_once = True
+            raise BackendConnectivityError(
+                "transient kubectl stream reset"
+            )
+        return payload[offset : offset + count]
+
+    monkeypatch.setattr(backend, "_read_remote", read_remote)
+    destination = tmp_path / "collected"
+
+    backend._collect_from_reader(
+        "reader",
+        destination,
+        ArtifactPolicy(),
+        frozenset(),
+    )
+
+    assert reads == [
+        ("reader", 0, 4),
+        ("reader", 4, 4),
+        ("reader", 4, 4),
+        ("reader", 8, 2),
+    ]
+    assert (destination / "result.bin").read_bytes() == payload
+
+
+def test_kubernetes_chunk_retry_preserves_backend_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            artifact_chunk_attempts=3,
+            artifact_chunk_retry_seconds=0,
+        )
+    )
+    reads = 0
+
+    def read_remote(*args, **kwargs) -> bytes:
+        nonlocal reads
+        reads += 1
+        raise BackendConnectivityError("cluster unavailable")
+
+    monkeypatch.setattr(backend, "_read_remote", read_remote)
+    monkeypatch.setattr(
+        backend,
+        "_probe_backend_reachable",
+        lambda: False,
+    )
+
+    with pytest.raises(BackendConnectivityError, match="unavailable"):
+        backend._read_remote_with_retries(
+            "reader",
+            "result.bin",
+            0,
+            4,
+        )
+
+    assert reads == 1
 
 
 def test_kubernetes_legacy_resources_remain_compatible(
