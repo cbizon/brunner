@@ -4,6 +4,8 @@ import argparse
 import importlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -96,6 +98,13 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     campaign_run = subparsers.add_parser("campaign-run")
     campaign_run.add_argument("campaign")
     campaign_run.add_argument("--poll-seconds", type=float, default=5)
+    campaign_run.add_argument("--host", default="127.0.0.1")
+    campaign_run.add_argument("--port", type=int, default=8765)
+    campaign_run.add_argument(
+        "--exit-after-terminal",
+        action="store_true",
+        help="stop the monitor and exit when the campaign is terminal",
+    )
     return parser
 
 
@@ -212,7 +221,39 @@ def execute(
             return runner.initialize()
         if args.command == "campaign-step":
             return runner.advance()
-        return runner.run(poll_seconds=args.poll_seconds)
+        from brunner.dashboard import start_campaign_server
+
+        server, url = start_campaign_server(
+            runner.root,
+            host=args.host,
+            port=args.port,
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="brunner-campaign-monitor",
+            daemon=True,
+        )
+        thread.start()
+        print(f"Campaign monitor: {url}", file=sys.stderr, flush=True)
+        try:
+            state = runner.run(poll_seconds=args.poll_seconds)
+            if args.exit_after_terminal:
+                return state
+            print(
+                "Campaign reached terminal state "
+                f"{state['status']}; monitor remains available at {url}. "
+                "Press Ctrl-C to stop.",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return state if "state" in locals() else runner.initialize()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
     raise AssertionError(args.command)
 
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brunner import __version__
+from brunner import BRUNNER_RUNTIME_PROTOCOL, __version__
 from brunner.contract import OutputContract
 from brunner.definition import BenchmarkDefinition
 from brunner.io import write_json_atomic
@@ -97,15 +97,18 @@ def write_trial_metadata(
     trial: Path,
     staged: StageReport,
 ) -> None:
+    resource_id = uuid.uuid4().hex
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "test_id": identity.test_id,
+        "resource_id": resource_id,
         "provider": identity.provider,
         "model": identity.model,
         "effort": identity.effort,
         "benchmark_id": definition.benchmark_id,
         "benchmark_version": definition.version,
         "brunner_version": __version__,
+        "brunner_runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
         "contract_sha256": contract.sha256,
         "challenge_sha256": staged.challenge_sha256,
         "assessment_contracts": [
@@ -123,7 +126,10 @@ def write_trial_metadata(
     write_json_atomic(
         trial / "metadata/agent-run.json",
         {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
+            "resource_id": resource_id,
+            "brunner_version": __version__,
+            "brunner_runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
             "benchmark_id": definition.benchmark_id,
             "benchmark_version": definition.version,
             "contract_sha256": contract.sha256,

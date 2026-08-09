@@ -523,6 +523,19 @@ class ArtifactPolicy:
     allow_symlinks: bool = False
     collect_evaluated_artifacts: bool = False
     max_collection_bytes: int | None = 10 * 1024 * 1024 * 1024
+    failure_diagnostic_globs: tuple[str, ...] = (
+        "metadata/**",
+        "workspace/.brunner-challenge.json",
+        "workspace/submission/manifest.json",
+        "workspace/submission/run-status.json",
+        "status.json",
+        "transcript/**",
+        "usage/**",
+        "timing/**",
+        "evaluation/**",
+        "backend/**",
+    )
+    max_diagnostic_collection_bytes: int = 512 * 1024 * 1024
 
     def validate(self) -> None:
         for name, globs in self.groups.items():
@@ -538,6 +551,14 @@ class ArtifactPolicy:
         ):
             raise ConfigurationError(
                 "artifact max_collection_bytes must be positive or None"
+            )
+        if not self.failure_diagnostic_globs:
+            raise ConfigurationError(
+                "artifact failure_diagnostic_globs cannot be empty"
+            )
+        if self.max_diagnostic_collection_bytes < 1:
+            raise ConfigurationError(
+                "artifact max_diagnostic_collection_bytes must be positive"
             )
 
 

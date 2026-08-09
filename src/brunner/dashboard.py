@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from collections import Counter
 from datetime import UTC, datetime
@@ -8,6 +9,31 @@ from pathlib import Path
 from typing import Any
 
 from brunner.report import visible_assessment_reports
+
+
+class _CampaignRequestHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def start_campaign_server(
+    root: Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> tuple[ThreadingHTTPServer, str]:
+    root = root.resolve()
+
+    def handler(*args: object, **kwargs: object) -> None:
+        _CampaignRequestHandler(
+            *args,
+            directory=str(root),
+            **kwargs,
+        )
+
+    server = ThreadingHTTPServer((host, port), handler)
+    address, selected_port = server.server_address[:2]
+    return server, f"http://{address}:{selected_port}/"
 
 
 def _relative_link(output: Path, value: str | None) -> str:

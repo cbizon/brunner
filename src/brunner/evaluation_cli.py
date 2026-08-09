@@ -11,6 +11,7 @@ from brunner.evaluation import (
     evaluation_spec_from_dict,
     execute_evaluation,
 )
+from brunner import BRUNNER_RUNTIME_PROTOCOL
 
 
 SPEC_ENV = "BRUNNER_EVALUATION_SPEC"
@@ -56,6 +57,12 @@ def main() -> None:
         if not isinstance(value, dict):
             raise TypeError("trusted evaluation specification is not an object")
         spec = evaluation_spec_from_dict(value)
+        if spec.runtime_protocol != BRUNNER_RUNTIME_PROTOCOL:
+            raise RuntimeError(
+                "trusted evaluator runtime protocol mismatch: "
+                f"{spec.runtime_protocol!r} != "
+                f"{BRUNNER_RUNTIME_PROTOCOL!r}"
+            )
         result = execute_evaluation(
             spec,
             args.trial,
@@ -77,12 +84,8 @@ def main() -> None:
         }
         exit_code = (
             0
-            if result["status"] == "complete"
-            else (
-                1
-                if summary["candidate_failure"]
-                else 2
-            )
+            if result["status"] == "complete" or summary["candidate_failure"]
+            else 2
         )
     except Exception as error:
         summary = {

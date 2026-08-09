@@ -523,7 +523,10 @@ class ReviewBackend:
         assert review.is_file()
         self.cleaned.add(handle.workload_id)
 
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         return BackendCapacity(
             limit=1,
             running=0,

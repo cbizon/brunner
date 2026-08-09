@@ -52,9 +52,8 @@ def test_codex_adapter_disables_external_tools(tmp_path: Path) -> None:
     )
     assert 'model_reasoning_effort="high"' in command
     assert "--ephemeral" in command
-    sandbox_index = command.index("--sandbox")
-    assert command[sandbox_index + 1] == "workspace-write"
-    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
 
 
 def test_codex_adapter_can_run_in_read_only_mode(tmp_path: Path) -> None:

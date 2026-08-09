@@ -26,7 +26,10 @@ def build_definition() -> BenchmarkDefinition:
                 "-m",
                 "examples.numeric_benchmark.evaluator",
             ),
-            image="brunner-numeric-evaluator:latest",
+            image=(
+                "registry.example/brunner-numeric-evaluator@sha256:"
+                + "0" * 64
+            ),
         ),
         reference=ReferenceDefinition(root=ROOT / "reference"),
     )

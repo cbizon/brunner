@@ -83,6 +83,25 @@ def _write_valid_submission(trial: Path) -> None:
     )
 
 
+def _serialized_evaluation_spec(spec) -> dict[str, object]:
+    return {
+        "schema_version": "2.0",
+        "runtime_protocol": spec.runtime_protocol,
+        "benchmark_id": spec.benchmark_id,
+        "benchmark_version": spec.benchmark_version,
+        "contract_sha256": spec.contract_sha256,
+        "command": list(spec.command),
+        "results_path": spec.results_path,
+        "primary_report": spec.primary_report,
+        "timeout_seconds": spec.timeout_seconds,
+        "reference_manifest_path": spec.reference_manifest_path,
+        "reference_manifest_sha256": spec.reference_manifest_sha256,
+        "reference_validate_command": list(
+            spec.reference_validate_command
+        ),
+    }
+
+
 def test_evaluate_trial_uses_contract_validated_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -151,20 +170,7 @@ def test_evaluation_cli_runs_deterministic_evaluator_in_subprocess(
     )
     environment["BRUNNER_TERMINATION_LOG"] = str(termination_log)
     environment["BRUNNER_EVALUATION_SPEC"] = json.dumps(
-        {
-            "schema_version": "1.0",
-            "benchmark_id": spec.benchmark_id,
-            "benchmark_version": spec.benchmark_version,
-            "contract_sha256": spec.contract_sha256,
-            "command": list(spec.command),
-            "results_path": spec.results_path,
-            "primary_report": spec.primary_report,
-            "timeout_seconds": spec.timeout_seconds,
-            "reference_manifest_path": spec.reference_manifest_path,
-            "reference_validate_command": list(
-                spec.reference_validate_command
-            ),
-        }
+        _serialized_evaluation_spec(spec)
     )
 
     completed = subprocess.run(
@@ -186,6 +192,54 @@ def test_evaluation_cli_runs_deterministic_evaluator_in_subprocess(
     assert result["status"] == "complete"
     summary = json.loads(termination_log.read_text())
     assert summary["brunner_evaluation"]["status"] == "complete"
+
+
+def test_evaluation_cli_candidate_failure_exits_successfully(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("candidate-failure", "codex", "fake", None),
+    )
+    spec = evaluation_spec(definition, contract)
+    termination_log = tmp_path / "termination.log"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = (
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
+        + os.pathsep
+        + environment.get("PYTHONPATH", "")
+    )
+    environment["BRUNNER_TERMINATION_LOG"] = str(termination_log)
+    environment["BRUNNER_EVALUATION_SPEC"] = json.dumps(
+        _serialized_evaluation_spec(spec)
+    )
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "brunner.evaluation_cli",
+            str(trial),
+        ),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(termination_log.read_text())[
+        "brunner_evaluation"
+    ]
+    assert summary["status"] == "failed"
+    assert summary["candidate_failure"] is True
 
 
 def test_invalid_submission_is_identified_as_candidate_failure(

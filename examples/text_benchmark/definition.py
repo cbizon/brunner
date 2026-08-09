@@ -27,7 +27,10 @@ def build_definition() -> BenchmarkDefinition:
                 "-m",
                 "examples.text_benchmark.evaluator",
             ),
-            image="brunner-text-evaluator:latest",
+            image=(
+                "registry.example/brunner-text-evaluator@sha256:"
+                + "0" * 64
+            ),
         ),
     )
 

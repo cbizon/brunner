@@ -78,6 +78,74 @@ def collectable_artifact(
     return True
 
 
+def _pointer_values(value: Any, pointer: str) -> list[Any]:
+    current = [value]
+    for raw_part in pointer.removeprefix("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        children = []
+        for item in current:
+            if part == "*":
+                if isinstance(item, dict):
+                    children.extend(item.values())
+                elif isinstance(item, list):
+                    children.extend(item)
+            elif isinstance(item, dict) and part in item:
+                children.append(item[part])
+            elif isinstance(item, list):
+                try:
+                    children.append(item[int(part)])
+                except (ValueError, IndexError):
+                    pass
+        current = children
+    return current
+
+
+def _manifest_artifact_paths(root: Path) -> frozenset[str]:
+    contract_path = root / "workspace/schema/output-contract.json"
+    if not contract_path.is_file():
+        return frozenset()
+    try:
+        contract = json.loads(contract_path.read_text())
+        manifest_relative = contract["submission"]["manifest_path"]
+    except (json.JSONDecodeError, KeyError, OSError, TypeError):
+        return frozenset()
+    manifest_path = root / "workspace" / str(manifest_relative)
+    if not manifest_path.is_file():
+        return frozenset()
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return frozenset()
+    paths = set()
+    for artifact in contract.get("artifacts", ()):
+        if not isinstance(artifact, dict):
+            continue
+        if isinstance(artifact.get("path"), str):
+            values = [artifact["path"]]
+            base = root / "workspace"
+        elif isinstance(artifact.get("manifest_pointer"), str):
+            values = _pointer_values(
+                manifest,
+                artifact["manifest_pointer"],
+            )
+            base = manifest_path.parent
+        else:
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            relative = Path(value)
+            if not value or relative.is_absolute() or ".." in relative.parts:
+                continue
+            candidate = base / relative
+            try:
+                name = candidate.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            paths.add(name)
+    return frozenset(paths)
+
+
 def _evaluated_artifact_paths(
     root: Path,
     evaluation_results_path: str,
@@ -93,17 +161,17 @@ def _evaluated_artifact_paths(
         )
     results_path = root / evaluation_results_path
     if not results_path.is_file():
-        return frozenset()
+        return _manifest_artifact_paths(root)
     try:
         results = json.loads(results_path.read_text())
     except (json.JSONDecodeError, OSError):
-        return frozenset()
+        return _manifest_artifact_paths(root)
     submission = results.get("submission")
     if not isinstance(submission, dict):
-        return frozenset()
+        return _manifest_artifact_paths(root)
     artifacts = submission.get("artifacts")
     if not isinstance(artifacts, list):
-        return frozenset()
+        return _manifest_artifact_paths(root)
     paths = set()
     for artifact in artifacts:
         if not isinstance(artifact, dict):
@@ -123,6 +191,7 @@ def file_inventory(
     *,
     included_groups: frozenset[str] = frozenset(),
     evaluation_results_path: str = "evaluation/results.json",
+    included_globs: tuple[str, ...] | None = None,
 ) -> dict[str, dict[str, Any]]:
     inventory = {}
     evaluated_artifacts = (
@@ -132,6 +201,11 @@ def file_inventory(
     )
     for path in sorted(root.rglob("*")):
         name = path.relative_to(root).as_posix()
+        if included_globs is not None and not _matches(
+            name,
+            included_globs,
+        ):
+            continue
         if name in evaluated_artifacts:
             continue
         if not collectable_artifact(

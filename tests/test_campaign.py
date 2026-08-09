@@ -132,7 +132,10 @@ class ImmediateBackend:
     def cleanup(self, handle: BackendHandle) -> None:
         self.cleaned.add(handle.workload_id)
 
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         return BackendCapacity(
             limit=10,
             running=0,
@@ -150,7 +153,10 @@ class MaterializationCheckingBackend(ImmediateBackend):
 
 
 class OfflineBackend(ImmediateBackend):
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         raise BackendConnectivityError("cluster API is unavailable")
 
 
@@ -193,11 +199,14 @@ class FlakyConnectivityBackend(ImmediateBackend):
         super().__init__()
         self.capacity_attempts = 0
 
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         self.capacity_attempts += 1
         if self.capacity_attempts == 1:
             raise BackendConnectivityError("cluster API is unavailable")
-        return super().capacity()
+        return super().capacity(workload)
 
 
 class AmbiguousSubmissionBackend(ImmediateBackend):
@@ -302,7 +311,10 @@ class CleanupRequestFailureBackend(ImmediateBackend):
 
 
 class ZeroCapacityBackend(ImmediateBackend):
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         return BackendCapacity(
             limit=1,
             running=0,
@@ -318,7 +330,10 @@ class UnexpectedInspectionBackend(ImmediateBackend):
 
 
 class UnexpectedCapacityBackend(ImmediateBackend):
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         raise RuntimeError("malformed capacity response")
 
 

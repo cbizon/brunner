@@ -6,6 +6,8 @@ from brunner.backends.base import (
     ExecutionBackend,
     TrustedEvaluationSpec,
     WorkloadSpec,
+    trial_resource_id,
+    workload_sha256,
 )
 from brunner.backends.kubernetes import (
     KubernetesBackend,
@@ -22,4 +24,6 @@ __all__ = [
     "KubernetesProfile",
     "TrustedEvaluationSpec",
     "WorkloadSpec",
+    "trial_resource_id",
+    "workload_sha256",
 ]

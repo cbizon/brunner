@@ -72,19 +72,19 @@ state publication must be atomic so they cannot expose partial state.
 | Trial construction | Filesystem failure or interruption | Trial creation | Atomic publish; incomplete temporary trial must not occupy the requested ID |
 | State persistence | Disk/inodes, permission, serialization, machine loss | Orchestrator | Preserve previous valid state; stop new side effects if authoritative state cannot be written |
 | Campaign locking | Concurrent orchestrator or stale diagnostic owner text | OS file lock | Terminal local orchestration error; kernel lock is authoritative |
-| Capacity observation | API loss, quota, no nodes, malformed response | Scheduler | Connectivity pause or visible `wait`; never an invisible running state |
-| Submission | Partial PVC/helper/Job/container, rejection, timeout, ambiguous response | Campaign submission reconciliation | Adopt idempotently after ambiguity; possible side effects require cleanup |
+| Capacity/preflight | API loss, RBAC, quota, no nodes, mutable/incompatible images, bad reference claim | Scheduler/backend | Connectivity pause, terminal configuration, or visible quota `wait`; never an invisible running state |
+| Submission | Partial NetworkPolicy/PVC/helper/Job, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation | Adopt only matching digests after ambiguity; possible side effects require cleanup |
 | Scheduling/startup | Unschedulable, image pull, mount, secret, GPU/storage unavailable | Backend inspection | Typed backend failure; retry only transient infrastructure |
 | Agent startup | Missing executable/config, corrupt trial state, permission/disk failure | Agent CLI and backend | Durable nonzero infrastructure result with diagnostics |
 | Provider execution | Auth, subscription/rate limit, model substitution, tool/sandbox denial, network, malformed terminal event | Runner/provider adapter | Provider-specific retry or terminal result; preserve requested/observed identity |
 | Runtime resources | CPU, memory, ephemeral storage, PVC, PID/FD, token/context, deadline | Backend plus runner | Attribute to candidate only when a candidate-specific limit proves ownership |
 | Output/timing capture | Log disk full, malformed event, output flood | Runner | Terminal provider parsing must not depend on optional diagnostic writes |
-| Inspection | Connectivity, malformed JSON, deleted Job/container, missing Events | Backend and campaign | Pause on connectivity; durable attention on unknown/malformed state |
+| Inspection | Connectivity, malformed JSON, deleted Job/PVC, multi-Pod retry history, missing Events | Backend and campaign | Pause on connectivity; restart missing Job with intact PVC; event loss is diagnostic-only |
 | Retry/resume | Retry deadline, exhausted budget, stale session, unsupported resume | Runner or campaign | Absolute persisted retry time; bounded retries; terminal reason at exhaustion |
 | Submission validation | Missing/invalid manifest, schema/path/size violation | Evaluator | `candidate_failed`; this is a valid benchmark result |
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
 | Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
-| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, local disk | Backend and campaign | Reuse unchanged staged files locally, omit evaluated raw artifacts by default, retry transport only; integrity never consumes a transport retry |
+| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, local disk | Backend and campaign | Reuse unchanged staged files locally, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry transport only |
 | Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure | Campaign | `assessment`; required-review failure makes result indeterminate |
 | Reporting | Serialization, template error, disk full | Evaluation or campaign save | Record `reporting`; never block cleanup or replace the authoritative result |
 | Cleanup | API loss, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Persist `cleanup_pending` and retry; result remains authoritative |
@@ -123,6 +123,12 @@ and event evidence before attributing exhaustion to either phase.
   accepts retention.
 - Unknown phases and malformed backend responses require attention; they never
   fall through to an unmarked running state.
+- NetworkPolicy, challenge, workload, runtime, image, and reference identities
+  must match before a remote resource is adopted.
+- Candidate evaluation failure exits the evaluator container successfully; the
+  benchmark result carries failure while the Kubernetes pipeline completes.
+- A failed old Pod cannot override an active replacement or a successful Job.
+- Missing Events never prevent collection or cleanup.
 - A campaign may wait indefinitely for connectivity by policy, but the wait
   reason and start time must be durable and visible.
 - A successful test suite is insufficient unless each external boundary has
@@ -135,8 +141,10 @@ construction, source symlink rejection, partial and rejected submission,
 primary-state corruption and backup recovery, malformed and unknown
 campaign/backend states, zero backend capacity, cleanup retry, collection
 integrity, malformed remote inventories, evaluator versus candidate
-attribution, required assessment failure, and non-gating report/dashboard
-failure.
+attribution, required assessment failure, non-gating report/dashboard failure,
+NetworkPolicy rendering/order, remote stage verification, runtime identity,
+immutable images, multi-Pod retries, missing Jobs, reference identity,
+ResourceQuota capacity, diagnostic collection, and persistent monitoring.
 
 Backend-side submission journals, detached child reaping,
 candidate-versus-runner cgroup attribution, and backup recovery after a

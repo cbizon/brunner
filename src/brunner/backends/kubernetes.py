@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brunner import BRUNNER_RUNTIME_PROTOCOL
 from brunner.artifacts import (
     CHUNK_BYTES,
     artifact_metadata,
@@ -23,6 +26,8 @@ from brunner.backends.base import (
     BackendSnapshot,
     WorkloadSpec,
     native_resource_name,
+    trial_resource_id,
+    workload_sha256,
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
@@ -33,6 +38,7 @@ from brunner.errors import (
     IntegrityError,
 )
 from brunner.io import write_json_atomic
+from brunner.staging import load_stage_report
 
 
 CONNECTIVITY_FRAGMENTS = (
@@ -72,6 +78,24 @@ REACHABLE_REQUEST_FRAGMENTS = (
     "unauthorized",
 )
 STAGED_ANNOTATION = "dev.brunner/staged"
+CHALLENGE_SHA256_ANNOTATION = "dev.brunner/challenge-sha256"
+WORKLOAD_SHA256_ANNOTATION = "dev.brunner/workload-sha256"
+RUNTIME_PROTOCOL_ANNOTATION = "dev.brunner/runtime-protocol"
+REFERENCE_MANIFEST_SHA256_ANNOTATION = (
+    "dev.brunner/reference-manifest-sha256"
+)
+PIPELINE_ROLE = "pipeline"
+HELPER_ROLES = ("trial-stager", "artifact-reader")
+PROXY_ENVIRONMENT = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
 NON_RETRYABLE_JOB_FAILURES = frozenset({"DeadlineExceeded"})
 NON_RETRYABLE_CONTAINER_FAILURES = frozenset(
     {
@@ -105,6 +129,7 @@ class ReaderMountError(BackendRequestError):
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
+
 @dataclass(frozen=True)
 class KubernetesProfile:
     namespace: str = "default"
@@ -121,6 +146,18 @@ class KubernetesProfile:
         default_factory=dict
     )
     nonsecret_environment: dict[str, str] = field(default_factory=dict)
+    proxy_url: str | None = None
+    proxy_pod_selector: dict[str, str] = field(default_factory=dict)
+    proxy_namespace: str | None = None
+    proxy_port: int | None = None
+    dns_namespace: str = "kube-system"
+    dns_pod_selector: dict[str, str] = field(
+        default_factory=lambda: {"k8s-app": "kube-dns"}
+    )
+    unsafe_disable_network_policy_for_tests: bool = False
+    job_backoff_limit: int = 6
+    require_image_digests: bool = True
+    preflight_enabled: bool = True
     max_parallel: int | None = None
     staging_timeout_seconds: float = 10 * 60
     reader_timeout_seconds: float = 10 * 60
@@ -141,6 +178,255 @@ class KubernetesProfile:
             raise ValueError(
                 "Kubernetes reference_claim_name cannot be empty"
             )
+        configured_proxy = self.proxy_url is not None
+        if configured_proxy != bool(self.proxy_pod_selector):
+            raise ValueError(
+                "Kubernetes proxy_url and proxy_pod_selector must be "
+                "configured together"
+            )
+        if configured_proxy and (
+            self.proxy_port is None or self.proxy_port < 1
+        ):
+            raise ValueError(
+                "Kubernetes proxy_port must be positive when proxying is "
+                "configured"
+            )
+        if PROXY_ENVIRONMENT & (
+            set(self.nonsecret_environment)
+            | set(self.secret_environment)
+        ):
+            names = sorted(
+                PROXY_ENVIRONMENT
+                & (
+                    set(self.nonsecret_environment)
+                    | set(self.secret_environment)
+                )
+            )
+            raise ValueError(
+                "Kubernetes proxy environment is managed by Brunner: "
+                + ", ".join(names)
+            )
+        if self.job_backoff_limit < 0:
+            raise ValueError(
+                "Kubernetes job_backoff_limit cannot be negative"
+            )
+
+
+def _image_is_immutable(image: str) -> bool:
+    return re.search(r"@sha256:[0-9a-fA-F]{64}$", image) is not None
+
+
+QUANTITY_FACTORS = {
+    "n": Decimal("0.000000001"),
+    "u": Decimal("0.000001"),
+    "m": Decimal("0.001"),
+    "k": Decimal("1000"),
+    "K": Decimal("1000"),
+    "M": Decimal("1000000"),
+    "G": Decimal("1000000000"),
+    "T": Decimal("1000000000000"),
+    "P": Decimal("1000000000000000"),
+    "E": Decimal("1000000000000000000"),
+    "Ki": Decimal(1024),
+    "Mi": Decimal(1024**2),
+    "Gi": Decimal(1024**3),
+    "Ti": Decimal(1024**4),
+    "Pi": Decimal(1024**5),
+    "Ei": Decimal(1024**6),
+}
+
+
+def _quantity(value: str | int | float | None) -> Decimal:
+    if value is None:
+        return Decimal(0)
+    text = str(value).strip()
+    match = re.fullmatch(
+        r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))([A-Za-z]+)?",
+        text,
+    )
+    if match is None:
+        raise BackendRequestError(
+            f"unsupported Kubernetes resource quantity: {value!r}"
+        )
+    try:
+        number = Decimal(match.group(1))
+    except InvalidOperation as error:
+        raise BackendRequestError(
+            f"invalid Kubernetes resource quantity: {value!r}"
+        ) from error
+    suffix = match.group(2) or ""
+    if suffix and suffix not in QUANTITY_FACTORS:
+        raise BackendRequestError(
+            f"unsupported Kubernetes resource quantity suffix: {value!r}"
+        )
+    return number * QUANTITY_FACTORS.get(suffix, Decimal(1))
+
+
+def _resource_requirements(
+    job: dict[str, Any],
+    pvc: dict[str, Any],
+) -> dict[str, Decimal]:
+    pod_spec = job["spec"]["template"]["spec"]
+    regular = pod_spec.get("containers", ())
+    init = pod_spec.get("initContainers", ())
+    resource_names = {
+        name
+        for container in (*regular, *init)
+        for kind in ("requests", "limits")
+        for name in container.get("resources", {}).get(kind, {})
+    }
+    requirements: dict[str, Decimal] = {
+        "pods": Decimal(1),
+        "count/jobs.batch": Decimal(1),
+        "persistentvolumeclaims": Decimal(1),
+        "requests.storage": _quantity(
+            pvc["spec"]["resources"]["requests"]["storage"]
+        ),
+    }
+    for kind in ("requests", "limits"):
+        for resource in resource_names:
+            regular_total = sum(
+                (
+                    _quantity(
+                        container.get("resources", {})
+                        .get(kind, {})
+                        .get(resource)
+                    )
+                    for container in regular
+                ),
+                Decimal(0),
+            )
+            init_max = max(
+                (
+                    _quantity(
+                        container.get("resources", {})
+                        .get(kind, {})
+                        .get(resource)
+                    )
+                    for container in init
+                ),
+                default=Decimal(0),
+            )
+            effective = max(regular_total, init_max)
+            if effective:
+                requirements[f"{kind}.{resource}"] = effective
+    return requirements
+
+
+def _network_policy_name(workload: WorkloadSpec, suffix: str) -> str:
+    return native_resource_name(
+        workload.workload_id,
+        workload.resource_id,
+        suffix=suffix,
+    )
+
+
+def render_network_policies(
+    workload: WorkloadSpec,
+    profile: KubernetesProfile,
+    labels: dict[str, str],
+) -> tuple[dict[str, Any], ...]:
+    if profile.unsafe_disable_network_policy_for_tests:
+        return ()
+    workload_name = str(labels["dev.brunner/workload"])
+    pipeline_egress: list[dict[str, Any]] = [
+        {
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": (
+                                profile.dns_namespace
+                            )
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": dict(profile.dns_pod_selector)
+                    },
+                }
+            ],
+            "ports": [
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53},
+            ],
+        }
+    ]
+    if profile.proxy_url is not None:
+        pipeline_egress.append(
+            {
+                "to": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": (
+                                    profile.proxy_namespace
+                                    or profile.namespace
+                                )
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": dict(
+                                profile.proxy_pod_selector
+                            )
+                        },
+                    }
+                ],
+                "ports": [
+                    {
+                        "protocol": "TCP",
+                        "port": profile.proxy_port,
+                    }
+                ],
+            }
+        )
+    common = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+    }
+    return (
+        {
+            **common,
+            "metadata": {
+                "name": _network_policy_name(workload, "-network"),
+                "namespace": profile.namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "podSelector": {
+                    "matchLabels": {
+                        "dev.brunner/workload": workload_name,
+                        "dev.brunner/role": PIPELINE_ROLE,
+                    }
+                },
+                "policyTypes": ["Egress"],
+                "egress": pipeline_egress,
+            },
+        },
+        {
+            **common,
+            "metadata": {
+                "name": _network_policy_name(workload, "-helpers"),
+                "namespace": profile.namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "podSelector": {
+                    "matchLabels": {
+                        "dev.brunner/workload": workload_name,
+                    },
+                    "matchExpressions": [
+                        {
+                            "key": "dev.brunner/role",
+                            "operator": "In",
+                            "values": list(HELPER_ROLES),
+                        }
+                    ],
+                },
+                "policyTypes": ["Egress"],
+                "egress": [],
+            },
+        },
+    )
 
 
 def render_pvc(
@@ -291,6 +577,22 @@ def render_job(
         {"name": key, "value": value}
         for key, value in sorted(profile.nonsecret_environment.items())
     ]
+    if profile.proxy_url is not None:
+        no_proxy = "localhost,127.0.0.1,.svc,.cluster.local"
+        environment.extend(
+            {
+                "name": name,
+                "value": value,
+            }
+            for name, value in (
+                ("HTTP_PROXY", profile.proxy_url),
+                ("HTTPS_PROXY", profile.proxy_url),
+                ("NO_PROXY", no_proxy),
+                ("http_proxy", profile.proxy_url),
+                ("https_proxy", profile.proxy_url),
+                ("no_proxy", no_proxy),
+            )
+        )
     environment.extend(
         {
             "name": name,
@@ -362,7 +664,8 @@ def render_job(
     if workload.evaluation is not None:
         evaluation = workload.evaluation
         evaluation_spec = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
+            "runtime_protocol": evaluation.runtime_protocol,
             "benchmark_id": evaluation.benchmark_id,
             "benchmark_version": evaluation.benchmark_version,
             "contract_sha256": evaluation.contract_sha256,
@@ -372,6 +675,9 @@ def render_job(
             "timeout_seconds": evaluation.timeout_seconds,
             "reference_manifest_path": (
                 evaluation.reference_manifest_path
+            ),
+            "reference_manifest_sha256": (
+                evaluation.reference_manifest_sha256
             ),
             "reference_validate_command": list(
                 evaluation.reference_validate_command
@@ -471,6 +777,14 @@ def render_job(
         pod_spec["containers"] = [evaluator]
         active_deadline_seconds += evaluation.timeout_seconds
     pod_spec["activeDeadlineSeconds"] = math.ceil(active_deadline_seconds)
+    pod_labels = {
+        **labels,
+        "dev.brunner/role": PIPELINE_ROLE,
+    }
+    annotations = {
+        WORKLOAD_SHA256_ANNOTATION: workload_sha256(workload),
+        RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+    }
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -478,11 +792,15 @@ def render_job(
             "name": name,
             "namespace": profile.namespace,
             "labels": labels,
+            "annotations": annotations,
         },
         "spec": {
-            "backoffLimit": 0,
+            "backoffLimit": profile.job_backoff_limit,
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": {
+                    "labels": pod_labels,
+                    "annotations": annotations,
+                },
                 "spec": pod_spec,
             },
         },
@@ -502,6 +820,15 @@ class KubernetesBackend:
     ) -> None:
         self.profile = profile
         self.kubectl = kubectl
+        self._preflight_complete = False
+
+    def prepare_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
+        image = workload.image or self.profile.agent_image
+        return (
+            workload
+            if image == workload.image
+            else replace(workload, image=image)
+        )
 
     def _error(
         self,
@@ -688,6 +1015,7 @@ class KubernetesBackend:
         uid: str | None,
         *,
         required: bool = False,
+        warnings: list[str] | None = None,
     ) -> tuple[dict[str, Any], ...]:
         selectors = [f"involvedObject.name={name}"]
         if uid:
@@ -704,6 +1032,11 @@ class KubernetesBackend:
             check=False,
         )
         if result.returncode:
+            message = (result.stderr or result.stdout).strip()
+            if warnings is not None:
+                warnings.append(
+                    f"Kubernetes events unavailable for {name}: {message}"
+                )
             if required:
                 raise self._error(
                     (
@@ -821,6 +1154,147 @@ class KubernetesBackend:
                 result.stderr.encode(),
             )
 
+    def _remote_protocol(self, pod_name: str) -> dict[str, str]:
+        result = self._run(
+            "exec",
+            "-n",
+            self.profile.namespace,
+            pod_name,
+            "--",
+            "python",
+            "-m",
+            "brunner.backends.remote",
+            "protocol",
+        )
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise BackendRequestError(
+                f"helper image in Pod {pod_name} returned invalid Brunner "
+                "runtime identity"
+            ) from error
+        if (
+            not isinstance(value, dict)
+            or value.get("protocol") != BRUNNER_RUNTIME_PROTOCOL
+        ):
+            raise BackendRequestError(
+                f"helper image in Pod {pod_name} has incompatible Brunner "
+                f"runtime protocol: {value!r}"
+            )
+        return {
+            "protocol": str(value["protocol"]),
+            "version": str(value.get("version") or ""),
+        }
+
+    @staticmethod
+    def _stage_report(workload: WorkloadSpec) -> dict[str, Any]:
+        report = load_stage_report(workload.trial / "workspace")
+        return {
+            **report.to_dict(),
+            "file_inventory": report.file_inventory,
+        }
+
+    def _validate_images(self, workload: WorkloadSpec) -> None:
+        if not self.profile.require_image_digests:
+            return
+        images = {
+            "agent": workload.image or self.profile.agent_image,
+            "artifact reader": self.profile.artifact_reader_image,
+        }
+        if workload.evaluation is not None:
+            images["evaluator"] = workload.evaluation.image
+        mutable = [
+            f"{label}={image!r}"
+            for label, image in images.items()
+            if image is not None and not _image_is_immutable(image)
+        ]
+        if mutable:
+            raise BackendRequestError(
+                "Kubernetes production workloads require immutable image "
+                "digests; use image@sha256:<digest> or explicitly set "
+                "require_image_digests=False for tests: "
+                + ", ".join(mutable)
+            )
+
+    def _check_permission(
+        self,
+        verb: str,
+        resource: str,
+    ) -> None:
+        result = self._run(
+            "auth",
+            "can-i",
+            verb,
+            resource,
+            "-n",
+            self.profile.namespace,
+            check=False,
+        )
+        if result.returncode or result.stdout.strip().lower() != "yes":
+            message = (result.stderr or result.stdout).strip()
+            raise BackendRequestError(
+                "Kubernetes preflight permission denied: "
+                f"{verb} {resource} in namespace "
+                f"{self.profile.namespace}: {message}"
+            )
+
+    def _ensure_preflight(self, workload: WorkloadSpec) -> None:
+        if not self.profile.preflight_enabled:
+            return
+        if not self.profile.artifact_reader_image:
+            raise BackendRequestError(
+                "Kubernetes campaigns require artifact_reader_image so "
+                "terminal and failed trials can be collected"
+            )
+        self._validate_images(workload)
+        self._validate_reference_claim(workload)
+        if self._preflight_complete:
+            return
+        result = self._run(
+            "version",
+            "--output=json",
+            check=False,
+        )
+        if result.returncode:
+            raise self._error(
+                ("version", "--output=json"),
+                result.returncode,
+                result.stdout.encode(),
+                result.stderr.encode(),
+            )
+        permissions = [
+            ("create", "jobs.batch"),
+            ("get", "jobs.batch"),
+            ("list", "jobs.batch"),
+            ("delete", "jobs.batch"),
+            ("create", "persistentvolumeclaims"),
+            ("get", "persistentvolumeclaims"),
+            ("delete", "persistentvolumeclaims"),
+            ("patch", "persistentvolumeclaims"),
+            ("create", "pods"),
+            ("get", "pods"),
+            ("list", "pods"),
+            ("delete", "pods"),
+            ("create", "pods/exec"),
+            ("get", "pods/log"),
+            ("get", "events"),
+            ("list", "events"),
+            ("get", "resourcequotas"),
+            ("list", "resourcequotas"),
+        ]
+        if not self.profile.unsafe_disable_network_policy_for_tests:
+            permissions.extend(
+                (
+                    ("create", "networkpolicies.networking.k8s.io"),
+                    ("get", "networkpolicies.networking.k8s.io"),
+                    ("patch", "networkpolicies.networking.k8s.io"),
+                    ("delete", "networkpolicies.networking.k8s.io"),
+                )
+            )
+        for verb, resource in permissions:
+            self._check_permission(verb, resource)
+        self._preflight_complete = True
+
     def _stage_trial(
         self,
         workload: WorkloadSpec,
@@ -831,7 +1305,7 @@ class KubernetesBackend:
         workload_name = str(labels["dev.brunner/workload"])
         pod_name = native_resource_name(
             workload.workload_id,
-            workload.trial,
+            workload.resource_id,
             suffix="-stage",
         )
         # Stagers created before role labels were introduced are still
@@ -860,6 +1334,19 @@ class KubernetesBackend:
                 pod_name,
                 self.profile.staging_timeout_seconds,
             )
+            self._remote_protocol(pod_name)
+            self._run(
+                "exec",
+                "-n",
+                self.profile.namespace,
+                pod_name,
+                "--",
+                "python",
+                "-m",
+                "brunner.backends.remote",
+                "clear",
+                "/brunner/trial",
+            )
             self._run(
                 "cp",
                 str(workload.trial.resolve()) + "/.",
@@ -867,6 +1354,27 @@ class KubernetesBackend:
                     f"{self.profile.namespace}/{pod_name}:"
                     "/brunner/trial"
                 ),
+            )
+            stage_report = self._stage_report(workload)
+            encoded = base64.urlsafe_b64encode(
+                json.dumps(
+                    stage_report,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode()
+            self._run(
+                "exec",
+                "-n",
+                self.profile.namespace,
+                pod_name,
+                "--",
+                "python",
+                "-m",
+                "brunner.backends.remote",
+                "verify-stage",
+                "/brunner/trial",
+                encoded,
             )
         except Exception as error:
             primary_error = error
@@ -902,6 +1410,12 @@ class KubernetesBackend:
                 "claim_name": claim_name,
                 "namespace": self.profile.namespace,
                 "submitted_at": submitted_at or _now(),
+                "resource_id": workload.resource_id,
+                "workload_sha256": workload.sha256,
+                "challenge_sha256": self._stage_report(workload)[
+                    "challenge_sha256"
+                ],
+                "runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
                 "evaluation_results_path": (
                     workload.evaluation.results_path
                     if workload.evaluation is not None
@@ -918,6 +1432,8 @@ class KubernetesBackend:
         job_name: str,
         claim_name: str,
         workload_name: str | None = None,
+        workload_sha256_value: str,
+        challenge_sha256: str,
     ) -> None:
         labels = job.get("metadata", {}).get("labels", {})
         if labels.get("dev.brunner/workload") != (
@@ -929,6 +1445,44 @@ class KubernetesBackend:
         if pvc is None:
             raise BackendRequestError(
                 f"existing Kubernetes Job {job_name} has no PVC {claim_name}"
+            )
+        job_annotations = job.get("metadata", {}).get("annotations", {})
+        expected_job_annotations = {
+            WORKLOAD_SHA256_ANNOTATION: workload_sha256_value,
+            RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+        }
+        job_mismatches = {
+            key: {
+                "expected": expected,
+                "actual": job_annotations.get(key),
+            }
+            for key, expected in expected_job_annotations.items()
+            if job_annotations.get(key) != expected
+        }
+        if job_mismatches:
+            raise BackendRequestError(
+                f"existing Kubernetes Job {job_name} identity mismatch: "
+                f"{job_mismatches}"
+            )
+        pvc_annotations = pvc.get("metadata", {}).get("annotations", {})
+        expected_pvc_annotations = {
+            STAGED_ANNOTATION: "true",
+            CHALLENGE_SHA256_ANNOTATION: challenge_sha256,
+            WORKLOAD_SHA256_ANNOTATION: workload_sha256_value,
+            RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+        }
+        pvc_mismatches = {
+            key: {
+                "expected": expected,
+                "actual": pvc_annotations.get(key),
+            }
+            for key, expected in expected_pvc_annotations.items()
+            if pvc_annotations.get(key) != expected
+        }
+        if pvc_mismatches:
+            raise BackendRequestError(
+                f"existing Kubernetes PVC {claim_name} identity mismatch: "
+                f"{pvc_mismatches}"
             )
         volumes = (
             job.get("spec", {})
@@ -979,16 +1533,60 @@ class KubernetesBackend:
             raise BackendRequestError(
                 f"trusted reference PVC does not exist: {claim_name}"
             )
+        access_modes = set(
+            claim.get("status", {}).get("accessModes")
+            or claim.get("spec", {}).get("accessModes")
+            or ()
+        )
+        if "ReadWriteMany" not in access_modes:
+            raise BackendRequestError(
+                f"trusted reference PVC {claim_name} must support "
+                "ReadWriteMany"
+            )
+        annotation = (
+            claim.get("metadata", {})
+            .get("annotations", {})
+            .get(REFERENCE_MANIFEST_SHA256_ANNOTATION)
+        )
+        if annotation != evaluation.reference_manifest_sha256:
+            raise BackendRequestError(
+                f"trusted reference PVC {claim_name} manifest digest "
+                f"mismatch: {annotation!r} != "
+                f"{evaluation.reference_manifest_sha256!r}"
+            )
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        workload = self.prepare_workload(workload)
         workload.validate()
-        self._validate_reference_claim(workload)
-        image = workload.image or self.profile.agent_image
+        self._ensure_preflight(workload)
+        image = workload.image
         if not image:
             raise BackendRequestError(
                 "Kubernetes workloads require an agent image"
             )
         state_path = self._state_path(workload.trial)
+        stage_report = self._stage_report(workload)
+        workload_digest = workload.sha256
+        job_name = native_resource_name(
+            workload.workload_id,
+            workload.resource_id,
+        )
+        claim_name = native_resource_name(
+            workload.workload_id,
+            workload.resource_id,
+            suffix="-data",
+        )
+        labels = {
+            "app.kubernetes.io/name": "brunner",
+            "dev.brunner/workload": job_name,
+            **workload.labels,
+        }
+        for policy in render_network_policies(
+            workload,
+            self.profile,
+            labels,
+        ):
+            self._apply(policy)
         if state_path.is_file():
             state = json.loads(state_path.read_text())
             handle = BackendHandle(
@@ -998,22 +1596,66 @@ class KubernetesBackend:
                 trial=workload.trial.resolve(),
                 metadata=dict(state["metadata"]),
             )
+            expected_handle = {
+                "native_id": job_name,
+                "workload_id": workload.workload_id,
+                "claim_name": claim_name,
+                "namespace": self.profile.namespace,
+                "resource_id": workload.resource_id,
+                "workload_sha256": workload_digest,
+                "challenge_sha256": stage_report["challenge_sha256"],
+                "runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
+            }
+            actual_handle = {
+                "native_id": handle.native_id,
+                "workload_id": handle.workload_id,
+                **{
+                    key: handle.metadata.get(key)
+                    for key in (
+                        "claim_name",
+                        "namespace",
+                        "resource_id",
+                        "workload_sha256",
+                        "challenge_sha256",
+                        "runtime_protocol",
+                    )
+                },
+            }
+            mismatches = {
+                key: {
+                    "expected": expected,
+                    "actual": actual_handle.get(key),
+                }
+                for key, expected in expected_handle.items()
+                if actual_handle.get(key) != expected
+            }
+            if mismatches:
+                raise BackendRequestError(
+                    "persisted Kubernetes submission identity differs from "
+                    f"the current workload: {mismatches}"
+                )
+            job = self._get("job", handle.native_id)
+            pvc = self._get(
+                "pvc",
+                str(handle.metadata["claim_name"]),
+            )
+            if job is not None:
+                self._validate_remote_submission(
+                    job=job,
+                    pvc=pvc,
+                    job_name=handle.native_id,
+                    claim_name=str(handle.metadata["claim_name"]),
+                    workload_name=native_resource_name(
+                        workload.workload_id,
+                        workload.resource_id,
+                    ),
+                    workload_sha256_value=workload_digest,
+                    challenge_sha256=str(
+                        stage_report["challenge_sha256"]
+                    ),
+                )
             return handle
 
-        job_name = native_resource_name(
-            workload.workload_id,
-            workload.trial,
-        )
-        claim_name = native_resource_name(
-            workload.workload_id,
-            workload.trial,
-            suffix="-data",
-        )
-        labels = {
-            "app.kubernetes.io/name": "brunner",
-            "dev.brunner/workload": job_name,
-            **workload.labels,
-        }
         job = self._get("job", job_name)
         pvc = self._get("pvc", claim_name)
         if job is not None:
@@ -1022,6 +1664,10 @@ class KubernetesBackend:
                 pvc=pvc,
                 job_name=job_name,
                 claim_name=claim_name,
+                workload_sha256_value=workload_digest,
+                challenge_sha256=str(
+                    stage_report["challenge_sha256"]
+                ),
             )
             handle = self._submission_handle(
                 workload,
@@ -1042,11 +1688,34 @@ class KubernetesBackend:
                     "by this Brunner workload"
                 )
             staged = (
-                pvc.get("metadata", {})
-                .get("annotations", {})
-                .get(STAGED_ANNOTATION)
-                == "true"
+                pvc.get("metadata", {}).get("annotations", {})
             )
+            if staged.get(STAGED_ANNOTATION) == "true":
+                expected_annotations = {
+                    CHALLENGE_SHA256_ANNOTATION: stage_report[
+                        "challenge_sha256"
+                    ],
+                    WORKLOAD_SHA256_ANNOTATION: workload_digest,
+                    RUNTIME_PROTOCOL_ANNOTATION: (
+                        BRUNNER_RUNTIME_PROTOCOL
+                    ),
+                }
+                mismatches = {
+                    key: {
+                        "expected": expected,
+                        "actual": staged.get(key),
+                    }
+                    for key, expected in expected_annotations.items()
+                    if staged.get(key) != expected
+                }
+                if mismatches:
+                    raise BackendRequestError(
+                        f"existing staged Kubernetes PVC {claim_name} "
+                        f"identity mismatch: {mismatches}"
+                    )
+                staged = True
+            else:
+                staged = False
         if not staged:
             self._stage_trial(workload, claim_name, image, labels)
             self._run(
@@ -1056,6 +1725,15 @@ class KubernetesBackend:
                 "-n",
                 self.profile.namespace,
                 f"{STAGED_ANNOTATION}=true",
+                (
+                    f"{CHALLENGE_SHA256_ANNOTATION}="
+                    f"{stage_report['challenge_sha256']}"
+                ),
+                f"{WORKLOAD_SHA256_ANNOTATION}={workload_digest}",
+                (
+                    f"{RUNTIME_PROTOCOL_ANNOTATION}="
+                    f"{BRUNNER_RUNTIME_PROTOCOL}"
+                ),
                 "--overwrite",
             )
         self._apply(
@@ -1080,25 +1758,26 @@ class KubernetesBackend:
         workload: WorkloadSpec,
         generation: int,
     ) -> BackendHandle:
+        workload = self.prepare_workload(workload)
         workload.validate()
-        self._validate_reference_claim(workload)
+        self._ensure_preflight(workload)
         if generation < 1:
             raise BackendRequestError(
                 "Kubernetes restart generation must be positive"
             )
-        image = workload.image or self.profile.agent_image
+        image = workload.image
         if not image:
             raise BackendRequestError(
                 "Kubernetes workloads require an agent image"
             )
         workload_name = native_resource_name(
             workload.workload_id,
-            workload.trial,
+            workload.resource_id,
         )
         claim_name = str(handle.metadata["claim_name"])
         job_name = native_resource_name(
             workload.workload_id,
-            workload.trial,
+            workload.resource_id,
             suffix=f"-r{generation}",
         )
         labels = {
@@ -1118,6 +1797,33 @@ class KubernetesBackend:
                 f"existing Kubernetes PVC {claim_name} is not owned "
                 "by this Brunner workload"
             )
+        stage_report = self._stage_report(workload)
+        pvc_annotations = pvc.get("metadata", {}).get("annotations", {})
+        expected_pvc_annotations = {
+            STAGED_ANNOTATION: "true",
+            CHALLENGE_SHA256_ANNOTATION: stage_report["challenge_sha256"],
+            WORKLOAD_SHA256_ANNOTATION: workload.sha256,
+            RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+        }
+        mismatches = {
+            key: {
+                "expected": expected,
+                "actual": pvc_annotations.get(key),
+            }
+            for key, expected in expected_pvc_annotations.items()
+            if pvc_annotations.get(key) != expected
+        }
+        if mismatches:
+            raise BackendRequestError(
+                f"cannot restart from unverified Kubernetes PVC "
+                f"{claim_name}: {mismatches}"
+            )
+        for policy in render_network_policies(
+            workload,
+            self.profile,
+            labels,
+        ):
+            self._apply(policy)
         job = self._get("job", job_name)
         if job is not None:
             self._validate_remote_submission(
@@ -1126,6 +1832,8 @@ class KubernetesBackend:
                 job_name=job_name,
                 claim_name=claim_name,
                 workload_name=workload_name,
+                workload_sha256_value=workload.sha256,
+                challenge_sha256=str(stage_report["challenge_sha256"]),
             )
             restarted = self._submission_handle(
                 workload,
@@ -1160,18 +1868,73 @@ class KubernetesBackend:
             restarted,
         )
 
-    def _pod_for_handle(
+    def _pods_for_handle(
         self,
         handle: BackendHandle,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any], ...]:
         value = self._get(
             "pods",
             labels=f"job-name={handle.native_id}",
         )
         if not value:
+            return ()
+        items = [
+            item
+            for item in value.get("items", [])
+            if isinstance(item, dict)
+        ]
+        return tuple(
+            sorted(
+                items,
+                key=lambda item: str(
+                    item.get("metadata", {}).get(
+                        "creationTimestamp",
+                        "",
+                    )
+                ),
+            )
+        )
+
+    def _pod_for_handle(
+        self,
+        handle: BackendHandle,
+    ) -> dict[str, Any] | None:
+        pods = self._pods_for_handle(handle)
+        return pods[-1] if pods else None
+
+    @staticmethod
+    def _pod_summary(pod: dict[str, Any]) -> dict[str, Any]:
+        metadata = pod.get("metadata", {})
+        status = pod.get("status", {})
+        return {
+            "name": metadata.get("name"),
+            "uid": metadata.get("uid"),
+            "created_at": metadata.get("creationTimestamp"),
+            "phase": status.get("phase"),
+            "reason": status.get("reason"),
+            "message": status.get("message"),
+            "node": pod.get("spec", {}).get("nodeName"),
+            "container_terminations": list(
+                KubernetesBackend._terminated_containers(pod)
+            ),
+        }
+
+    @staticmethod
+    def _select_terminal_pod(
+        pods: tuple[dict[str, Any], ...],
+        phase: str,
+    ) -> dict[str, Any] | None:
+        if not pods:
             return None
-        items = value.get("items", [])
-        return items[0] if items else None
+        if phase == "succeeded":
+            succeeded = [
+                pod
+                for pod in pods
+                if pod.get("status", {}).get("phase") == "Succeeded"
+            ]
+            if succeeded:
+                return succeeded[-1]
+        return pods[-1]
 
     @staticmethod
     def _terminated_containers(
@@ -1239,19 +2002,44 @@ class KubernetesBackend:
             )
         job = self._get("job", handle.native_id, check=False)
         if job is None:
+            claim_phase = (
+                pvc.get("status", {}).get("phase") if pvc else None
+            )
+            storage_present = pvc is not None
             return BackendSnapshot(
-                phase="unknown",
-                reason="JobMissing",
-                message="workload job has not been created or was deleted",
+                phase="failed",
+                reason=(
+                    "JobMissing"
+                    if storage_present
+                    else "TrialStorageMissing"
+                ),
+                message=(
+                    "workload Job is missing; the durable trial PVC can be "
+                    "restarted"
+                    if storage_present
+                    else "workload Job and durable trial PVC are both missing"
+                ),
                 warnings=tuple(warnings),
                 details={
-                    "claim_phase": (
-                        pvc.get("status", {}).get("phase") if pvc else None
-                    ),
-                    "retryable_infrastructure": False,
+                    "claim_phase": claim_phase,
+                    "retryable_infrastructure": storage_present,
                 },
             )
-        pod = self._pod_for_handle(handle)
+        job_status = job.get("status", {})
+        conditions = {
+            item.get("type"): item
+            for item in job_status.get("conditions", [])
+        }
+        if "Complete" in conditions:
+            phase = "succeeded"
+        elif "Failed" in conditions:
+            phase = "failed"
+        elif job_status.get("active"):
+            phase = "running"
+        else:
+            phase = "pending"
+        pods = self._pods_for_handle(handle)
+        pod = self._select_terminal_pod(pods, phase)
         terminations = self._terminated_containers(pod)
         agent_termination = next(
             (
@@ -1306,19 +2094,6 @@ class KubernetesBackend:
             or evaluator_termination
             or agent_termination
         )
-        job_status = job.get("status", {})
-        conditions = {
-            item.get("type"): item
-            for item in job_status.get("conditions", [])
-        }
-        if "Complete" in conditions:
-            phase = "succeeded"
-        elif "Failed" in conditions:
-            phase = "failed"
-        elif job_status.get("active"):
-            phase = "running"
-        else:
-            phase = "pending"
         reason = None
         message = None
         exit_code = terminated.get("exitCode") if terminated else None
@@ -1343,7 +2118,7 @@ class KubernetesBackend:
                 or brunner_incomplete
             )
         )
-        if container_failed:
+        if container_failed and phase in {"succeeded", "failed"}:
             phase = "failed"
             if termination_reason in RETRYABLE_CONTAINER_FAILURES:
                 reason = termination_reason
@@ -1390,11 +2165,8 @@ class KubernetesBackend:
             "job": [],
             "pod": [],
         }
-        event_failure_reason = None
-        event_failure_message = None
         if phase in {"succeeded", "failed"}:
             job_metadata = job.get("metadata", {})
-            pod_metadata = pod.get("metadata", {}) if pod else {}
             kubernetes_events["job"] = list(
                 self._events(
                     str(job_metadata.get("name") or handle.native_id),
@@ -1403,19 +2175,20 @@ class KubernetesBackend:
                         if job_metadata.get("uid") is not None
                         else None
                     ),
-                    required=True,
+                    warnings=warnings,
                 )
             )
-            if pod:
-                kubernetes_events["pod"] = list(
+            for event_pod in pods:
+                event_metadata = event_pod.get("metadata", {})
+                kubernetes_events["pod"].extend(
                     self._events(
-                        str(pod_metadata.get("name") or ""),
+                        str(event_metadata.get("name") or ""),
                         (
-                            str(pod_metadata["uid"])
-                            if pod_metadata.get("uid") is not None
+                            str(event_metadata["uid"])
+                            if event_metadata.get("uid") is not None
                             else None
                         ),
-                        required=True,
+                        warnings=warnings,
                     )
                 )
             for event in (
@@ -1424,13 +2197,6 @@ class KubernetesBackend:
             ):
                 if event.get("type") != "Warning":
                     continue
-                event_reason = event.get("reason")
-                if (
-                    event_failure_reason is None
-                    and event_reason in RETRYABLE_CONTAINER_FAILURES
-                ):
-                    event_failure_reason = str(event_reason)
-                    event_failure_message = str(event.get("message") or "")
                 detail = ": ".join(
                     str(value)
                     for value in (
@@ -1441,10 +2207,6 @@ class KubernetesBackend:
                 )
                 if detail and detail not in warnings:
                     warnings.append(detail)
-        if phase == "succeeded" and event_failure_reason is not None:
-            phase = "failed"
-            reason = event_failure_reason
-            message = event_failure_message
         if (
             brunner_evaluation
             and brunner_evaluation.get("retryable_infrastructure") is False
@@ -1491,6 +2253,10 @@ class KubernetesBackend:
                 ),
                 "terminated_container": terminated,
                 "container_terminations": list(terminations),
+                "pods": [
+                    self._pod_summary(item)
+                    for item in pods
+                ],
                 "job_failure_reason": job_failure_reason,
                 "pod_failure_reason": pod_failure_reason,
                 "retryable_infrastructure": retryable_infrastructure,
@@ -1501,23 +2267,41 @@ class KubernetesBackend:
         )
 
     def logs(self, handle: BackendHandle) -> str:
-        result = self._run(
-            "logs",
-            f"job/{handle.native_id}",
-            "-n",
-            self.profile.namespace,
-            "--all-containers=true",
-            "--prefix=true",
-            check=False,
-        )
-        if result.returncode and "not found" not in result.stderr.lower():
-            raise self._error(
-                ("logs", f"job/{handle.native_id}"),
-                result.returncode,
-                result.stdout.encode(),
-                result.stderr.encode(),
+        pods = self._pods_for_handle(handle)
+        targets = [
+            f"pod/{pod.get('metadata', {}).get('name')}"
+            for pod in pods
+            if pod.get("metadata", {}).get("name")
+        ]
+        if not targets:
+            targets = [f"job/{handle.native_id}"]
+        output = []
+        for target in targets:
+            result = self._run(
+                "logs",
+                target,
+                "-n",
+                self.profile.namespace,
+                "--all-containers=true",
+                "--prefix=true",
+                check=False,
             )
-        return result.stdout + result.stderr
+            if (
+                result.returncode
+                and "not found" not in result.stderr.lower()
+            ):
+                raise self._error(
+                    ("logs", target),
+                    result.returncode,
+                    result.stdout.encode(),
+                    result.stderr.encode(),
+                )
+            output.append(
+                f"===== {target} =====\n"
+                + result.stdout
+                + result.stderr
+            )
+        return "\n".join(output)
 
     def _reader(
         self,
@@ -1559,6 +2343,7 @@ class KubernetesBackend:
                 name,
                 self.profile.reader_timeout_seconds,
             )
+            self._remote_protocol(name)
         except BackendRequestError as error:
             pod = self._get("pod", name, check=False)
             node = (
@@ -1597,6 +2382,7 @@ class KubernetesBackend:
         policy: ArtifactPolicy,
         included_groups: frozenset[str],
         evaluation_results_path: str = "evaluation/results.json",
+        included_globs: tuple[str, ...] | None = None,
     ) -> dict[str, dict[str, Any]]:
         encoded = base64.urlsafe_b64encode(
             json.dumps(
@@ -1611,7 +2397,18 @@ class KubernetesBackend:
                         policy.collect_evaluated_artifacts
                     ),
                     "max_collection_bytes": policy.max_collection_bytes,
+                    "failure_diagnostic_globs": list(
+                        policy.failure_diagnostic_globs
+                    ),
+                    "max_diagnostic_collection_bytes": (
+                        policy.max_diagnostic_collection_bytes
+                    ),
                     "included_groups": sorted(included_groups),
+                    "included_globs": (
+                        list(included_globs)
+                        if included_globs is not None
+                        else None
+                    ),
                 },
                 separators=(",", ":"),
             ).encode()
@@ -1706,10 +2503,46 @@ class KubernetesBackend:
             for name, metadata in inventory.items()
             if name not in unchanged
         }
-        transferred_bytes = enforce_inventory_size(
-            transfer_inventory,
-            policy.max_collection_bytes,
-        )
+        collection_mode = "complete"
+        omitted_files = 0
+        omitted_bytes = 0
+        try:
+            transferred_bytes = enforce_inventory_size(
+                transfer_inventory,
+                policy.max_collection_bytes,
+            )
+        except IntegrityError:
+            if evaluation_results_path in inventory:
+                raise
+            full_inventory = inventory
+            inventory = self._remote_inventory(
+                pod,
+                inventory_policy,
+                included_groups,
+                evaluation_results_path,
+                included_globs=policy.failure_diagnostic_globs,
+            )
+            unchanged = self._unchanged_staged_files(
+                baseline_trial,
+                inventory,
+            )
+            transfer_inventory = {
+                name: metadata
+                for name, metadata in inventory.items()
+                if name not in unchanged
+            }
+            transferred_bytes = enforce_inventory_size(
+                transfer_inventory,
+                policy.max_diagnostic_collection_bytes,
+            )
+            collection_mode = "diagnostics"
+            omitted_files = len(full_inventory) - len(inventory)
+            omitted_bytes = sum(
+                int(metadata.get("size", 0))
+                for name, metadata in full_inventory.items()
+                if name not in inventory
+                and metadata.get("type") == "file"
+            )
         partial, complete = prepare_partial_artifacts(
             destination,
             inventory,
@@ -1788,6 +2621,9 @@ class KubernetesBackend:
         )
         result["reused_staged_files"] = len(unchanged)
         result["transferred_bytes"] = transferred_bytes
+        result["collection_mode"] = collection_mode
+        result["omitted_files"] = omitted_files
+        result["omitted_bytes"] = omitted_bytes
         return result
 
     @staticmethod
@@ -1941,6 +2777,27 @@ class KubernetesBackend:
         self._delete_helper_pods(helper_workloads, "trial-stager")
         self._delete_helper_pods(helper_workloads, "artifact-reader")
         self._delete_and_wait("job", handle.native_id)
+        if not self.profile.unsafe_disable_network_policy_for_tests:
+            resource_id = str(
+                handle.metadata.get("resource_id")
+                or trial_resource_id(handle.trial)
+            )
+            self._delete_and_wait(
+                "networkpolicy",
+                native_resource_name(
+                    handle.workload_id,
+                    resource_id,
+                    suffix="-network",
+                ),
+            )
+            self._delete_and_wait(
+                "networkpolicy",
+                native_resource_name(
+                    handle.workload_id,
+                    resource_id,
+                    suffix="-helpers",
+                ),
+            )
         if retain_storage:
             state["storage_retained"] = True
             state["storage_retained_at"] = _now()
@@ -1952,7 +2809,14 @@ class KubernetesBackend:
             str(handle.metadata["claim_name"]),
         )
 
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
+        if workload is not None:
+            workload = self.prepare_workload(workload)
+            workload.validate()
+            self._ensure_preflight(workload)
         value = self._get(
             "jobs",
             labels="app.kubernetes.io/name=brunner",
@@ -1965,7 +2829,7 @@ class KubernetesBackend:
                 running += 1
             elif not status.get("succeeded") and not status.get("failed"):
                 pending += 1
-        available = (
+        profile_available = (
             None
             if self.profile.max_parallel is None
             else max(
@@ -1973,13 +2837,96 @@ class KubernetesBackend:
                 self.profile.max_parallel - running - pending,
             )
         )
+        quota_available: int | None = None
+        quota_limits: list[dict[str, Any]] = []
+        requirements: dict[str, Decimal] = {}
+        if workload is not None:
+            labels = {
+                "app.kubernetes.io/name": "brunner",
+                "dev.brunner/workload": native_resource_name(
+                    workload.workload_id,
+                    workload.resource_id,
+                ),
+            }
+            requirements = _resource_requirements(
+                render_job(
+                    "capacity-probe",
+                    "capacity-probe-data",
+                    workload,
+                    self.profile,
+                    labels,
+                ),
+                render_pvc(
+                    "capacity-probe-data",
+                    self.profile,
+                    labels,
+                ),
+            )
+            if not self.profile.unsafe_disable_network_policy_for_tests:
+                requirements[
+                    "count/networkpolicies.networking.k8s.io"
+                ] = Decimal(2)
+            quotas = self._get("resourcequota") or {"items": []}
+            for quota in quotas.get("items", ()):
+                hard = quota.get("status", {}).get("hard", {})
+                used = quota.get("status", {}).get("used", {})
+                if not isinstance(hard, dict) or not isinstance(used, dict):
+                    continue
+                constrained = []
+                for resource, requirement in requirements.items():
+                    if resource not in hard or requirement <= 0:
+                        continue
+                    remaining = max(
+                        Decimal(0),
+                        _quantity(hard[resource])
+                        - _quantity(used.get(resource, "0")),
+                    )
+                    capacity = int(remaining // requirement)
+                    constrained.append(capacity)
+                    quota_limits.append(
+                        {
+                            "quota": quota.get("metadata", {}).get("name"),
+                            "resource": resource,
+                            "hard": hard[resource],
+                            "used": used.get(resource, "0"),
+                            "required": str(requirement),
+                            "available_workloads": capacity,
+                        }
+                    )
+                if constrained:
+                    current = min(constrained)
+                    quota_available = (
+                        current
+                        if quota_available is None
+                        else min(quota_available, current)
+                    )
+        available = profile_available
+        if quota_available is not None:
+            available = (
+                quota_available
+                if available is None
+                else min(available, quota_available)
+            )
+        limit = self.profile.max_parallel
+        if quota_available is not None:
+            quota_limit = running + pending + quota_available
+            limit = (
+                quota_limit
+                if limit is None
+                else min(limit, quota_limit)
+            )
         return BackendCapacity(
-            limit=self.profile.max_parallel,
+            limit=limit,
             running=running,
             pending=pending,
             available=available,
             details={
                 "namespace": self.profile.namespace,
                 "checked_at": _now(),
+                "requirements": {
+                    name: str(value)
+                    for name, value in requirements.items()
+                },
+                "quota_limits": quota_limits,
             },
         )

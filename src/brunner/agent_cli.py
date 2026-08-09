@@ -16,6 +16,7 @@ from brunner.io import write_json_atomic
 from brunner.pipeline import summarize_pipeline_state
 from brunner.providers import ProviderSettings
 from brunner.runner import run_staged_trial
+from brunner.runtime_protocol import validate_trial_runtime
 from brunner.trial import load_trial_identity
 
 
@@ -87,6 +88,7 @@ def main() -> None:
     }
     try:
         try:
+            validate_trial_runtime(args.trial)
             identity = load_trial_identity(args.trial)
             runtime = None
             if (

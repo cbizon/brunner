@@ -36,8 +36,10 @@ fault-injection coverage.
 - Evidence dossiers, timing facts, assessment provenance, and report links
 - Reference bundle manifests and integrity checks
 - Append-only campaign task lists with caller-owned trial IDs
-- Campaign capacity control, recovery, and static dashboards
+- ResourceQuota-aware campaign capacity, recovery, and persistent monitors
 - Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
+- Default-deny Sterling egress with deployment-owned proxy allowlisting
+- Immutable image, runtime protocol, challenge, workload, and reference identity
 
 ## Benchmark Slots
 
@@ -74,12 +76,20 @@ so neither phase depends on the orchestrating machine remaining awake or
 connected. Brunner does not provide host-process, local-container, or
 orchestrator-side evaluation campaigns.
 
+Production profiles require digest-pinned agent, evaluator, and reader images.
+Brunner applies workload NetworkPolicies before staging, permits the pipeline
+to use only DNS and an explicitly selected proxy, and gives helper Pods no
+egress. The proxy deployment, not Brunner or the benchmark, owns external
+domain allowlists.
+
 Evaluator-consumed submission artifacts are not copied back by default.
 `ArtifactPolicy.collect_evaluated_artifacts=True` is an explicit opt-in, and
 `ArtifactPolicy.max_collection_bytes` bounds the total transfer even when raw
 artifacts are requested. Unchanged files from the staged challenge are
 reconstructed in the collected trial with local hard links rather than being
-downloaded from Sterling again.
+downloaded from Sterling again. If an incomplete trial still exceeds the
+normal ceiling, Brunner collects only the bounded diagnostic policy and records
+what was omitted.
 
 Materialize a harmless candidate-visible example resource before staging:
 

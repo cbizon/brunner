@@ -14,11 +14,13 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from brunner.backends.base import TrustedEvaluationSpec
+from brunner import BRUNNER_RUNTIME_PROTOCOL
 from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import ContractError, EvaluationError, IntegrityError
 from brunner.failure import failure_from_exception, failure_record
 from brunner.io import write_json_atomic
+from brunner.hashing import sha256_file
 from brunner.reference import validate_reference_manifest
 from brunner.submission import ValidatedSubmission, validate_submission
 
@@ -106,6 +108,14 @@ def evaluation_spec(
 ) -> TrustedEvaluationSpec:
     reference = definition.reference
     evaluation = definition.evaluation
+    reference_manifest_sha256 = None
+    if reference is not None:
+        manifest = reference.root / reference.manifest_path
+        if not manifest.is_file():
+            raise IntegrityError(
+                f"reference manifest does not exist: {manifest}"
+            )
+        reference_manifest_sha256 = sha256_file(manifest)
     return TrustedEvaluationSpec(
         benchmark_id=definition.benchmark_id,
         benchmark_version=definition.version,
@@ -115,9 +125,11 @@ def evaluation_spec(
         results_path=evaluation.results_path,
         primary_report=evaluation.primary_report,
         timeout_seconds=evaluation.timeout_seconds,
+        runtime_protocol=BRUNNER_RUNTIME_PROTOCOL,
         reference_manifest_path=(
             reference.manifest_path if reference is not None else None
         ),
+        reference_manifest_sha256=reference_manifest_sha256,
         reference_validate_command=(
             reference.validate_command if reference is not None else ()
         ),
@@ -131,7 +143,7 @@ def evaluation_spec(
 
 
 def evaluation_spec_from_dict(value: dict[str, Any]) -> TrustedEvaluationSpec:
-    if value.get("schema_version") != "1.0":
+    if value.get("schema_version") != "2.0":
         raise EvaluationError("unsupported trusted evaluation specification")
     return TrustedEvaluationSpec(
         benchmark_id=str(value["benchmark_id"]),
@@ -146,9 +158,15 @@ def evaluation_spec_from_dict(value: dict[str, Any]) -> TrustedEvaluationSpec:
             else None
         ),
         timeout_seconds=float(value["timeout_seconds"]),
+        runtime_protocol=str(value["runtime_protocol"]),
         reference_manifest_path=(
             str(value["reference_manifest_path"])
             if value.get("reference_manifest_path") is not None
+            else None
+        ),
+        reference_manifest_sha256=(
+            str(value["reference_manifest_sha256"])
+            if value.get("reference_manifest_sha256") is not None
             else None
         ),
         reference_validate_command=tuple(
@@ -238,6 +256,10 @@ def execute_evaluation(
     }
     try:
         metadata = json.loads((trial / "metadata/manifest.json").read_text())
+        if metadata.get("brunner_runtime_protocol") != spec.runtime_protocol:
+            raise IntegrityError(
+                "trial runtime protocol differs from evaluator runtime"
+            )
         if metadata.get("contract_sha256") != contract.sha256:
             raise ContractError(
                 "trial contract digest differs from evaluator contract"
@@ -278,19 +300,39 @@ def execute_evaluation(
             reference_manifest_path = (
                 reference_root / spec.reference_manifest_path
             )
+            if (
+                sha256_file(reference_manifest_path)
+                != spec.reference_manifest_sha256
+            ):
+                raise IntegrityError(
+                    "mounted reference manifest digest does not match the "
+                    "orchestrator-approved manifest"
+                )
             reference_manifest = validate_reference_manifest(
                 reference_root,
                 reference_manifest_path,
             )
-            reference_contract = reference_manifest.get(
-                "metadata", {}
-            ).get("contract_sha256")
-            if (
-                reference_contract is not None
-                and reference_contract != contract.sha256
-            ):
+            reference_metadata = reference_manifest.get("metadata")
+            expected_reference_metadata = {
+                "benchmark_id": spec.benchmark_id,
+                "benchmark_version": spec.benchmark_version,
+                "contract_sha256": contract.sha256,
+            }
+            if not isinstance(reference_metadata, dict):
                 raise IntegrityError(
-                    "reference bundle contract digest does not match trial"
+                    "reference bundle metadata is missing"
+                )
+            mismatches = {
+                key: {
+                    "expected": expected,
+                    "actual": reference_metadata.get(key),
+                }
+                for key, expected in expected_reference_metadata.items()
+                if reference_metadata.get(key) != expected
+            }
+            if mismatches:
+                raise IntegrityError(
+                    f"reference bundle identity mismatch: {mismatches}"
                 )
             environment["BRUNNER_REFERENCE_ROOT"] = str(reference_root)
             environment["BRUNNER_REFERENCE_MANIFEST"] = str(
