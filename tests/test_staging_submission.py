@@ -40,7 +40,10 @@ def definition() -> BenchmarkDefinition:
         root=EXAMPLE_ROOT,
         contract_path=EXAMPLE_ROOT / "output-contract.json",
         challenge=ChallengeDefinition(root=EXAMPLE_ROOT / "challenge"),
-        evaluation=EvaluationDefinition(command=(sys.executable, "-c", "pass")),
+        evaluation=EvaluationDefinition(
+            command=(sys.executable, "-c", "pass"),
+            image="test-evaluator:latest",
+        ),
     )
 
 
@@ -361,6 +364,27 @@ def test_no_materializer_preserves_staging_output(tmp_path: Path) -> None:
     ).read_bytes() == (
         tmp_path / "second-workspace/input.txt"
     ).read_bytes()
+
+
+def test_stage_records_candidate_visible_file_inventory(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+
+    report = stage_challenge(
+        benchmark,
+        contract,
+        tmp_path / "workspace",
+    )
+
+    marker = json.loads(
+        (report.workspace / ".brunner-challenge.json").read_text()
+    )
+    assert marker["file_inventory"] == report.file_inventory
+    assert "file_inventory" not in report.to_dict()
+    assert marker["file_inventory"]["input.txt"]["size"] > 0
+    assert marker["file_inventory"]["input.txt"]["sha256"]
 
 
 def test_no_materializer_rejects_source_symlink(tmp_path: Path) -> None:

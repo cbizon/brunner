@@ -22,7 +22,15 @@ def build_definition() -> BenchmarkDefinition:
         contract_path=ROOT / "output-contract.json",
         challenge=ChallengeDefinition(root=ROOT / "challenge"),
         evaluation=EvaluationDefinition(
-            command=(sys.executable, str(ROOT / "evaluator.py")),
+            command=(
+                "python",
+                "-m",
+                "examples.text_benchmark.evaluator",
+            ),
+            image=(
+                "registry.example/brunner-text-evaluator@sha256:"
+                + "0" * 64
+            ),
         ),
     )
 

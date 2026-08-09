@@ -33,6 +33,7 @@ CONNECTIVITY_FRAGMENTS = (
 class ContainerBackend:
     name = "container"
     agent_isolation = "container"
+    trusted_evaluation = "unsupported"
 
     def __init__(
         self,
@@ -323,7 +324,10 @@ class ContainerBackend:
                 message.strip(),
             )
 
-    def capacity(self) -> BackendCapacity:
+    def capacity(
+        self,
+        workload: WorkloadSpec | None = None,
+    ) -> BackendCapacity:
         result = self._run(
             "ps",
             "--filter",

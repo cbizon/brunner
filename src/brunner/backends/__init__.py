@@ -4,9 +4,11 @@ from brunner.backends.base import (
     BackendSnapshot,
     CONTAINER_ISOLATION,
     ExecutionBackend,
+    TrustedEvaluationSpec,
     WorkloadSpec,
+    trial_resource_id,
+    workload_sha256,
 )
-from brunner.backends.container import ContainerBackend
 from brunner.backends.kubernetes import (
     KubernetesBackend,
     KubernetesProfile,
@@ -17,9 +19,11 @@ __all__ = [
     "BackendHandle",
     "BackendSnapshot",
     "CONTAINER_ISOLATION",
-    "ContainerBackend",
     "ExecutionBackend",
     "KubernetesBackend",
     "KubernetesProfile",
+    "TrustedEvaluationSpec",
     "WorkloadSpec",
+    "trial_resource_id",
+    "workload_sha256",
 ]

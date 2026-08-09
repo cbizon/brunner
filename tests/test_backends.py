@@ -7,12 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from brunner.backends import BackendHandle, BackendSnapshot, WorkloadSpec
+from brunner.artifacts import artifact_metadata
+from brunner.backends import (
+    BackendHandle,
+    BackendSnapshot,
+    TrustedEvaluationSpec,
+    WorkloadSpec,
+)
 from brunner.backends.base import native_resource_name
 from brunner.backends.container import ContainerBackend
 from brunner.backends.kubernetes import (
     KubernetesBackend,
-    KubernetesProfile,
+    KubernetesProfile as ProductionKubernetesProfile,
     ReaderMountError,
     render_helper_pod,
     render_job,
@@ -31,6 +37,31 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def KubernetesProfile(**kwargs: object) -> ProductionKubernetesProfile:
+    kwargs.setdefault("require_image_digests", False)
+    kwargs.setdefault("preflight_enabled", False)
+    kwargs.setdefault("unsafe_disable_network_policy_for_tests", True)
+    return ProductionKubernetesProfile(**kwargs)
+
+
+def _write_stage_marker(trial: Path) -> None:
+    workspace = trial / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / ".brunner-challenge.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "workspace": str(workspace),
+                "challenge_sha256": "a" * 64,
+                "contract_sha256": "b" * 64,
+                "benchmark_id": "test",
+                "benchmark_version": "1.0",
+                "file_inventory": {},
+            }
+        )
+    )
+
+
 def test_kubernetes_resources_preserve_secret_boundary(
     tmp_path: Path,
 ) -> None:
@@ -44,9 +75,9 @@ def test_kubernetes_resources_preserve_secret_boundary(
         secret_environment={
             "OPENAI_API_KEY": ("provider-credentials", "openai")
         },
-        nonsecret_environment={
-            "HTTPS_PROXY": "http://proxy.internal:3128",
-        },
+        proxy_url="http://proxy.internal:3128",
+        proxy_pod_selector={"app": "egress-proxy"},
+        proxy_port=3128,
         node_selector={"pool": "bench"},
     )
     workload = WorkloadSpec(
@@ -135,6 +166,154 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert expression["values"] == ["node-a"]
 
 
+def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    _write_stage_marker(trial)
+    profile = KubernetesProfile(
+        namespace="benchmarks",
+        agent_image="agent:latest",
+        reference_claim_name="benchmark-reference",
+        secret_environment={
+            "OPENAI_API_KEY": ("provider-credentials", "openai")
+        },
+        proxy_url="http://proxy.internal:3128",
+        proxy_pod_selector={"app": "egress-proxy"},
+        proxy_port=3128,
+    )
+    workload = WorkloadSpec(
+        workload_id="pipeline",
+        trial=trial,
+        command=("python", "-m", "brunner.agent_cli", "/brunner/trial"),
+        timeout_seconds=61.2,
+        evaluation=TrustedEvaluationSpec(
+            benchmark_id="benchmark",
+            benchmark_version="1.0",
+            contract_sha256="abc123",
+            image="evaluator:latest",
+            command=("python", "-m", "benchmark.evaluator"),
+            results_path="evaluation/custom-results.json",
+            timeout_seconds=120,
+            reference_manifest_path="manifest.json",
+            reference_manifest_sha256="c" * 64,
+            cpu_request="3",
+            cpu_limit="8",
+            memory_request="16Gi",
+            memory_limit="64Gi",
+        ),
+    )
+
+    job = render_job(
+        "pipeline",
+        "pipeline-data",
+        workload,
+        profile,
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    pod = job["spec"]["template"]["spec"]
+    agent = pod["initContainers"][0]
+    evaluator = pod["containers"][0]
+    assert pod["activeDeadlineSeconds"] == 182
+    assert agent["name"] == "agent"
+    assert evaluator["name"] == "evaluator"
+    assert evaluator["image"] == "evaluator:latest"
+    assert evaluator["command"] == [
+        "python",
+        "-m",
+        "brunner.evaluation_cli",
+        "/brunner/trial",
+    ]
+    agent_environment = {item["name"] for item in agent["env"]}
+    evaluator_environment = {
+        item["name"] for item in evaluator["env"]
+    }
+    assert "OPENAI_API_KEY" in agent_environment
+    assert "HTTPS_PROXY" in agent_environment
+    assert "OPENAI_API_KEY" not in evaluator_environment
+    assert "HTTPS_PROXY" not in evaluator_environment
+    encoded_spec = next(
+        item["value"]
+        for item in evaluator["env"]
+        if item["name"] == "BRUNNER_EVALUATION_SPEC"
+    )
+    assert json.loads(encoded_spec)["command"] == [
+        "python",
+        "-m",
+        "benchmark.evaluator",
+    ]
+    assert json.loads(encoded_spec)["results_path"] == (
+        "evaluation/custom-results.json"
+    )
+    handle = KubernetesBackend(profile)._submission_handle(
+        workload,
+        job_name="pipeline",
+        claim_name="pipeline-data",
+    )
+    assert handle.metadata["evaluation_results_path"] == (
+        "evaluation/custom-results.json"
+    )
+    assert {
+        mount["name"]: mount
+        for mount in evaluator["volumeMounts"]
+    }["reference"]["readOnly"] is True
+    assert all(
+        mount["name"] != "reference"
+        for mount in agent["volumeMounts"]
+    )
+    reference = next(
+        volume
+        for volume in pod["volumes"]
+        if volume["name"] == "reference"
+    )
+    assert reference["persistentVolumeClaim"] == {
+        "claimName": "benchmark-reference",
+        "readOnly": True,
+    }
+    assert evaluator["resources"] == {
+        "requests": {"cpu": "3", "memory": "16Gi"},
+        "limits": {"cpu": "8", "memory": "64Gi"},
+    }
+
+
+def test_kubernetes_pipeline_requires_configured_reference_claim(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="pipeline",
+        trial=trial,
+        command=("agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        evaluation=TrustedEvaluationSpec(
+            benchmark_id="benchmark",
+            benchmark_version="1.0",
+            contract_sha256="abc123",
+            image="evaluator:latest",
+            command=("evaluate",),
+            results_path="evaluation/results.json",
+            timeout_seconds=60,
+            reference_manifest_path="manifest.json",
+        ),
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="reference_claim_name",
+    ):
+        render_job(
+            "pipeline",
+            "pipeline-data",
+            workload,
+            KubernetesProfile(namespace="benchmarks"),
+            {"app.kubernetes.io/name": "brunner"},
+        )
+
+
 @pytest.mark.parametrize("chunk_bytes", (0, -1))
 def test_kubernetes_profile_rejects_invalid_artifact_chunk_size(
     chunk_bytes: int,
@@ -210,6 +389,137 @@ def test_kubernetes_collection_uses_configured_artifact_chunk_size(
     assert result["files"] == 1
 
 
+def test_kubernetes_collection_reuses_unchanged_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    staged = trial / "workspace/large-input.bin"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"x" * 4096)
+    staged_metadata = artifact_metadata(staged)
+    assert staged_metadata is not None
+    marker = trial / "workspace/.brunner-challenge.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "file_inventory": {
+                    "large-input.bin": staged_metadata.to_dict(),
+                },
+            }
+        )
+    )
+    output = b"complete\n"
+    inventory = {
+        "workspace/large-input.bin": staged_metadata.to_dict(),
+        "status.json": {
+            "type": "file",
+            "size": len(output),
+            "sha256": hashlib.sha256(output).hexdigest(),
+        },
+    }
+    reads = []
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_chunk_bytes=4,
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+
+    def read_remote(
+        pod: str,
+        relative_path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        reads.append((relative_path, offset, count))
+        assert relative_path == "status.json"
+        return output[offset : offset + count]
+
+    monkeypatch.setattr(backend, "_read_remote", read_remote)
+    destination = tmp_path / "collected"
+
+    result = backend._collect_from_reader(
+        "reader",
+        destination,
+        ArtifactPolicy(max_collection_bytes=32),
+        frozenset(),
+        trial,
+    )
+
+    assert reads == [
+        ("status.json", 0, 4),
+        ("status.json", 4, 4),
+        ("status.json", 8, 1),
+    ]
+    assert (destination / "workspace/large-input.bin").samefile(staged)
+    assert result["reused_staged_files"] == 1
+    assert result["transferred_bytes"] == len(output)
+
+
+def test_kubernetes_collection_caps_changed_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    staged = trial / "workspace/large-input.bin"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"x" * 4096)
+    staged_metadata = artifact_metadata(staged)
+    assert staged_metadata is not None
+    (trial / "workspace/.brunner-challenge.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "file_inventory": {
+                    "large-input.bin": staged_metadata.to_dict(),
+                },
+            }
+        )
+    )
+    changed = b"y" * 4096
+    inventory = {
+        "workspace/large-input.bin": {
+            "type": "file",
+            "size": len(changed),
+            "sha256": hashlib.sha256(changed).hexdigest(),
+        }
+    }
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_read_remote",
+        lambda *args, **kwargs: pytest.fail(
+            "oversized changed input must be rejected before transfer"
+        ),
+    )
+
+    with pytest.raises(IntegrityError, match="exceeding the configured"):
+        backend._collect_from_reader(
+            "reader",
+            tmp_path / "collected",
+            ArtifactPolicy(
+                max_collection_bytes=32,
+                max_diagnostic_collection_bytes=32,
+            ),
+            frozenset(),
+            trial,
+        )
+
+
 def test_kubernetes_collection_retries_chunk_on_same_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,7 +546,6 @@ def test_kubernetes_collection_retries_chunk_on_same_reader(
         "_remote_inventory",
         lambda *args, **kwargs: inventory,
     )
-
     failed_once = False
 
     def read_remote(
@@ -678,6 +987,7 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
 ) -> None:
     trial = tmp_path / "trial"
     (trial / "workspace").mkdir(parents=True)
+    _write_stage_marker(trial)
     workload = WorkloadSpec(
         workload_id="case-1",
         trial=trial,
@@ -730,7 +1040,12 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
         pvc = remote[f"pvc/{claim_name}"]
         metadata = pvc["metadata"]
         assert isinstance(metadata, dict)
-        metadata.setdefault("annotations", {})["dev.brunner/staged"] = "true"
+        annotations = metadata.setdefault("annotations", {})
+        assert isinstance(annotations, dict)
+        for argument in arguments:
+            if argument.startswith("dev.brunner/") and "=" in argument:
+                key, value = argument.split("=", 1)
+                annotations[key] = value
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(backend, "_get", get_resource)
@@ -765,6 +1080,7 @@ def test_kubernetes_submission_recovers_each_pre_job_boundary(
 ) -> None:
     trial = tmp_path / "trial"
     (trial / "workspace").mkdir(parents=True)
+    _write_stage_marker(trial)
     workload = WorkloadSpec(
         workload_id="case-1",
         trial=trial,
@@ -821,7 +1137,12 @@ def test_kubernetes_submission_recovers_each_pre_job_boundary(
         pvc = remote[f"pvc/{claim_name}"]
         metadata = pvc["metadata"]
         assert isinstance(metadata, dict)
-        metadata.setdefault("annotations", {})["dev.brunner/staged"] = "true"
+        annotations = metadata.setdefault("annotations", {})
+        assert isinstance(annotations, dict)
+        for argument in arguments:
+            if argument.startswith("dev.brunner/") and "=" in argument:
+                key, value = argument.split("=", 1)
+                annotations[key] = value
         inject_once("pvc_annotated")
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
@@ -913,7 +1234,7 @@ def test_kubernetes_snapshot_classifies_infrastructure_restart(
     monkeypatch.setattr(
         backend,
         "_events",
-        lambda name, uid, required=False: (),
+        lambda name, uid, **kwargs: (),
     )
 
     snapshot = backend.inspect(handle)
@@ -1035,7 +1356,7 @@ def test_kubernetes_complete_job_preserves_infrastructure_failure(
     monkeypatch.setattr(
         backend,
         "_events",
-        lambda name, uid, required=False: events.get(name, ()),
+        lambda name, uid, **kwargs: events.get(name, ()),
     )
 
     snapshot = backend.inspect(handle)
@@ -1054,7 +1375,111 @@ def test_kubernetes_complete_job_preserves_infrastructure_failure(
     assert f"{expected_reason}: agent terminated" in snapshot.warnings
 
 
-def test_kubernetes_eviction_event_overrides_successful_container(
+def test_kubernetes_candidate_evaluation_failure_is_not_restarted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    pipeline = {
+        "status": "complete",
+        "provider_result_present": True,
+        "infrastructure_failure": False,
+    }
+    evaluation = {
+        "status": "failed",
+        "candidate_failure": True,
+        "retryable_infrastructure": False,
+        "failure": {
+            "domain": "candidate",
+            "reason": "BenchmarkEvaluationFailed",
+            "message": "candidate output was incorrect",
+        },
+    }
+    pod = {
+        "metadata": {"name": "trial-pod", "uid": "pod-uid"},
+        "spec": {"nodeName": "node-a"},
+        "status": {
+            "phase": "Succeeded",
+            "initContainerStatuses": [
+                {
+                    "name": "agent",
+                    "state": {
+                        "terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                            "message": json.dumps(
+                                {"brunner_pipeline": pipeline}
+                            ),
+                        }
+                    },
+                }
+            ],
+            "containerStatuses": [
+                {
+                    "name": "evaluator",
+                    "state": {
+                        "terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                            "message": json.dumps(
+                                {"brunner_evaluation": evaluation}
+                            ),
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if kind == "pvc":
+            return {"status": {"phase": "Bound"}}
+        if kind == "job":
+            return {
+                "metadata": {"name": "trial-job", "uid": "job-uid"},
+                "status": {
+                    "conditions": [{"type": "Complete"}]
+                },
+            }
+        if kind == "pods":
+            return {"items": [pod]}
+        raise AssertionError((kind, name, kwargs))
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_events",
+        lambda name, uid, **kwargs: (),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "succeeded"
+    assert snapshot.reason is None
+    assert snapshot.details["retryable_infrastructure"] is False
+    assert snapshot.details["brunner_pipeline"] == pipeline
+    assert snapshot.details["brunner_evaluation"] == evaluation
+    assert snapshot.details["terminated_container"]["container"] == (
+        "evaluator"
+    )
+
+
+def test_kubernetes_old_warning_event_does_not_override_completed_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1127,26 +1552,23 @@ def test_kubernetes_eviction_event_overrides_successful_container(
     monkeypatch.setattr(
         backend,
         "_events",
-        lambda name, uid, required=False: events.get(name, ()),
+        lambda name, uid, **kwargs: events.get(name, ()),
     )
 
     snapshot = backend.inspect(handle)
 
-    assert snapshot.phase == "failed"
-    assert snapshot.reason == "Evicted"
-    assert snapshot.message == (
-        "Pod ephemeral local storage usage exceeds "
-        "the total limit of containers 256Mi."
-    )
+    assert snapshot.phase == "succeeded"
+    assert snapshot.reason is None
+    assert snapshot.message is None
     assert snapshot.exit_code == 0
-    assert snapshot.details["retryable_infrastructure"] is True
+    assert snapshot.details["retryable_infrastructure"] is False
     assert snapshot.warnings == (
         "Evicted: Pod ephemeral local storage usage exceeds "
         "the total limit of containers 256Mi.",
     )
 
 
-def test_kubernetes_missing_job_is_unknown_even_when_pvc_exists(
+def test_kubernetes_missing_job_with_pvc_is_retryable_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1172,9 +1594,10 @@ def test_kubernetes_missing_job_is_unknown_even_when_pvc_exists(
 
     snapshot = backend.inspect(handle)
 
-    assert snapshot.phase == "unknown"
+    assert snapshot.phase == "failed"
     assert snapshot.reason == "JobMissing"
     assert snapshot.details["claim_phase"] == "Bound"
+    assert snapshot.details["retryable_infrastructure"] is True
 
 
 def test_kubernetes_restart_reuses_pvc_without_restaging(
@@ -1183,6 +1606,7 @@ def test_kubernetes_restart_reuses_pvc_without_restaging(
 ) -> None:
     trial = tmp_path / "trial"
     (trial / "workspace").mkdir(parents=True)
+    _write_stage_marker(trial)
     workload = WorkloadSpec(
         workload_id="case-1",
         trial=trial,
@@ -1213,7 +1637,13 @@ def test_kubernetes_restart_reuses_pvc_without_restaging(
         if kind == "pvc":
             return {
                 "metadata": {
-                    "labels": {"dev.brunner/workload": workload_name}
+                    "labels": {"dev.brunner/workload": workload_name},
+                    "annotations": {
+                        "dev.brunner/staged": "true",
+                        "dev.brunner/challenge-sha256": "a" * 64,
+                        "dev.brunner/workload-sha256": workload.sha256,
+                        "dev.brunner/runtime-protocol": "1.0",
+                    },
                 }
             }
         if kind == "job":
@@ -1556,6 +1986,7 @@ def test_kubernetes_stage_labels_and_waits_for_helper_cleanup(
 ) -> None:
     trial = tmp_path / "trial"
     trial.mkdir()
+    _write_stage_marker(trial)
     workload = WorkloadSpec(
         workload_id="case-1",
         trial=trial,
@@ -1581,6 +2012,11 @@ def test_kubernetes_stage_labels_and_waits_for_helper_cleanup(
         backend,
         "_wait_for_pod",
         lambda name, timeout: None,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_protocol",
+        lambda name: {"protocol": "1.0", "version": "test"},
     )
     monkeypatch.setattr(
         backend,

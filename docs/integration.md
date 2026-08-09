@@ -63,8 +63,17 @@ def build_definition() -> BenchmarkDefinition:
             materialize_timeout_seconds=60 * 60,
         ),
         evaluation=EvaluationDefinition(
-            command=(sys.executable, str(ROOT / "evaluator.py")),
-            # image="my-evaluator:1.0",  # optional trusted container
+            image=(
+                "registry.example/my-benchmark-evaluator@sha256:"
+                "0123456789abcdef0123456789abcdef"
+                "0123456789abcdef0123456789abcdef"
+            ),
+            command=("python", "-m", "my_benchmark.evaluator"),
+            timeout_seconds=12 * 60 * 60,
+            cpu_request="3",
+            cpu_limit="8",
+            memory_request="16Gi",
+            memory_limit="64Gi",
         ),
         qualitative_review=QualitativeReviewDefinition(
             reviewer=ProviderSettings(
@@ -79,6 +88,9 @@ def build_definition() -> BenchmarkDefinition:
         ),
         artifacts=ArtifactPolicy(
             groups={"debug": ("debug/**",)},
+            collect_evaluated_artifacts=False,
+            max_collection_bytes=10 * 1024 * 1024 * 1024,
+            max_diagnostic_collection_bytes=512 * 1024 * 1024,
         ),
         runtime=RuntimeDefaults(
             timeout_seconds=6 * 60 * 60,
@@ -164,8 +176,8 @@ brunner \
 ```
 
 With no `materialize_command`, Brunner retains the existing direct challenge
-copy behavior. `stage`, `trial-create`, and every container-isolated campaign
-backend share this same staging path.
+copy behavior. `stage`, `trial-create`, and every Kubernetes campaign share
+this same staging path.
 
 ## Standard Qualitative Review
 
@@ -184,10 +196,10 @@ qualitative_review=QualitativeReviewDefinition(
 )
 ```
 
-When configured, every evaluation path runs the review after the deterministic
-evaluator and before campaign cleanup. This includes `trial-evaluate`,
-`trial-assess`, and container or Kubernetes campaigns. Trial creation records
-the review contract before execution.
+When configured, the campaign runs the review after Sterling's deterministic
+evaluator result has been selectively collected and before cleanup.
+`trial-assess` can rerun assessments over an existing collected evaluation.
+Trial creation records the review contract before execution.
 
 Brunner writes:
 
@@ -525,9 +537,13 @@ def main() -> int:
     return 0 if passed else 1
 ```
 
-The evaluator must write the path in `BRUNNER_EVALUATION_RESULTS`. Brunner
-validates the result envelope and generates a general run report. Evaluators
-may list additional report files in the result.
+The evaluator command runs only inside `EvaluationDefinition.image` on
+Sterling. It must write the path in `BRUNNER_EVALUATION_RESULTS`. Brunner
+validates the result envelope on the PVC, then generates the general run report
+after selective collection. Evaluators may list additional report files. The
+image must contain Brunner, the benchmark evaluator package, and every runtime
+dependency used by the evaluator; the command is interpreted inside that image,
+not on the orchestrator.
 
 ## References
 
@@ -551,7 +567,7 @@ definition and contract:
 from pathlib import Path
 
 from brunner import CampaignPlan, CampaignRunner, CampaignTrial
-from brunner.backends import ContainerBackend
+from brunner.backends import KubernetesBackend, KubernetesProfile
 
 
 def build_campaign(definition, contract):
@@ -572,8 +588,14 @@ def build_campaign(definition, contract):
                 effort="high",
             ),
         ),
-        backend_image="my-benchmark-agent:latest",
+        backend_image=(
+            "registry.example/my-benchmark-agent@sha256:"
+            "0123456789abcdef0123456789abcdef"
+            "0123456789abcdef0123456789abcdef"
+        ),
+        cpu_request="2",
         cpu_limit="8",
+        memory_request="8Gi",
         memory_limit="32Gi",
         max_parallel=2,
         included_artifact_groups=frozenset({"debug"}),
@@ -584,12 +606,27 @@ def build_campaign(definition, contract):
         definition,
         contract,
         plan,
-        ContainerBackend(
-            max_parallel=2,
-            inherited_environment=("OPENAI_API_KEY",),
-            nonsecret_environment={
-                "HTTPS_PROXY": "http://proxy.internal:3128",
-            },
+        KubernetesBackend(
+            KubernetesProfile(
+                namespace="bizon",
+                agent_image=plan.backend_image,
+                artifact_reader_image=plan.backend_image,
+                reference_claim_name="my-benchmark-reference",
+                storage_size="250Gi",
+                storage_class_name="sterling-storage-class",
+                image_pull_secrets=("registry-credentials",),
+                secret_environment={
+                    "OPENAI_API_KEY": (
+                        "provider-credentials",
+                        "OPENAI_API_KEY",
+                    ),
+                },
+                proxy_url="http://proxy.proxy.svc:3128",
+                proxy_namespace="proxy",
+                proxy_pod_selector={"app": "egress-proxy"},
+                proxy_port=3128,
+                max_parallel=2,
+            )
         ),
     )
 ```
@@ -608,10 +645,12 @@ trials=(
 Campaign state is append-only by trial ID. Repeating an existing ID with the
 same execution attributes is a no-op, whether it is pending, running, failed,
 or complete. Adding another ID creates another trial without invalidating
-existing state, and list order may change freely. Reusing an ID with different
-provider, model, effort, or environment keys is rejected because the
-persisted trial would otherwise be ambiguous. Removing an ID from the Python
-list does not delete or cancel its historical campaign entry.
+existing state, and list order may change freely. Reusing an ID with a changed
+provider, model, effort, command, image, timeout, resource envelope, label, or
+trusted evaluation contract is rejected because the persisted remote workload
+would otherwise be ambiguous. The campaign also requires every trial to share
+one deterministic materialized challenge digest. Removing an ID from the
+Python list does not delete or cancel its historical campaign entry.
 
 ```sh
 brunner --benchmark my_benchmark.definition \
@@ -622,13 +661,55 @@ brunner --benchmark my_benchmark.definition \
   campaign-run my_benchmark.campaign --poll-seconds 10
 ```
 
-Campaign backends must declare `agent_isolation = "container"`;
-`CampaignRunner` rejects host-process backends. For OCI execution, use
-`ContainerBackend` and set `backend_image` on the plan. For Kubernetes,
-construct `KubernetesBackend(KubernetesProfile(...))`. Agent and
-artifact-reader images must contain Brunner; the agent image also needs the
-selected provider CLI. The benchmark package, evaluator, and references are
-not required in the agent image.
+`campaign-run` serves the campaign directory at
+`http://127.0.0.1:8765/` while reconciling and keeps that monitor available
+after the campaign becomes terminal. Use `--exit-after-terminal` for batch
+automation, or `--host` and `--port` to change the listener.
+
+Campaigns require `KubernetesBackend`. Brunner renders one durable Job with the
+agent as an init container and the trusted evaluator as the main container.
+Agent and artifact-reader images must contain Brunner; the agent image also
+needs the selected provider CLI. The evaluator image must contain Brunner and
+the benchmark evaluator package.
+
+Production images must use `image@sha256:<digest>` references and must contain
+a compatible Brunner runtime protocol. Set
+`KubernetesProfile.require_image_digests=False` only in controlled tests.
+
+Before any staging helper is created, Brunner applies two workload
+NetworkPolicies. The pipeline may use cluster DNS and the proxy selected by
+`proxy_namespace`, `proxy_pod_selector`, and `proxy_port`; helpers have no
+egress. `proxy_url` is injected only into the agent. The selected proxy owns
+external provider-domain allowlists. Do not place proxy variables in
+`nonsecret_environment`, and do not encode provider URLs in Brunner.
+Sterling's CNI must enforce Kubernetes NetworkPolicy; Brunner cannot infer
+enforcement from successful object creation.
+
+The stager clears an incomplete trial PVC before copying, verifies every
+remote challenge file against the local stage inventory, rejects remote
+symlinks, and annotates the PVC only after verification. Existing Jobs and
+PVCs are adopted only when challenge, workload, runtime-protocol, and ownership
+annotations match the current trial.
+
+Brunner hashes the effective agent image even when it is supplied by
+`KubernetesProfile.agent_image`. Custom workload labels must not use
+`app.kubernetes.io/name`, `dev.brunner/workload`, `dev.brunner/role`, or
+`dev.brunner/restart-generation`; those labels are reserved for ownership and
+reconciliation.
+
+When a benchmark defines `ReferenceDefinition`, configure
+`KubernetesProfile.reference_claim_name` with an existing Sterling PVC
+containing the validated reference bundle. Only the evaluator mounts that PVC,
+read-only. Brunner fails submission if the claim is absent rather than copying
+trusted references into the trial or agent image.
+
+The reference claim must support `ReadWriteMany` and carry
+`dev.brunner/reference-manifest-sha256`, whose value is the SHA-256 of the
+manifest file bytes approved by the orchestrator. The evaluator independently
+checks that mounted manifest and requires exact `benchmark_id`,
+`benchmark_version`, and `contract_sha256` metadata. Provisioning and annotating
+the large reference PVC remain deployment operations; Brunner never transfers
+the reference through the candidate PVC.
 
 Kubernetes artifact collection reads each file through resumable
 `kubectl exec` calls. `KubernetesProfile.artifact_chunk_bytes` controls the
@@ -639,6 +720,26 @@ count on the same mounted reader before Brunner replaces the reader pod;
 Smaller chunks are more resilient on slow or unstable links but increase
 command overhead. These values apply to the orchestrator-side transfer; the
 remote reader protocol accepts any positive chunk size.
+
+Files recorded in the Sterling evaluator's validated `submission.artifacts`
+list are omitted from collection unless
+`ArtifactPolicy.collect_evaluated_artifacts=True`. This keeps trajectories,
+videos, and other evaluator-only data on the trial PVC. Even with explicit
+opt-in, `max_collection_bytes` rejects an oversized inventory before transfer.
+Brunner also compares the remote workspace to the per-file inventory recorded
+during staging. Unchanged challenge files are hard-linked from the local staged
+trial into the collected view instead of being downloaded from Sterling.
+Changed challenge files count against `max_collection_bytes`; if local
+hard-link reuse is unavailable, collection fails rather than silently copying
+a large immutable input.
+
+If evaluation never completed and the remaining inventory still exceeds
+`max_collection_bytes`, Brunner switches to
+`ArtifactPolicy.failure_diagnostic_globs`, bounded by
+`max_diagnostic_collection_bytes`. The collection result records
+`collection_mode="diagnostics"` plus omitted file and byte counts. Submission
+artifacts declared by the staged output contract are excluded even when no
+evaluation result exists.
 
 Kubernetes workload requests and limits are independent. Set `cpu_request`,
 `memory_request`, and `ephemeral_storage_request` to scheduler reservations;
@@ -662,23 +763,20 @@ plan = CampaignPlan(
 compatibility shorthands that set both Kubernetes request and limit when no
 explicit side is supplied. Either side can be overridden incrementally, so
 existing code can add only limit fields to become burstable. New benchmark
-code should use the explicit request and limit fields. For OCI execution,
-explicit `cpu_limit` and `memory_limit` take precedence; request and ephemeral
-storage fields have no effect because an OCI runtime has no scheduler
-reservation or portable ephemeral-storage limit.
+code should use the explicit request and limit fields. Evaluator requests and
+limits are configured independently on `EvaluationDefinition`.
 
 Campaign trials do not accept environment-variable names or values. Provider
 credentials and deployment networking belong to the backend configuration:
 
-- `ContainerBackend.inherited_environment` names credentials that must exist in
-  the orchestrator environment. Brunner passes `--env NAME` to the OCI runtime,
-  never `--env NAME=value`, so secret values are absent from command arguments
-  and campaign state.
 - `KubernetesProfile.secret_environment` maps container variable names to
-  Kubernetes Secret name/key references.
-- `ContainerBackend.nonsecret_environment` and
-  `KubernetesProfile.nonsecret_environment` are for explicit non-secret
-  deployment settings such as proxy addresses or certificate paths.
+  Kubernetes Secret name/key references for the agent init container.
+- `KubernetesProfile.nonsecret_environment` supplies explicit non-secret agent
+  deployment settings such as certificate paths.
+- `proxy_url`, `proxy_namespace`, `proxy_pod_selector`, and `proxy_port`
+  define the only allowed agent egress route.
+
+The evaluator container receives neither mapping.
 
 Do not put secret values in non-secret environment mappings.
 
@@ -686,6 +784,13 @@ Do not put secret values in non-secret environment mappings.
 the backend cannot be reached. `campaign-run` keeps waiting and retries until
 connectivity returns or the process is interrupted; it does not alter remote
 workloads while disconnected.
+
+Before launch, Brunner checks cluster access, required Job/PVC/Pod/Event/
+NetworkPolicy RBAC, immutable images, reference identity, and ResourceQuota
+capacity. Quota capacity includes object counts, PVC storage, CPU, memory,
+ephemeral storage, and extended resources, using Kubernetes' effective
+init-container scheduling request. A quota limit appears as a visible
+`backend_capacity` scheduler wait rather than oversubmission.
 
 Kubernetes helper, Job, and PVC cleanup is synchronous. Brunner removes stale
 staging and artifact-reader pods by workload labels before reuse and does not
@@ -706,14 +811,14 @@ workload log. Terminal Kubernetes snapshots preserve structured Job and Pod
 events before cleanup. They also include relevant warning events for pending
 PVCs and artifact-reader mount failures, and the campaign dashboard shows
 those warnings with live elapsed time. The orchestrator's Kubernetes identity
-must be allowed to read Events. A terminal event-read failure stops
-reconciliation before cleanup rather than silently discarding the diagnostics.
+should be allowed to read Events. Preflight reports missing Event RBAC before
+launch, but terminal Event expiry, RBAC drift, or transient read failure is
+recorded as a warning and never blocks collection or cleanup.
 
 `RuntimeDefaults.timeout_seconds` is the agent's hard deadline.
-`backend_shutdown_grace_seconds` is added only to the enclosing backend
-workload deadline, leaving time for terminal state and accounting artifacts
-to be written after the agent deadline. Keep it positive and large enough for
-the selected backend to stop and persist the runner cleanly.
+`backend_shutdown_grace_seconds` leaves time for terminal state and accounting
+artifacts after the agent deadline. The enclosing Job deadline also includes
+the effective evaluator timeout.
 
 Campaigns bound the states a stuck backend can hide in:
 
@@ -726,12 +831,11 @@ Campaigns bound the states a stuck backend can hide in:
 | `infrastructure_max_restarts` | Relaunches an interrupted backend workload against its existing persistent trial | 2 |
 | `cleanup_retry_seconds` | Delay before retrying failed backend cleanup | 60 seconds |
 | `max_pause_seconds` | Optional limit before backend disconnection requires manual attention | Unlimited |
-| `evaluation_timeout_seconds` | One budget shared by reference validation, the evaluator, and all assessments | Benchmark evaluation timeout |
+| `evaluation_timeout_seconds` | Optional campaign cap on the Sterling evaluator container | Benchmark evaluation timeout |
 
-Reconciliation is sequential, so an evaluator that hangs blocks every other
-trial in the campaign until its timeout expires. Set
-`evaluation_timeout_seconds` to something much smaller than
-`EvaluationDefinition.timeout_seconds` when a campaign has many trials.
+Kubernetes enforces evaluator timeout even while the orchestrator is asleep or
+disconnected. Set `evaluation_timeout_seconds` to cap a benchmark's configured
+evaluation timeout for a particular campaign.
 Exceeding `trial_timeout_seconds` marks the live trial as needing attention but
 keeps its lifecycle phase pending or running. Brunner continues inspecting it,
 resolves the attention marker when it terminates, and keeps its slot reserved
@@ -746,16 +850,15 @@ contract-check       Validate contract and print digest
 contract-render      Render the generated output-requirements prompt section
 stage                Stage an isolated challenge
 trial-create         Create a durable trial
-trial-evaluate       Run trusted evaluation
 trial-assess         Rerun configured assessments over existing evaluation
 reference-build      Build a reference manifest
 reference-validate   Verify a reference bundle
 campaign-init        Create campaign state and trials
 campaign-step        Reconcile one campaign iteration
-campaign-run         Reconcile until complete, paused, or attention required
+campaign-run         Reconcile and serve the monitor until interrupted
 ```
 
-Remote backends invoke `python -m brunner.agent_cli` inside the agent
+Kubernetes invokes `python -m brunner.agent_cli` inside the agent init
 container. The module reads only staged trial metadata and does not import
 benchmark code; it is intentionally not installed as a public console command.
 It handles `SIGTERM` and `SIGINT` as graceful interruption requests, terminating
@@ -765,6 +868,16 @@ state, and exiting nonzero. Kubernetes Jobs set
 pipeline summary there so Job inspection can distinguish a terminal provider
 result from interruption or missing output even when Kubernetes reports an
 inconsistent zero exit code.
+
+After a terminal provider result, Kubernetes starts
+`python -m brunner.evaluation_cli` in the evaluator container. It receives no
+provider Secret or agent proxy environment, mounts the trial PVC read/write and
+the configured reference PVC read-only, and records its own termination
+summary for candidate-versus-infrastructure classification.
+
+A valid candidate failure exits `evaluation_cli` with zero so Kubernetes marks
+the pipeline complete. Exit code 2 is reserved for evaluator, reference,
+runtime-protocol, or other trusted infrastructure failure.
 
 An agent exit code of zero means that a current terminal provider result exists
 and trusted evaluation may run. It is pipeline completion, not benchmark

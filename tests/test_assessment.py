@@ -24,7 +24,11 @@ from brunner.assessment import (
 )
 from brunner.contract import load_output_contract
 from brunner.errors import ConfigurationError, ProviderSchemaError
-from brunner.evaluation import evaluate_trial
+from brunner.evaluation import (
+    evaluation_spec,
+    execute_evaluation,
+    finalize_evaluation,
+)
 from brunner.providers import ProviderSettings
 from brunner.trial import TrialIdentity, create_trial
 
@@ -34,6 +38,19 @@ EXAMPLE_ROOT = ROOT / "examples/text_benchmark"
 COMMON_SCHEMA = (
     "https://brunner.dev/schemas/assessment-common.schema.json"
 )
+
+
+def evaluate_trial(definition, contract, trial):
+    execute_evaluation(
+        evaluation_spec(definition, contract),
+        trial,
+        reference_root=(
+            definition.reference.root
+            if definition.reference is not None
+            else None
+        ),
+    )
+    return finalize_evaluation(definition, contract, trial)
 
 
 def _write_assessment_materials(
@@ -86,6 +103,7 @@ def _definition(
         challenge=ChallengeDefinition(root=root / "challenge"),
         evaluation=EvaluationDefinition(
             command=(sys.executable, str(root / "evaluator.py")),
+            image="test-evaluator:latest",
         ),
         assessments=(assessment,),
     )
@@ -139,7 +157,7 @@ def _create_trial(
 def _pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )

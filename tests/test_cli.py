@@ -4,6 +4,7 @@ import tomllib
 from pathlib import Path
 
 import brunner.backends as backends
+import brunner.evaluation as evaluation
 
 from brunner.cli import build_parser
 
@@ -17,16 +18,16 @@ def test_public_cli_does_not_expose_host_agent_execution() -> None:
 
     assert "local-run" not in help_text
     assert "trial-run" not in help_text
+    assert "trial-evaluate" not in help_text
     assert "brunner-agent" not in project["project"]["scripts"]
+    assert not hasattr(evaluation, "evaluate_trial")
 
 
 def test_public_backends_are_container_isolated() -> None:
     assert not hasattr(backends, "LocalBackend")
-    assert (
-        backends.ContainerBackend.agent_isolation
-        == backends.CONTAINER_ISOLATION
-    )
+    assert not hasattr(backends, "ContainerBackend")
     assert (
         backends.KubernetesBackend.agent_isolation
         == backends.CONTAINER_ISOLATION
     )
+    assert backends.KubernetesBackend.trusted_evaluation == "kubernetes"

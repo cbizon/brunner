@@ -4,13 +4,14 @@ import argparse
 import importlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from brunner.contract import load_output_contract, render_output_requirements
 from brunner.campaign import CampaignRunner
 from brunner.definition import BenchmarkDefinition
-from brunner.evaluation import evaluate_trial
 from brunner.reference import (
     build_reference_manifest,
     validate_reference_manifest,
@@ -82,9 +83,6 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     _add_provider_arguments(create)
     create.add_argument("--test-id")
 
-    evaluation = subparsers.add_parser("trial-evaluate")
-    evaluation.add_argument("trial", type=_path)
-
     assessment = subparsers.add_parser("trial-assess")
     assessment.add_argument("trial", type=_path)
 
@@ -100,6 +98,13 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     campaign_run = subparsers.add_parser("campaign-run")
     campaign_run.add_argument("campaign")
     campaign_run.add_argument("--poll-seconds", type=float, default=5)
+    campaign_run.add_argument("--host", default="127.0.0.1")
+    campaign_run.add_argument("--port", type=int, default=8765)
+    campaign_run.add_argument(
+        "--exit-after-terminal",
+        action="store_true",
+        help="stop the monitor and exit when the campaign is terminal",
+    )
     return parser
 
 
@@ -143,8 +148,6 @@ def execute(
                 identity,
             )
         }
-    if args.command == "trial-evaluate":
-        return evaluate_trial(definition, contract, args.trial)
     if args.command == "trial-assess":
         from brunner.assessment import run_assessments
         from brunner.io import load_json_object, write_json_atomic
@@ -218,7 +221,39 @@ def execute(
             return runner.initialize()
         if args.command == "campaign-step":
             return runner.advance()
-        return runner.run(poll_seconds=args.poll_seconds)
+        from brunner.dashboard import start_campaign_server
+
+        server, url = start_campaign_server(
+            runner.root,
+            host=args.host,
+            port=args.port,
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="brunner-campaign-monitor",
+            daemon=True,
+        )
+        thread.start()
+        print(f"Campaign monitor: {url}", file=sys.stderr, flush=True)
+        try:
+            state = runner.run(poll_seconds=args.poll_seconds)
+            if args.exit_after_terminal:
+                return state
+            print(
+                "Campaign reached terminal state "
+                f"{state['status']}; monitor remains available at {url}. "
+                "Press Ctrl-C to stop.",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return state if "state" in locals() else runner.initialize()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
     raise AssertionError(args.command)
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 from brunner import (
@@ -22,7 +21,15 @@ def build_definition() -> BenchmarkDefinition:
         contract_path=ROOT / "output-contract.json",
         challenge=ChallengeDefinition(root=ROOT / "challenge"),
         evaluation=EvaluationDefinition(
-            command=(sys.executable, str(ROOT / "evaluator.py")),
+            command=(
+                "python",
+                "-m",
+                "examples.numeric_benchmark.evaluator",
+            ),
+            image=(
+                "registry.example/brunner-numeric-evaluator@sha256:"
+                + "0" * 64
+            ),
         ),
         reference=ReferenceDefinition(root=ROOT / "reference"),
     )

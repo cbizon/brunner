@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 import re
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
@@ -16,9 +17,11 @@ from brunner.backends import (
     BackendHandle,
     CONTAINER_ISOLATION,
     ExecutionBackend,
+    TrustedEvaluationSpec,
     WorkloadSpec,
+    workload_sha256,
 )
-from brunner.contract import OutputContract
+from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import (
     ArtifactTransferError,
@@ -26,7 +29,10 @@ from brunner.errors import (
     BackendError,
     IntegrityError,
 )
-from brunner.evaluation import evaluate_trial
+from brunner.evaluation import (
+    evaluation_spec,
+    finalize_evaluation,
+)
 from brunner.failure import (
     attach_failure,
     failure_from_exception,
@@ -86,6 +92,20 @@ def _load_optional_object(path: Path) -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _evaluation_sha256(spec: TrustedEvaluationSpec) -> str:
+    value = {
+        name: list(item) if isinstance(item, tuple) else item
+        for name, item in vars(spec).items()
+    }
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -262,6 +282,10 @@ def default_workload_factory(
     definition: BenchmarkDefinition,
     backend_name: str,
 ) -> WorkloadSpec:
+    contract = load_output_contract(
+        definition.contract_path,
+        expected_benchmark_id=definition.benchmark_id,
+    )
     command = [
         "python",
         "-m",
@@ -272,6 +296,11 @@ def default_workload_factory(
         command.extend(
             ("--provider-executable", plan.provider_executable)
         )
+    trusted_evaluation = _campaign_evaluation_spec(
+        definition,
+        contract,
+        plan,
+    )
     return WorkloadSpec(
         workload_id=trial.name,
         trial=trial,
@@ -287,8 +316,26 @@ def default_workload_factory(
         memory_limit=plan.memory_limit,
         ephemeral_storage_request=plan.ephemeral_storage_request,
         ephemeral_storage_limit=plan.ephemeral_storage_limit,
+        evaluation=trusted_evaluation,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
+
+
+def _campaign_evaluation_spec(
+    definition: BenchmarkDefinition,
+    contract: OutputContract,
+    plan: CampaignPlan,
+) -> TrustedEvaluationSpec:
+    trusted_evaluation = evaluation_spec(definition, contract)
+    if plan.evaluation_timeout_seconds is not None:
+        trusted_evaluation = replace(
+            trusted_evaluation,
+            timeout_seconds=min(
+                trusted_evaluation.timeout_seconds,
+                plan.evaluation_timeout_seconds,
+            ),
+        )
+    return trusted_evaluation
 
 
 def _handle_from_dict(value: dict[str, Any]) -> BackendHandle:
@@ -316,6 +363,11 @@ class CampaignRunner:
                 "campaign backends must run agents in a container isolation "
                 "boundary; host-process execution is not supported"
             )
+        if getattr(backend, "trusted_evaluation", None) != "kubernetes":
+            raise ValueError(
+                "campaign backends must run trusted evaluation in the "
+                "Kubernetes trial workload; local evaluation is not supported"
+            )
         plan.validate()
         definition.validate()
         self.definition = definition
@@ -330,6 +382,60 @@ class CampaignRunner:
         self.lock_path = self.root / "campaign.lock"
         self._lock_depth = 0
         self._lock_stream: TextIO | None = None
+
+    def _configured_workload(
+        self,
+        entry: dict[str, Any],
+    ) -> WorkloadSpec:
+        workload = self.workload_factory(
+            Path(entry["trial"]),
+            self._campaign_trial(entry),
+            self.plan,
+            self.definition,
+            self.backend.name,
+        )
+        prepare_workload = getattr(self.backend, "prepare_workload", None)
+        if callable(prepare_workload):
+            workload = prepare_workload(workload)
+        expected_evaluation = _campaign_evaluation_spec(
+            self.definition,
+            self.contract,
+            self.plan,
+        )
+        if workload.evaluation != expected_evaluation:
+            raise ValueError(
+                "campaign workload must use the benchmark's exact "
+                "Sterling evaluation specification"
+            )
+        workload.validate()
+        digest = workload_sha256(workload)
+        pinned = entry.get("workload_sha256")
+        if pinned is None:
+            handle = entry.get("handle")
+            remote_digest = (
+                handle.get("metadata", {}).get("workload_sha256")
+                if isinstance(handle, dict)
+                and isinstance(handle.get("metadata"), dict)
+                else None
+            )
+            if handle is not None and remote_digest is None:
+                raise RuntimeError(
+                    "existing submitted trial has no verifiable workload "
+                    "digest; create a new trial identifier rather than "
+                    "silently adopting mutable execution settings"
+                )
+            if remote_digest is not None and remote_digest != digest:
+                raise RuntimeError(
+                    "persisted backend workload digest differs from current "
+                    f"configuration: {remote_digest} != {digest}"
+                )
+            entry["workload_sha256"] = digest
+        elif pinned != digest:
+            raise RuntimeError(
+                "campaign trial workload changed for "
+                f"{entry['test_id']}: {pinned} != {digest}"
+            )
+        return workload
 
     @contextmanager
     def _campaign_lock(self) -> Iterator[None]:
@@ -405,8 +511,19 @@ class CampaignRunner:
                 "benchmark_id": self.definition.benchmark_id,
                 "benchmark_version": self.definition.version,
                 "contract_sha256": self.contract.sha256,
+                "evaluation_sha256": _evaluation_sha256(
+                    _campaign_evaluation_spec(
+                        self.definition,
+                        self.contract,
+                        self.plan,
+                    )
+                ),
                 "backend": self.backend.name,
             }
+            if state.get("evaluation_sha256") is None:
+                state["evaluation_sha256"] = expected[
+                    "evaluation_sha256"
+                ]
             mismatches = {
                 key: {"expected": value, "actual": state.get(key)}
                 for key, value in expected.items()
@@ -416,7 +533,7 @@ class CampaignRunner:
                 raise RuntimeError(
                     f"campaign identity changed: {mismatches}"
                 )
-            state["schema_version"] = "2.1"
+            state["schema_version"] = "3.0"
             state.pop("plan_sha256", None)
             state.setdefault("trials", [])
             state.setdefault("events", [])
@@ -454,11 +571,18 @@ class CampaignRunner:
             return state
 
         state = {
-            "schema_version": "2.1",
+            "schema_version": "3.0",
             "campaign_id": self.plan.campaign_id,
             "benchmark_id": self.definition.benchmark_id,
             "benchmark_version": self.definition.version,
             "contract_sha256": self.contract.sha256,
+            "evaluation_sha256": _evaluation_sha256(
+                _campaign_evaluation_spec(
+                    self.definition,
+                    self.contract,
+                    self.plan,
+                )
+            ),
             "backend": self.backend.name,
             "status": "running",
             "created_at": _now(),
@@ -583,6 +707,32 @@ class CampaignRunner:
                         "campaign trial identity changed for "
                         f"{campaign_trial.test_id}: {mismatches}"
                     )
+                metadata = _load_optional_object(
+                    Path(existing["trial"]) / "metadata/manifest.json"
+                )
+                if metadata is None:
+                    raise RuntimeError(
+                        "campaign trial metadata is missing or invalid: "
+                        f"{existing['trial']}"
+                    )
+                self._pin_challenge_identity(state, existing, metadata)
+                try:
+                    self._configured_workload(existing)
+                except Exception as error:
+                    existing["phase"] = "attention_required"
+                    existing["error"] = str(error)
+                    attach_failure(
+                        existing,
+                        failure_from_exception(
+                            error,
+                            operation="workload_identity",
+                            domain="integrity",
+                            reason="WorkloadIdentityUnverifiable",
+                            disposition="attention",
+                            retryable=False,
+                            cleanup_required=bool(existing.get("handle")),
+                        ),
+                    )
                 continue
             trial_path = tests_root / campaign_trial.test_id
             if trial_path.exists():
@@ -655,8 +805,32 @@ class CampaignRunner:
                     "infrastructure": 0,
                 },
             }
+            metadata = _load_optional_object(
+                trial / "metadata/manifest.json"
+            )
+            if metadata is None:
+                raise RuntimeError(
+                    f"new trial has no valid metadata: {trial}"
+                )
+            self._pin_challenge_identity(state, entry, metadata)
             state["trials"].append(entry)
             entries[campaign_trial.test_id] = entry
+            try:
+                self._configured_workload(entry)
+            except Exception as error:
+                entry["phase"] = "attention_required"
+                entry["error"] = str(error)
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="workload_configuration",
+                        domain="configuration",
+                        reason="WorkloadConfigurationFailed",
+                        disposition="attention",
+                        retryable=False,
+                    ),
+                )
             self._event(
                 state,
                 "trial_added",
@@ -665,6 +839,34 @@ class CampaignRunner:
             )
             added += 1
         return added
+
+    def _pin_challenge_identity(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        challenge_sha256 = metadata.get("challenge_sha256")
+        if not isinstance(challenge_sha256, str) or not challenge_sha256:
+            raise RuntimeError(
+                f"trial {entry['test_id']} has no challenge digest"
+            )
+        campaign_digest = state.get("challenge_sha256")
+        if campaign_digest is None:
+            state["challenge_sha256"] = challenge_sha256
+        elif campaign_digest != challenge_sha256:
+            raise RuntimeError(
+                "campaign challenge materialization is not deterministic: "
+                f"{entry['test_id']} produced {challenge_sha256}, expected "
+                f"{campaign_digest}"
+            )
+        entry_digest = entry.get("challenge_sha256")
+        if entry_digest not in {None, challenge_sha256}:
+            raise RuntimeError(
+                "persisted trial challenge digest changed for "
+                f"{entry['test_id']}: {entry_digest} != {challenge_sha256}"
+            )
+        entry["challenge_sha256"] = challenge_sha256
 
     def _save(self, state: dict[str, Any]) -> None:
         state["updated_at"] = _now()
@@ -769,9 +971,16 @@ class CampaignRunner:
         # Default to the backend's own workload deadline plus a margin: past
         # that point the backend itself is stuck, so nothing else will stop it.
         runtime = self.definition.runtime
+        evaluation_timeout = self.definition.evaluation.timeout_seconds
+        if self.plan.evaluation_timeout_seconds is not None:
+            evaluation_timeout = min(
+                evaluation_timeout,
+                self.plan.evaluation_timeout_seconds,
+            )
         return (
             runtime.timeout_seconds
             + runtime.backend_shutdown_grace_seconds
+            + evaluation_timeout
             + self.plan.trial_timeout_margin_seconds
         )
 
@@ -804,16 +1013,11 @@ class CampaignRunner:
         self,
         state: dict[str, Any],
         entry: dict[str, Any],
+        workload: WorkloadSpec | None = None,
     ) -> BackendHandle | None:
         trial = Path(entry["trial"])
         try:
-            workload = self.workload_factory(
-                trial,
-                self._campaign_trial(entry),
-                self.plan,
-                self.definition,
-                self.backend.name,
-            )
+            workload = workload or self._configured_workload(entry)
         except Exception as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
@@ -970,13 +1174,7 @@ class CampaignRunner:
         if not callable(restart):
             return None
         try:
-            workload = self.workload_factory(
-                Path(entry["trial"]),
-                self._campaign_trial(entry),
-                self.plan,
-                self.definition,
-                self.backend.name,
-            )
+            workload = self._configured_workload(entry)
         except Exception as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
@@ -1216,9 +1414,18 @@ class CampaignRunner:
         entry["backend_phase"] = backend_phase
         if entry["phase"] != "evaluation_pending":
             attempt_number = self._begin_collection_attempt(state, entry)
+            collection_handle = replace(
+                handle,
+                metadata={
+                    **handle.metadata,
+                    "evaluation_results_path": (
+                        self.definition.evaluation.results_path
+                    ),
+                },
+            )
             try:
                 collection = self.backend.collect(
-                    handle,
+                    collection_handle,
                     destination,
                     self.definition.artifacts,
                     included_groups=self.plan.included_artifact_groups,
@@ -1436,11 +1643,10 @@ class CampaignRunner:
         entry["phase"] = "evaluating"
         self._save(state)
         try:
-            evaluation = evaluate_trial(
+            evaluation = finalize_evaluation(
                 self.definition,
                 self.contract,
                 destination,
-                timeout_seconds=self.plan.evaluation_timeout_seconds,
             )
         except Exception as error:
             entry["phase"] = "attention_required"
@@ -1936,8 +2142,34 @@ class CampaignRunner:
         )
         available_by_plan = max(0, self.plan.max_parallel - active)
         if available_by_plan:
+            capacity_workload = None
+            for candidate in state["trials"]:
+                if (
+                    candidate["phase"] == "pending"
+                    and not candidate.get("handle")
+                ):
+                    try:
+                        capacity_workload = self._configured_workload(
+                            candidate
+                        )
+                    except Exception as error:
+                        candidate["phase"] = "attention_required"
+                        candidate["error"] = str(error)
+                        attach_failure(
+                            candidate,
+                            failure_from_exception(
+                                error,
+                                operation="workload_configuration",
+                                domain="configuration",
+                                reason="WorkloadConfigurationFailed",
+                                disposition="attention",
+                                retryable=False,
+                            ),
+                        )
+                        continue
+                    break
             try:
-                capacity = self.backend.capacity()
+                capacity = self.backend.capacity(capacity_workload)
             except BackendConnectivityError as error:
                 return self._pause_connectivity(state, error)
             except BackendError as error:
