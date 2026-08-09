@@ -33,6 +33,7 @@ CONNECTIVITY_FRAGMENTS = (
 class ContainerBackend:
     name = "container"
     agent_isolation = "container"
+    trusted_evaluation = "unsupported"
 
     def __init__(
         self,

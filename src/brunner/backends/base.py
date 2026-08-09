@@ -44,6 +44,88 @@ def native_resource_name(
 
 
 @dataclass(frozen=True)
+class TrustedEvaluationSpec:
+    benchmark_id: str
+    benchmark_version: str
+    contract_sha256: str
+    image: str
+    command: tuple[str, ...]
+    results_path: str
+    timeout_seconds: float
+    primary_report: str | None = None
+    reference_manifest_path: str | None = None
+    reference_validate_command: tuple[str, ...] = ()
+    cpu_request: str | None = None
+    cpu_limit: str | None = None
+    memory_request: str | None = None
+    memory_limit: str | None = None
+    ephemeral_storage_request: str | None = None
+    ephemeral_storage_limit: str | None = None
+
+    def validate(self) -> None:
+        if (
+            not isinstance(self.benchmark_id, str)
+            or not self.benchmark_id.strip()
+        ):
+            raise ValueError("evaluation benchmark_id cannot be empty")
+        if (
+            not isinstance(self.benchmark_version, str)
+            or not self.benchmark_version.strip()
+        ):
+            raise ValueError("evaluation benchmark_version cannot be empty")
+        if (
+            not isinstance(self.contract_sha256, str)
+            or not self.contract_sha256.strip()
+        ):
+            raise ValueError("evaluation contract_sha256 cannot be empty")
+        if not isinstance(self.image, str) or not self.image.strip():
+            raise ValueError("evaluation image cannot be empty")
+        if not self.command or any(
+            not isinstance(argument, str) or not argument.strip()
+            for argument in self.command
+        ):
+            raise ValueError("evaluation command cannot be empty")
+        if self.timeout_seconds <= 0:
+            raise ValueError("evaluation timeout must be positive")
+        for name, value in (
+            ("results_path", self.results_path),
+            ("primary_report", self.primary_report),
+            ("reference_manifest_path", self.reference_manifest_path),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"evaluation {name} must be a safe relative path"
+                )
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(
+                    f"evaluation {name} must be a safe relative path"
+                )
+        if any(
+            not isinstance(argument, str) or not argument.strip()
+            for argument in self.reference_validate_command
+        ):
+            raise ValueError(
+                "evaluation reference_validate_command arguments must be "
+                "non-empty strings"
+            )
+        for name, value in (
+            ("cpu_request", self.cpu_request),
+            ("cpu_limit", self.cpu_limit),
+            ("memory_request", self.memory_request),
+            ("memory_limit", self.memory_limit),
+            ("ephemeral_storage_request", self.ephemeral_storage_request),
+            ("ephemeral_storage_limit", self.ephemeral_storage_limit),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"evaluation {name} cannot be empty")
+
+
+@dataclass(frozen=True)
 class WorkloadSpec:
     workload_id: str
     trial: Path
@@ -61,6 +143,7 @@ class WorkloadSpec:
     memory_limit: str | None = None
     ephemeral_storage_request: str | None = None
     ephemeral_storage_limit: str | None = None
+    evaluation: TrustedEvaluationSpec | None = None
 
     def validate(self) -> None:
         if not self.workload_id.strip():
@@ -73,6 +156,8 @@ class WorkloadSpec:
             raise ValueError("workload timeout must be positive")
         if self.gpu < 0:
             raise ValueError("workload gpu count cannot be negative")
+        if self.evaluation is not None:
+            self.evaluation.validate()
         for name, value in (
             ("cpu", self.cpu),
             ("memory", self.memory),
@@ -157,6 +242,7 @@ class BackendCapacity:
 class ExecutionBackend(Protocol):
     name: str
     agent_isolation: str
+    trusted_evaluation: str
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle: ...
 

@@ -19,7 +19,7 @@ from brunner.errors import (
     ConfigurationError,
     IntegrityError,
 )
-from brunner.hashing import sha256_tree
+from brunner.hashing import sha256_tree_inventory
 from brunner.io import write_json_atomic
 
 
@@ -39,8 +39,9 @@ class StageReport:
     contract_sha256: str
     benchmark_id: str
     benchmark_version: str
+    file_inventory: dict[str, dict[str, object]]
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "workspace": str(self.workspace),
             "challenge_sha256": self.challenge_sha256,
@@ -290,19 +291,21 @@ def stage_challenge(
         destination,
         forbidden_names=definition.challenge.forbidden_names,
     )
-    challenge_sha256 = sha256_tree(destination)
+    challenge_sha256, file_inventory = sha256_tree_inventory(destination)
     report = StageReport(
         workspace=destination,
         challenge_sha256=challenge_sha256,
         contract_sha256=contract.sha256,
         benchmark_id=definition.benchmark_id,
         benchmark_version=definition.version,
+        file_inventory=file_inventory,
     )
     write_json_atomic(
         destination / ".brunner-challenge.json",
         {
             "schema_version": "1.0",
             **report.to_dict(),
+            "file_inventory": report.file_inventory,
         },
     )
     return report
@@ -317,4 +320,8 @@ def load_stage_report(workspace: Path) -> StageReport:
         contract_sha256=str(value["contract_sha256"]),
         benchmark_id=str(value["benchmark_id"]),
         benchmark_version=str(value["benchmark_version"]),
+        file_inventory={
+            str(name): dict(metadata)
+            for name, metadata in value.get("file_inventory", {}).items()
+        },
     )

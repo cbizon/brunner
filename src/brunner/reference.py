@@ -16,7 +16,8 @@ REFERENCE_POLICY = ArtifactPolicy(
         "**/__pycache__/**",
         "**/*.pyc",
         "**/.brunner-reference.json",
-    )
+    ),
+    max_collection_bytes=None,
 )
 
 

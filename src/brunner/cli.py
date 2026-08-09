@@ -10,7 +10,6 @@ from typing import Any, Callable, Sequence
 from brunner.contract import load_output_contract, render_output_requirements
 from brunner.campaign import CampaignRunner
 from brunner.definition import BenchmarkDefinition
-from brunner.evaluation import evaluate_trial
 from brunner.reference import (
     build_reference_manifest,
     validate_reference_manifest,
@@ -82,9 +81,6 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     _add_provider_arguments(create)
     create.add_argument("--test-id")
 
-    evaluation = subparsers.add_parser("trial-evaluate")
-    evaluation.add_argument("trial", type=_path)
-
     assessment = subparsers.add_parser("trial-assess")
     assessment.add_argument("trial", type=_path)
 
@@ -143,8 +139,6 @@ def execute(
                 identity,
             )
         }
-    if args.command == "trial-evaluate":
-        return evaluate_trial(definition, contract, args.trial)
     if args.command == "trial-assess":
         from brunner.assessment import run_assessments
         from brunner.io import load_json_object, write_json_atomic

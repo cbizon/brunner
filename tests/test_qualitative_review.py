@@ -29,12 +29,29 @@ from brunner.campaign import CampaignPlan, CampaignRunner, CampaignTrial
 from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
 from brunner.errors import ConfigurationError
-from brunner.evaluation import evaluate_trial
+from brunner.evaluation import (
+    evaluation_spec,
+    execute_evaluation,
+    finalize_evaluation,
+)
 from brunner.trial import TrialIdentity, create_trial
 
 
 ROOT = Path(__file__).parents[1]
 EXAMPLE_ROOT = ROOT / "examples/text_benchmark"
+
+
+def evaluate_trial(definition, contract, trial):
+    execute_evaluation(
+        evaluation_spec(definition, contract),
+        trial,
+        reference_root=(
+            definition.reference.root
+            if definition.reference is not None
+            else None
+        ),
+    )
+    return finalize_evaluation(definition, contract, trial)
 
 
 def _evidence(finding: str) -> dict[str, Any]:
@@ -189,6 +206,7 @@ def _definition(
         challenge=ChallengeDefinition(root=root / "challenge"),
         evaluation=EvaluationDefinition(
             command=(sys.executable, str(root / "evaluator.py")),
+            image="test-evaluator:latest",
         ),
         qualitative_review=qualitative_review,
     )
@@ -257,7 +275,7 @@ def _create_trial(
 def _set_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -448,12 +466,25 @@ def test_standard_review_artifacts_cannot_be_overwritten(
 class ReviewBackend:
     name = "review"
     agent_isolation = "container"
+    trusted_evaluation = "kubernetes"
 
-    def __init__(self) -> None:
+    def __init__(self, evaluator: Path) -> None:
+        self.evaluator = evaluator
         self.cleaned: set[str] = set()
 
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         _write_valid_submission(workload.trial)
+        assert workload.evaluation is not None
+        execute_evaluation(
+            replace(
+                workload.evaluation,
+                command=(
+                    sys.executable,
+                    str(self.evaluator),
+                ),
+            ),
+            workload.trial,
+        )
         return BackendHandle(
             backend=self.name,
             workload_id=workload.workload_id,
@@ -508,11 +539,14 @@ def _workload(
     definition: BenchmarkDefinition,
     backend_name: str,
 ) -> WorkloadSpec:
+    contract = load_output_contract(definition.contract_path)
+    trusted_evaluation = evaluation_spec(definition, contract)
     return WorkloadSpec(
         workload_id=trial.name,
         trial=trial,
         command=("unused",),
         timeout_seconds=10,
+        evaluation=trusted_evaluation,
     )
 
 
@@ -525,7 +559,7 @@ def test_campaign_runs_standard_review_before_cleanup(
     _write_reviewer(reviewer, _valid_review())
     definition = _definition(root, reviewer)
     contract = load_output_contract(definition.contract_path)
-    backend = ReviewBackend()
+    backend = ReviewBackend(root / "evaluator.py")
     plan = CampaignPlan(
         campaign_id="qualitative-campaign",
         root=tmp_path / "campaign",

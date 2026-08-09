@@ -5,7 +5,7 @@ import json
 import math
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,7 @@ from typing import Any
 from brunner.artifacts import (
     CHUNK_BYTES,
     artifact_metadata,
+    enforce_inventory_size,
     finalize_artifact_collection,
     prepare_partial_artifacts,
 )
@@ -109,6 +110,7 @@ class KubernetesProfile:
     namespace: str = "default"
     agent_image: str | None = None
     artifact_reader_image: str | None = None
+    reference_claim_name: str | None = None
     storage_size: str = "20Gi"
     storage_class_name: str | None = None
     service_account_name: str | None = None
@@ -131,6 +133,13 @@ class KubernetesProfile:
         if self.artifact_chunk_bytes < 1:
             raise ValueError(
                 "Kubernetes artifact_chunk_bytes must be positive"
+            )
+        if (
+            self.reference_claim_name is not None
+            and not self.reference_claim_name.strip()
+        ):
+            raise ValueError(
+                "Kubernetes reference_claim_name cannot be empty"
             )
 
 
@@ -349,9 +358,119 @@ def render_job(
         claim_name=claim_name,
         container=container,
     )
-    pod_spec["activeDeadlineSeconds"] = math.ceil(
-        workload.timeout_seconds
-    )
+    active_deadline_seconds = workload.timeout_seconds
+    if workload.evaluation is not None:
+        evaluation = workload.evaluation
+        evaluation_spec = {
+            "schema_version": "1.0",
+            "benchmark_id": evaluation.benchmark_id,
+            "benchmark_version": evaluation.benchmark_version,
+            "contract_sha256": evaluation.contract_sha256,
+            "command": list(evaluation.command),
+            "results_path": evaluation.results_path,
+            "primary_report": evaluation.primary_report,
+            "timeout_seconds": evaluation.timeout_seconds,
+            "reference_manifest_path": (
+                evaluation.reference_manifest_path
+            ),
+            "reference_validate_command": list(
+                evaluation.reference_validate_command
+            ),
+        }
+        evaluator_requests = {}
+        evaluator_limits = {}
+        if evaluation.cpu_request:
+            evaluator_requests["cpu"] = evaluation.cpu_request
+        if evaluation.memory_request:
+            evaluator_requests["memory"] = evaluation.memory_request
+        if evaluation.ephemeral_storage_request:
+            evaluator_requests["ephemeral-storage"] = (
+                evaluation.ephemeral_storage_request
+            )
+        if evaluation.cpu_limit:
+            evaluator_limits["cpu"] = evaluation.cpu_limit
+        if evaluation.memory_limit:
+            evaluator_limits["memory"] = evaluation.memory_limit
+        if evaluation.ephemeral_storage_limit:
+            evaluator_limits["ephemeral-storage"] = (
+                evaluation.ephemeral_storage_limit
+            )
+        evaluator_resources = {}
+        if evaluator_requests:
+            evaluator_resources["requests"] = evaluator_requests
+        if evaluator_limits:
+            evaluator_resources["limits"] = evaluator_limits
+        evaluator = {
+            "name": "evaluator",
+            "image": evaluation.image,
+            "command": [
+                "python",
+                "-m",
+                "brunner.evaluation_cli",
+                "/brunner/trial",
+            ],
+            "workingDir": "/brunner/trial/workspace",
+            "env": [
+                {
+                    "name": "BRUNNER_EVALUATION_SPEC",
+                    "value": json.dumps(
+                        evaluation_spec,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "name": TERMINATION_LOG_ENV,
+                    "value": "/dev/termination-log",
+                },
+            ],
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "capabilities": {"drop": ["ALL"]},
+                "readOnlyRootFilesystem": True,
+            },
+            "volumeMounts": [
+                {"name": "trial", "mountPath": "/brunner/trial"},
+                {"name": "evaluator-tmp", "mountPath": "/tmp"},
+            ],
+        }
+        if evaluator_resources:
+            evaluator["resources"] = evaluator_resources
+        if evaluation.reference_manifest_path is not None:
+            if not profile.reference_claim_name:
+                raise BackendRequestError(
+                    "Kubernetes evaluation requires reference_claim_name "
+                    "when the benchmark defines a reference bundle"
+                )
+            evaluator["volumeMounts"].append(
+                {
+                    "name": "reference",
+                    "mountPath": "/brunner/reference",
+                    "readOnly": True,
+                }
+            )
+            pod_spec["volumes"].append(
+                {
+                    "name": "reference",
+                    "persistentVolumeClaim": {
+                        "claimName": profile.reference_claim_name,
+                        "readOnly": True,
+                    },
+                }
+            )
+        for mount in container["volumeMounts"]:
+            if mount["name"] == "tmp":
+                mount["name"] = "agent-tmp"
+        for volume in pod_spec["volumes"]:
+            if volume["name"] == "tmp":
+                volume["name"] = "agent-tmp"
+        pod_spec["volumes"].append(
+            {"name": "evaluator-tmp", "emptyDir": {}}
+        )
+        pod_spec["initContainers"] = [container]
+        pod_spec["containers"] = [evaluator]
+        active_deadline_seconds += evaluation.timeout_seconds
+    pod_spec["activeDeadlineSeconds"] = math.ceil(active_deadline_seconds)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -373,6 +492,7 @@ def render_job(
 class KubernetesBackend:
     name = "kubernetes"
     agent_isolation = "container"
+    trusted_evaluation = "kubernetes"
 
     def __init__(
         self,
@@ -782,6 +902,11 @@ class KubernetesBackend:
                 "claim_name": claim_name,
                 "namespace": self.profile.namespace,
                 "submitted_at": submitted_at or _now(),
+                "evaluation_results_path": (
+                    workload.evaluation.results_path
+                    if workload.evaluation is not None
+                    else "evaluation/results.json"
+                ),
             },
         )
 
@@ -836,8 +961,28 @@ class KubernetesBackend:
         )
         return handle
 
+    def _validate_reference_claim(self, workload: WorkloadSpec) -> None:
+        evaluation = workload.evaluation
+        if (
+            evaluation is None
+            or evaluation.reference_manifest_path is None
+        ):
+            return
+        claim_name = self.profile.reference_claim_name
+        if not claim_name:
+            raise BackendRequestError(
+                "Kubernetes evaluation requires reference_claim_name "
+                "when the benchmark defines a reference bundle"
+            )
+        claim = self._get("pvc", claim_name)
+        if claim is None:
+            raise BackendRequestError(
+                f"trusted reference PVC does not exist: {claim_name}"
+            )
+
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         workload.validate()
+        self._validate_reference_claim(workload)
         image = workload.image or self.profile.agent_image
         if not image:
             raise BackendRequestError(
@@ -936,6 +1081,7 @@ class KubernetesBackend:
         generation: int,
     ) -> BackendHandle:
         workload.validate()
+        self._validate_reference_claim(workload)
         if generation < 1:
             raise BackendRequestError(
                 "Kubernetes restart generation must be positive"
@@ -1028,25 +1174,34 @@ class KubernetesBackend:
         return items[0] if items else None
 
     @staticmethod
-    def _terminated_container(
+    def _terminated_containers(
         pod: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any], ...]:
         if pod is None:
-            return None
+            return ()
         status = pod.get("status", {})
+        terminated_containers = []
         for key in ("initContainerStatuses", "containerStatuses"):
             for item in status.get(key, []):
                 terminated = item.get("state", {}).get("terminated")
                 if terminated:
-                    return {
-                        "container": item.get("name"),
-                        **terminated,
-                    }
-        return None
+                    terminated_containers.append(
+                        {
+                            "container": item.get("name"),
+                            "container_type": (
+                                "init"
+                                if key == "initContainerStatuses"
+                                else "main"
+                            ),
+                            **terminated,
+                        }
+                    )
+        return tuple(terminated_containers)
 
     @staticmethod
-    def _brunner_pipeline(
+    def _termination_summary(
         terminated: dict[str, Any] | None,
+        key: str,
     ) -> dict[str, Any] | None:
         if terminated is None:
             return None
@@ -1059,7 +1214,7 @@ class KubernetesBackend:
             return None
         if not isinstance(value, dict):
             return None
-        summary = value.get("brunner_pipeline")
+        summary = value.get(key)
         return summary if isinstance(summary, dict) else None
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
@@ -1097,8 +1252,60 @@ class KubernetesBackend:
                 },
             )
         pod = self._pod_for_handle(handle)
-        terminated = self._terminated_container(pod)
-        brunner_pipeline = self._brunner_pipeline(terminated)
+        terminations = self._terminated_containers(pod)
+        agent_termination = next(
+            (
+                item
+                for item in terminations
+                if item.get("container") == "agent"
+            ),
+            None,
+        )
+        evaluator_termination = next(
+            (
+                item
+                for item in terminations
+                if item.get("container") == "evaluator"
+            ),
+            None,
+        )
+        brunner_pipeline = self._termination_summary(
+            agent_termination,
+            "brunner_pipeline",
+        )
+        brunner_evaluation = self._termination_summary(
+            evaluator_termination,
+            "brunner_evaluation",
+        )
+        failed_terminations = [
+            item
+            for item in terminations
+            if (
+                int(item.get("exitCode") or 0) != 0
+                or int(item.get("signal") or 0) != 0
+                or item.get("reason") not in {None, "Completed"}
+            )
+        ]
+        terminated = (
+            next(
+                (
+                    item
+                    for item in failed_terminations
+                    if item.get("container") == "evaluator"
+                ),
+                None,
+            )
+            or next(
+                (
+                    item
+                    for item in failed_terminations
+                    if item.get("container") == "agent"
+                ),
+                None,
+            )
+            or evaluator_termination
+            or agent_termination
+        )
         job_status = job.get("status", {})
         conditions = {
             item.get("type"): item
@@ -1123,6 +1330,10 @@ class KubernetesBackend:
             brunner_pipeline
             and brunner_pipeline.get("infrastructure_failure") is True
         )
+        evaluation_failed = bool(
+            brunner_evaluation
+            and brunner_evaluation.get("status") == "failed"
+        )
         container_failed = bool(
             terminated
             and (
@@ -1145,6 +1356,18 @@ class KubernetesBackend:
                     brunner_pipeline.get("failure")
                     or "Brunner agent did not produce a terminal "
                     "provider result"
+                )
+            elif evaluation_failed:
+                evaluation_failure = brunner_evaluation.get("failure")
+                if not isinstance(evaluation_failure, dict):
+                    evaluation_failure = {}
+                reason = str(
+                    evaluation_failure.get("reason")
+                    or "EvaluatorFailed"
+                )
+                message = str(
+                    evaluation_failure.get("message")
+                    or "trusted evaluator did not complete successfully"
                 )
             else:
                 reason = termination_reason or "ContainerFailed"
@@ -1222,11 +1445,20 @@ class KubernetesBackend:
             phase = "failed"
             reason = event_failure_reason
             message = event_failure_message
-        retryable_evidence = (
-            brunner_pipeline.get("retryable_infrastructure") is True
-            if brunner_incomplete
-            else (
-                exit_code not in {None, 0}
+        if (
+            brunner_evaluation
+            and brunner_evaluation.get("retryable_infrastructure") is False
+        ):
+            retryable_evidence = False
+        elif brunner_incomplete:
+            retryable_evidence = (
+                brunner_pipeline.get("retryable_infrastructure") is True
+            )
+        else:
+            retryable_evidence = (
+                (
+                    exit_code not in {None, 0}
+                )
                 or termination_signal != 0
                 or reason in RETRYABLE_CONTAINER_FAILURES
                 or pod_failure_reason
@@ -1237,7 +1469,6 @@ class KubernetesBackend:
                 }
                 or job_failure_reason == "BackoffLimitExceeded"
             )
-        )
         retryable_infrastructure = bool(
             phase == "failed"
             and job_failure_reason not in NON_RETRYABLE_JOB_FAILURES
@@ -1259,10 +1490,12 @@ class KubernetesBackend:
                     pvc.get("status", {}).get("phase") if pvc else None
                 ),
                 "terminated_container": terminated,
+                "container_terminations": list(terminations),
                 "job_failure_reason": job_failure_reason,
                 "pod_failure_reason": pod_failure_reason,
                 "retryable_infrastructure": retryable_infrastructure,
                 "brunner_pipeline": brunner_pipeline,
+                "brunner_evaluation": brunner_evaluation,
                 "kubernetes_events": kubernetes_events,
             },
         )
@@ -1363,6 +1596,7 @@ class KubernetesBackend:
         pod: str,
         policy: ArtifactPolicy,
         included_groups: frozenset[str],
+        evaluation_results_path: str = "evaluation/results.json",
     ) -> dict[str, dict[str, Any]]:
         encoded = base64.urlsafe_b64encode(
             json.dumps(
@@ -1373,6 +1607,10 @@ class KubernetesBackend:
                         for name, patterns in policy.groups.items()
                     },
                     "allow_symlinks": policy.allow_symlinks,
+                    "collect_evaluated_artifacts": (
+                        policy.collect_evaluated_artifacts
+                    ),
+                    "max_collection_bytes": policy.max_collection_bytes,
                     "included_groups": sorted(included_groups),
                 },
                 separators=(",", ":"),
@@ -1390,6 +1628,7 @@ class KubernetesBackend:
             "inventory",
             "/brunner/trial",
             encoded,
+            evaluation_results_path,
         )
         try:
             value = json.loads(result.stdout)
@@ -1448,20 +1687,62 @@ class KubernetesBackend:
         destination: Path,
         policy: ArtifactPolicy,
         included_groups: frozenset[str],
+        baseline_trial: Path | None = None,
+        evaluation_results_path: str = "evaluation/results.json",
     ) -> dict[str, Any]:
+        inventory_policy = replace(policy, max_collection_bytes=None)
         inventory = self._remote_inventory(
             pod,
-            policy,
+            inventory_policy,
             included_groups,
+            evaluation_results_path,
+        )
+        unchanged = self._unchanged_staged_files(
+            baseline_trial,
+            inventory,
+        )
+        transfer_inventory = {
+            name: metadata
+            for name, metadata in inventory.items()
+            if name not in unchanged
+        }
+        transferred_bytes = enforce_inventory_size(
+            transfer_inventory,
+            policy.max_collection_bytes,
         )
         partial, complete = prepare_partial_artifacts(
             destination,
             inventory,
-            policy,
+            inventory_policy,
             included_groups,
         )
-        for name, expected in inventory.items():
+        for name in unchanged:
             if name in complete:
+                continue
+            assert baseline_trial is not None
+            source = baseline_trial / name
+            expected = inventory[name]
+            if (
+                expected.get("type") != "file"
+                or not source.is_file()
+                or source.is_symlink()
+                or source.stat().st_size != int(expected["size"])
+            ):
+                raise IntegrityError(
+                    f"staged baseline file is unavailable for reuse: {name}"
+                )
+            target = partial / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.unlink(missing_ok=True)
+            try:
+                target.hardlink_to(source)
+            except OSError as error:
+                raise IntegrityError(
+                    "cannot reuse unchanged staged file without copying "
+                    f"its bytes: {name}: {error}"
+                ) from error
+        for name, expected in inventory.items():
+            if name in complete or name in unchanged:
                 continue
             if expected.get("type") != "file":
                 raise IntegrityError(
@@ -1498,13 +1779,49 @@ class KubernetesBackend:
                 raise IntegrityError(
                     f"remote artifact checksum mismatch: {name}"
                 )
-        return finalize_artifact_collection(
+        result = finalize_artifact_collection(
             partial,
             destination,
             inventory,
-            policy,
+            inventory_policy,
             included_groups=included_groups,
         )
+        result["reused_staged_files"] = len(unchanged)
+        result["transferred_bytes"] = transferred_bytes
+        return result
+
+    @staticmethod
+    def _unchanged_staged_files(
+        baseline_trial: Path | None,
+        inventory: dict[str, dict[str, Any]],
+    ) -> frozenset[str]:
+        if baseline_trial is None:
+            return frozenset()
+        marker = baseline_trial / "workspace/.brunner-challenge.json"
+        if not marker.is_file():
+            return frozenset()
+        try:
+            value = json.loads(marker.read_text())
+        except (json.JSONDecodeError, OSError):
+            return frozenset()
+        baseline = value.get("file_inventory")
+        if not isinstance(baseline, dict):
+            return frozenset()
+        unchanged = set()
+        for relative, metadata in baseline.items():
+            if not isinstance(relative, str) or not isinstance(metadata, dict):
+                continue
+            relative_path = Path(relative)
+            if (
+                not relative
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+            ):
+                continue
+            name = f"workspace/{relative}"
+            if inventory.get(name) == metadata:
+                unchanged.add(name)
+        return frozenset(unchanged)
 
     def collect(
         self,
@@ -1541,6 +1858,13 @@ class KubernetesBackend:
                     destination,
                     policy,
                     included_groups,
+                    handle.trial,
+                    str(
+                        handle.metadata.get(
+                            "evaluation_results_path",
+                            "evaluation/results.json",
+                        )
+                    ),
                 )
                 state_path = self._state_path(handle.trial)
                 if state_path.is_file():

@@ -33,7 +33,7 @@ Failure domains are:
 | --- | --- |
 | `candidate` | Candidate output or candidate-controlled workload behavior |
 | `provider` | Requested model/provider execution and identity |
-| `backend` | OCI/Kubernetes execution and observation |
+| `backend` | Kubernetes execution and observation |
 | `integrity` | Trusted identity, checksum, isolation, or path invariant |
 | `evaluation` | Deterministic evaluator or reference-validation infrastructure |
 | `assessment` | Trusted qualitative reviewer or renderer infrastructure |
@@ -81,10 +81,10 @@ state publication must be atomic so they cannot expose partial state.
 | Output/timing capture | Log disk full, malformed event, output flood | Runner | Terminal provider parsing must not depend on optional diagnostic writes |
 | Inspection | Connectivity, malformed JSON, deleted Job/container, missing Events | Backend and campaign | Pause on connectivity; durable attention on unknown/malformed state |
 | Retry/resume | Retry deadline, exhausted budget, stale session, unsupported resume | Runner or campaign | Absolute persisted retry time; bounded retries; terminal reason at exhaustion |
-| Artifact collection | Transfer loss, helper failure, malformed inventory, checksum/path violation, local disk | Backend and campaign | Retry transport only; integrity never consumes a transport retry |
 | Submission validation | Missing/invalid manifest, schema/path/size violation | Evaluator | `candidate_failed`; this is a valid benchmark result |
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
-| Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
+| Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
+| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, local disk | Backend and campaign | Reuse unchanged staged files locally, omit evaluated raw artifacts by default, retry transport only; integrity never consumes a transport retry |
 | Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure | Campaign | `assessment`; required-review failure makes result indeterminate |
 | Reporting | Serialization, template error, disk full | Evaluation or campaign save | Record `reporting`; never block cleanup or replace the authoritative result |
 | Cleanup | API loss, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Persist `cleanup_pending` and retry; result remains authoritative |
@@ -107,9 +107,9 @@ system reason:
 | Provider token/context/subscription exhaustion | Provider policy |
 | Kubernetes quota or storage-class exhaustion | Backend wait or configuration |
 
-When candidate and harness processes share a cgroup, Brunner cannot reliably
-attribute pod-level memory exhaustion to the candidate. Benchmarks that score
-resource consumption need a separately measurable candidate resource boundary.
+The agent init container and evaluator main container have separate resource
+envelopes and termination records. Pod-wide failures still require container
+and event evidence before attributing exhaustion to either phase.
 
 ## Invariants
 

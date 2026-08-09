@@ -22,6 +22,13 @@ def _policy(value: str) -> tuple[ArtifactPolicy, frozenset[str]]:
                 for name, patterns in decoded.get("groups", {}).items()
             },
             allow_symlinks=bool(decoded.get("allow_symlinks", False)),
+            collect_evaluated_artifacts=bool(
+                decoded.get("collect_evaluated_artifacts", False)
+            ),
+            max_collection_bytes=decoded.get(
+                "max_collection_bytes",
+                10 * 1024 * 1024 * 1024,
+            ),
         ),
         frozenset(decoded.get("included_groups", ())),
     )
@@ -33,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     inventory = subparsers.add_parser("inventory")
     inventory.add_argument("root", type=Path)
     inventory.add_argument("policy")
+    inventory.add_argument(
+        "evaluation_results_path",
+        nargs="?",
+        default="evaluation/results.json",
+    )
     read = subparsers.add_parser("read")
     read.add_argument("root", type=Path)
     read.add_argument("path")
@@ -52,6 +64,7 @@ def main() -> int:
                     root,
                     policy,
                     included_groups=groups,
+                    evaluation_results_path=args.evaluation_results_path,
                 ),
                 sort_keys=True,
             )

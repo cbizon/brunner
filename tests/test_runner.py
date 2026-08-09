@@ -43,7 +43,10 @@ def definition() -> BenchmarkDefinition:
         root=EXAMPLE_ROOT,
         contract_path=EXAMPLE_ROOT / "output-contract.json",
         challenge=ChallengeDefinition(root=EXAMPLE_ROOT / "challenge"),
-        evaluation=EvaluationDefinition(command=(sys.executable, "-c", "pass")),
+        evaluation=EvaluationDefinition(
+            command=(sys.executable, "-c", "pass"),
+            image="test-evaluator:latest",
+        ),
     )
 
 

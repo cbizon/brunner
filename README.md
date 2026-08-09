@@ -4,10 +4,10 @@
 the reusable lifecycle:
 
 ```text
-isolated agent execution -> submission -> verified collection
-                         -> trusted evaluation -> qualitative review
-                         -> optional domain assessments
-                         -> campaign reporting
+Sterling agent init container -> Sterling evaluator container
+                              -> selective verified collection
+                              -> qualitative review / assessments
+                              -> campaign reporting
 ```
 
 Each benchmark imports Brunner and supplies only its challenge, canonical
@@ -27,10 +27,10 @@ fault-injection coverage.
 - Codex and Claude provider adapters
 - Durable retries, session resume, finalization, and timeout handling
 - Cross-provider token normalization and interval-based time accounting
-- OCI-container and Kubernetes execution backends
+- Durable Kubernetes execution on the Sterling deployment target
 - Resumable checksum-verified artifact collection with configurable
   Kubernetes transfer chunks
-- Trusted host or evaluator-container execution
+- Trusted evaluation on the trial PVC before artifact collection
 - Packaged evidence-bound qualitative review contract and HTML report
 - Schema-bound command or model-based post-evaluation assessments
 - Evidence dossiers, timing facts, assessment provenance, and report links
@@ -45,7 +45,7 @@ fault-injection coverage.
 - `challenge/`: prompt template and agent-visible inputs
 - Optional challenge materialization command and timeout
 - `output-contract.json`: submission, work units, artifacts, and JSON schemas
-- Evaluator command and optional evaluator image
+- Evaluator image, image-internal command, timeout, and resource requests/limits
 - Standard qualitative-review model configuration
 - Optional domain assessment contracts, commands or reviewer models, and reports
 - Optional reference root and validation command
@@ -68,9 +68,18 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
   contract-check
 ```
 
-Candidate agents run only through campaign backends that provide an outer
-container isolation boundary. Brunner supports OCI containers and Kubernetes;
-it does not provide host-process or local campaign execution.
+Campaigns run only through the Kubernetes backend. The agent is an init
+container and the trusted evaluator is the main container in one durable Job,
+so neither phase depends on the orchestrating machine remaining awake or
+connected. Brunner does not provide host-process, local-container, or
+orchestrator-side evaluation campaigns.
+
+Evaluator-consumed submission artifacts are not copied back by default.
+`ArtifactPolicy.collect_evaluated_artifacts=True` is an explicit opt-in, and
+`ArtifactPolicy.max_collection_bytes` bounds the total transfer even when raw
+artifacts are requested. Unchanged files from the staged challenge are
+reconstructed in the collected trial with local hard links rather than being
+downloaded from Sterling again.
 
 Materialize a harmless candidate-visible example resource before staging:
 

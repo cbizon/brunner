@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from brunner.backends import BackendHandle, BackendSnapshot, WorkloadSpec
+from brunner.artifacts import artifact_metadata
+from brunner.backends import (
+    BackendHandle,
+    BackendSnapshot,
+    TrustedEvaluationSpec,
+    WorkloadSpec,
+)
 from brunner.backends.base import native_resource_name
 from brunner.backends.container import ContainerBackend
 from brunner.backends.kubernetes import (
@@ -135,6 +141,152 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert expression["values"] == ["node-a"]
 
 
+def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    profile = KubernetesProfile(
+        namespace="benchmarks",
+        agent_image="agent:latest",
+        reference_claim_name="benchmark-reference",
+        secret_environment={
+            "OPENAI_API_KEY": ("provider-credentials", "openai")
+        },
+        nonsecret_environment={
+            "HTTPS_PROXY": "http://proxy.internal:3128",
+        },
+    )
+    workload = WorkloadSpec(
+        workload_id="pipeline",
+        trial=trial,
+        command=("python", "-m", "brunner.agent_cli", "/brunner/trial"),
+        timeout_seconds=61.2,
+        evaluation=TrustedEvaluationSpec(
+            benchmark_id="benchmark",
+            benchmark_version="1.0",
+            contract_sha256="abc123",
+            image="evaluator:latest",
+            command=("python", "-m", "benchmark.evaluator"),
+            results_path="evaluation/custom-results.json",
+            timeout_seconds=120,
+            reference_manifest_path="manifest.json",
+            cpu_request="3",
+            cpu_limit="8",
+            memory_request="16Gi",
+            memory_limit="64Gi",
+        ),
+    )
+
+    job = render_job(
+        "pipeline",
+        "pipeline-data",
+        workload,
+        profile,
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    pod = job["spec"]["template"]["spec"]
+    agent = pod["initContainers"][0]
+    evaluator = pod["containers"][0]
+    assert pod["activeDeadlineSeconds"] == 182
+    assert agent["name"] == "agent"
+    assert evaluator["name"] == "evaluator"
+    assert evaluator["image"] == "evaluator:latest"
+    assert evaluator["command"] == [
+        "python",
+        "-m",
+        "brunner.evaluation_cli",
+        "/brunner/trial",
+    ]
+    agent_environment = {item["name"] for item in agent["env"]}
+    evaluator_environment = {
+        item["name"] for item in evaluator["env"]
+    }
+    assert "OPENAI_API_KEY" in agent_environment
+    assert "HTTPS_PROXY" in agent_environment
+    assert "OPENAI_API_KEY" not in evaluator_environment
+    assert "HTTPS_PROXY" not in evaluator_environment
+    encoded_spec = next(
+        item["value"]
+        for item in evaluator["env"]
+        if item["name"] == "BRUNNER_EVALUATION_SPEC"
+    )
+    assert json.loads(encoded_spec)["command"] == [
+        "python",
+        "-m",
+        "benchmark.evaluator",
+    ]
+    assert json.loads(encoded_spec)["results_path"] == (
+        "evaluation/custom-results.json"
+    )
+    handle = KubernetesBackend(profile)._submission_handle(
+        workload,
+        job_name="pipeline",
+        claim_name="pipeline-data",
+    )
+    assert handle.metadata["evaluation_results_path"] == (
+        "evaluation/custom-results.json"
+    )
+    assert {
+        mount["name"]: mount
+        for mount in evaluator["volumeMounts"]
+    }["reference"]["readOnly"] is True
+    assert all(
+        mount["name"] != "reference"
+        for mount in agent["volumeMounts"]
+    )
+    reference = next(
+        volume
+        for volume in pod["volumes"]
+        if volume["name"] == "reference"
+    )
+    assert reference["persistentVolumeClaim"] == {
+        "claimName": "benchmark-reference",
+        "readOnly": True,
+    }
+    assert evaluator["resources"] == {
+        "requests": {"cpu": "3", "memory": "16Gi"},
+        "limits": {"cpu": "8", "memory": "64Gi"},
+    }
+
+
+def test_kubernetes_pipeline_requires_configured_reference_claim(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    workload = WorkloadSpec(
+        workload_id="pipeline",
+        trial=trial,
+        command=("agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+        evaluation=TrustedEvaluationSpec(
+            benchmark_id="benchmark",
+            benchmark_version="1.0",
+            contract_sha256="abc123",
+            image="evaluator:latest",
+            command=("evaluate",),
+            results_path="evaluation/results.json",
+            timeout_seconds=60,
+            reference_manifest_path="manifest.json",
+        ),
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="reference_claim_name",
+    ):
+        render_job(
+            "pipeline",
+            "pipeline-data",
+            workload,
+            KubernetesProfile(namespace="benchmarks"),
+            {"app.kubernetes.io/name": "brunner"},
+        )
+
+
 @pytest.mark.parametrize("chunk_bytes", (0, -1))
 def test_kubernetes_profile_rejects_invalid_artifact_chunk_size(
     chunk_bytes: int,
@@ -190,6 +342,134 @@ def test_kubernetes_collection_uses_configured_artifact_chunk_size(
     assert reads == [(0, 4), (4, 4), (8, 2)]
     assert (destination / "result.bin").read_bytes() == payload
     assert result["files"] == 1
+
+
+def test_kubernetes_collection_reuses_unchanged_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    staged = trial / "workspace/large-input.bin"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"x" * 4096)
+    staged_metadata = artifact_metadata(staged)
+    assert staged_metadata is not None
+    marker = trial / "workspace/.brunner-challenge.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "file_inventory": {
+                    "large-input.bin": staged_metadata.to_dict(),
+                },
+            }
+        )
+    )
+    output = b"complete\n"
+    inventory = {
+        "workspace/large-input.bin": staged_metadata.to_dict(),
+        "status.json": {
+            "type": "file",
+            "size": len(output),
+            "sha256": hashlib.sha256(output).hexdigest(),
+        },
+    }
+    reads = []
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_chunk_bytes=4,
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+
+    def read_remote(
+        pod: str,
+        relative_path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        reads.append((relative_path, offset, count))
+        assert relative_path == "status.json"
+        return output[offset : offset + count]
+
+    monkeypatch.setattr(backend, "_read_remote", read_remote)
+    destination = tmp_path / "collected"
+
+    result = backend._collect_from_reader(
+        "reader",
+        destination,
+        ArtifactPolicy(max_collection_bytes=32),
+        frozenset(),
+        trial,
+    )
+
+    assert reads == [
+        ("status.json", 0, 4),
+        ("status.json", 4, 4),
+        ("status.json", 8, 1),
+    ]
+    assert (destination / "workspace/large-input.bin").samefile(staged)
+    assert result["reused_staged_files"] == 1
+    assert result["transferred_bytes"] == len(output)
+
+
+def test_kubernetes_collection_caps_changed_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    staged = trial / "workspace/large-input.bin"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"x" * 4096)
+    staged_metadata = artifact_metadata(staged)
+    assert staged_metadata is not None
+    (trial / "workspace/.brunner-challenge.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "file_inventory": {
+                    "large-input.bin": staged_metadata.to_dict(),
+                },
+            }
+        )
+    )
+    changed = b"y" * 4096
+    inventory = {
+        "workspace/large-input.bin": {
+            "type": "file",
+            "size": len(changed),
+            "sha256": hashlib.sha256(changed).hexdigest(),
+        }
+    }
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    monkeypatch.setattr(
+        backend,
+        "_remote_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_read_remote",
+        lambda *args, **kwargs: pytest.fail(
+            "oversized changed input must be rejected before transfer"
+        ),
+    )
+
+    with pytest.raises(IntegrityError, match="exceeding the configured"):
+        backend._collect_from_reader(
+            "reader",
+            tmp_path / "collected",
+            ArtifactPolicy(max_collection_bytes=32),
+            frozenset(),
+            trial,
+        )
 
 
 def test_kubernetes_legacy_resources_remain_compatible(
@@ -937,6 +1217,115 @@ def test_kubernetes_complete_job_preserves_infrastructure_failure(
         "pod": list(events["trial-pod"]),
     }
     assert f"{expected_reason}: agent terminated" in snapshot.warnings
+
+
+def test_kubernetes_candidate_evaluation_failure_is_not_restarted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    pipeline = {
+        "status": "complete",
+        "provider_result_present": True,
+        "infrastructure_failure": False,
+    }
+    evaluation = {
+        "status": "failed",
+        "candidate_failure": True,
+        "retryable_infrastructure": False,
+        "failure": {
+            "domain": "candidate",
+            "reason": "BenchmarkEvaluationFailed",
+            "message": "candidate output was incorrect",
+        },
+    }
+    pod = {
+        "metadata": {"name": "trial-pod", "uid": "pod-uid"},
+        "spec": {"nodeName": "node-a"},
+        "status": {
+            "phase": "Failed",
+            "initContainerStatuses": [
+                {
+                    "name": "agent",
+                    "state": {
+                        "terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                            "message": json.dumps(
+                                {"brunner_pipeline": pipeline}
+                            ),
+                        }
+                    },
+                }
+            ],
+            "containerStatuses": [
+                {
+                    "name": "evaluator",
+                    "state": {
+                        "terminated": {
+                            "exitCode": 1,
+                            "reason": "Error",
+                            "message": json.dumps(
+                                {"brunner_evaluation": evaluation}
+                            ),
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    def get_resource(
+        kind: str,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if kind == "pvc":
+            return {"status": {"phase": "Bound"}}
+        if kind == "job":
+            return {
+                "metadata": {"name": "trial-job", "uid": "job-uid"},
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Failed",
+                            "reason": "BackoffLimitExceeded",
+                        }
+                    ]
+                },
+            }
+        if kind == "pods":
+            return {"items": [pod]}
+        raise AssertionError((kind, name, kwargs))
+
+    monkeypatch.setattr(backend, "_get", get_resource)
+    monkeypatch.setattr(
+        backend,
+        "_events",
+        lambda name, uid, required=False: (),
+    )
+
+    snapshot = backend.inspect(handle)
+
+    assert snapshot.phase == "failed"
+    assert snapshot.reason == "BenchmarkEvaluationFailed"
+    assert snapshot.details["retryable_infrastructure"] is False
+    assert snapshot.details["brunner_pipeline"] == pipeline
+    assert snapshot.details["brunner_evaluation"] == evaluation
+    assert snapshot.details["terminated_container"]["container"] == (
+        "evaluator"
+    )
 
 
 def test_kubernetes_eviction_event_overrides_successful_container(

@@ -13,7 +13,8 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from brunner.contract import OutputContract
+from brunner.backends.base import TrustedEvaluationSpec
+from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import ContractError, EvaluationError, IntegrityError
 from brunner.failure import failure_from_exception, failure_record
@@ -99,84 +100,66 @@ def _run_evaluator(
             ) from error
 
 
-def evaluator_invocation(
+def evaluation_spec(
     definition: BenchmarkDefinition,
     contract: OutputContract,
-    trial: Path,
-    environment: dict[str, str],
-) -> tuple[tuple[str, ...], Path, dict[str, str]]:
+) -> TrustedEvaluationSpec:
+    reference = definition.reference
     evaluation = definition.evaluation
-    if evaluation.image is None:
-        return (
-            evaluation.command,
-            trial / "workspace",
-            environment,
-        )
+    return TrustedEvaluationSpec(
+        benchmark_id=definition.benchmark_id,
+        benchmark_version=definition.version,
+        contract_sha256=contract.sha256,
+        image=evaluation.image,
+        command=evaluation.command,
+        results_path=evaluation.results_path,
+        primary_report=evaluation.primary_report,
+        timeout_seconds=evaluation.timeout_seconds,
+        reference_manifest_path=(
+            reference.manifest_path if reference is not None else None
+        ),
+        reference_validate_command=(
+            reference.validate_command if reference is not None else ()
+        ),
+        cpu_request=evaluation.cpu_request,
+        cpu_limit=evaluation.cpu_limit,
+        memory_request=evaluation.memory_request,
+        memory_limit=evaluation.memory_limit,
+        ephemeral_storage_request=evaluation.ephemeral_storage_request,
+        ephemeral_storage_limit=evaluation.ephemeral_storage_limit,
+    )
 
-    container_trial = Path("/brunner/trial")
-    container_environment = {
-        "BRUNNER_TRIAL_ROOT": str(container_trial),
-        "BRUNNER_WORKSPACE": str(container_trial / "workspace"),
-        "BRUNNER_SUBMISSION_MANIFEST": str(
-            container_trial
-            / Path(environment["BRUNNER_SUBMISSION_MANIFEST"]).relative_to(
-                trial
-            )
+
+def evaluation_spec_from_dict(value: dict[str, Any]) -> TrustedEvaluationSpec:
+    if value.get("schema_version") != "1.0":
+        raise EvaluationError("unsupported trusted evaluation specification")
+    return TrustedEvaluationSpec(
+        benchmark_id=str(value["benchmark_id"]),
+        benchmark_version=str(value["benchmark_version"]),
+        contract_sha256=str(value["contract_sha256"]),
+        image=str(value.get("image") or "remote-evaluator"),
+        command=tuple(str(item) for item in value["command"]),
+        results_path=str(value["results_path"]),
+        primary_report=(
+            str(value["primary_report"])
+            if value.get("primary_report") is not None
+            else None
         ),
-        "BRUNNER_RUN_STATUS": str(
-            container_trial
-            / Path(environment["BRUNNER_RUN_STATUS"]).relative_to(trial)
+        timeout_seconds=float(value["timeout_seconds"]),
+        reference_manifest_path=(
+            str(value["reference_manifest_path"])
+            if value.get("reference_manifest_path") is not None
+            else None
         ),
-        "BRUNNER_OUTPUT_CONTRACT": str(
-            container_trial / "workspace/schema/output-contract.json"
+        reference_validate_command=tuple(
+            str(item)
+            for item in value.get("reference_validate_command", ())
         ),
-        "BRUNNER_CONTRACT_SHA256": contract.sha256,
-        "BRUNNER_EVALUATION_RESULTS": str(
-            container_trial
-            / Path(environment["BRUNNER_EVALUATION_RESULTS"]).relative_to(
-                trial
-            )
-        ),
-    }
-    arguments = [
-        evaluation.container_runtime,
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--read-only",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid",
-        "--mount",
-        f"type=bind,src={trial},dst={container_trial}",
-        "--workdir",
-        str(container_trial / "workspace"),
-    ]
-    if definition.reference is not None:
-        container_reference = Path("/brunner/reference")
-        container_environment["BRUNNER_REFERENCE_ROOT"] = str(
-            container_reference
-        )
-        container_environment["BRUNNER_REFERENCE_MANIFEST"] = str(
-            container_reference / definition.reference.manifest_path
-        )
-        arguments.extend(
-            (
-                "--mount",
-                "type=bind,src="
-                f"{definition.reference.root.resolve()},"
-                f"dst={container_reference},readonly",
-            )
-        )
-    for key, value in sorted(container_environment.items()):
-        arguments.extend(("--env", f"{key}={value}"))
-    arguments.extend((evaluation.image, *evaluation.command))
-    return tuple(arguments), trial, os.environ.copy()
+    )
 
 
 def _failure_result(
-    definition: BenchmarkDefinition,
-    contract: OutputContract,
+    spec: TrustedEvaluationSpec,
     *,
     error: BaseException,
     provider_status: str | None,
@@ -196,46 +179,50 @@ def _failure_result(
             "traceback": traceback_path,
         },
         "failure": failure,
-        "benchmark_id": definition.benchmark_id,
-        "benchmark_version": definition.version,
-        "contract_sha256": contract.sha256,
+        "benchmark_id": spec.benchmark_id,
+        "benchmark_version": spec.benchmark_version,
+        "contract_sha256": spec.contract_sha256,
         "provider_status": provider_status,
         "evaluator_return_code": return_code,
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
 
 
-def evaluate_trial(
-    definition: BenchmarkDefinition,
-    contract: OutputContract,
+def execute_evaluation(
+    spec: TrustedEvaluationSpec,
     trial: Path,
     *,
+    reference_root: Path | None = None,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Run trusted evaluation.
-
-    ``timeout_seconds`` overrides the benchmark's own evaluation timeout. A
-    campaign uses it to bound a wedged evaluator, which would otherwise block
-    every other trial for the benchmark's full timeout.
-    """
+    """Execute deterministic evaluation inside the trusted environment."""
+    spec.validate()
     trial = trial.resolve()
-    evaluation_timeout = (
-        definition.evaluation.timeout_seconds
-        if timeout_seconds is None
-        else min(timeout_seconds, definition.evaluation.timeout_seconds)
+    contract = load_output_contract(
+        trial / "workspace/schema/output-contract.json",
+        expected_benchmark_id=spec.benchmark_id,
     )
-    # One shared budget across reference validation, the evaluator, and every
-    # assessment. Handing each step the full timeout would let a bounded
-    # evaluation still run for a multiple of it.
-    evaluation_deadline = time.monotonic() + evaluation_timeout
+    if contract.sha256 != spec.contract_sha256:
+        raise ContractError(
+            "staged output contract differs from evaluator contract"
+        )
+    evaluation_timeout = (
+        spec.timeout_seconds
+        if timeout_seconds is None
+        else min(timeout_seconds, spec.timeout_seconds)
+    )
+    deadline = time.monotonic() + evaluation_timeout
 
     def remaining_seconds() -> float:
-        return max(0.0, evaluation_deadline - time.monotonic())
-    results_path = trial / definition.evaluation.results_path
+        return max(0.0, deadline - time.monotonic())
+
+    results_path = trial / spec.results_path
     results_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path = results_path.with_name("evaluator.stdout.log")
     stderr_path = results_path.with_name("evaluator.stderr.log")
     error_path = results_path.with_name("error.txt")
+    results_path.unlink(missing_ok=True)
+    error_path.unlink(missing_ok=True)
     status_path = trial / "status.json"
     provider_status = None
     if status_path.is_file():
@@ -276,25 +263,28 @@ def evaluate_trial(
                 "BRUNNER_EVALUATION_RESULTS": str(results_path),
             }
         )
-        if definition.reference is not None:
+        if spec.reference_manifest_path is not None:
+            if reference_root is None:
+                raise IntegrityError(
+                    "trusted evaluation requires a mounted reference bundle"
+                )
             failure_context = {
                 "operation": "reference_validation",
                 "domain": "integrity",
                 "reason": "ReferenceValidationFailed",
                 "disposition": "attention",
             }
+            reference_root = reference_root.resolve()
             reference_manifest_path = (
-                definition.reference.root
-                / definition.reference.manifest_path
+                reference_root / spec.reference_manifest_path
             )
             reference_manifest = validate_reference_manifest(
-                definition.reference.root,
+                reference_root,
                 reference_manifest_path,
             )
-            reference_metadata = reference_manifest.get("metadata", {})
-            reference_contract = reference_metadata.get(
-                "contract_sha256"
-            )
+            reference_contract = reference_manifest.get(
+                "metadata", {}
+            ).get("contract_sha256")
             if (
                 reference_contract is not None
                 and reference_contract != contract.sha256
@@ -302,13 +292,11 @@ def evaluate_trial(
                 raise IntegrityError(
                     "reference bundle contract digest does not match trial"
                 )
-            environment["BRUNNER_REFERENCE_ROOT"] = str(
-                definition.reference.root.resolve()
-            )
+            environment["BRUNNER_REFERENCE_ROOT"] = str(reference_root)
             environment["BRUNNER_REFERENCE_MANIFEST"] = str(
                 reference_manifest_path.resolve()
             )
-            if definition.reference.validate_command:
+            if spec.reference_validate_command:
                 failure_context = {
                     "operation": "reference_validation_command",
                     "domain": "evaluation",
@@ -316,8 +304,8 @@ def evaluate_trial(
                     "disposition": "attention",
                 }
                 reference_return_code = _run_evaluator(
-                    definition.reference.validate_command,
-                    cwd=definition.reference.root,
+                    spec.reference_validate_command,
+                    cwd=reference_root,
                     environment=environment,
                     timeout_seconds=remaining_seconds(),
                     stdout_path=results_path.with_name(
@@ -338,16 +326,10 @@ def evaluate_trial(
             "reason": "EvaluatorFailed",
             "disposition": "attention",
         }
-        command, cwd, process_environment = evaluator_invocation(
-            definition,
-            contract,
-            trial,
-            environment,
-        )
         return_code = _run_evaluator(
-            command,
-            cwd=cwd,
-            environment=process_environment,
+            spec.command,
+            cwd=trial / "workspace",
+            environment=environment,
             timeout_seconds=remaining_seconds(),
             stdout_path=stdout_path,
             stderr_path=stderr_path,
@@ -364,19 +346,21 @@ def evaluate_trial(
                 "evaluator exited nonzero but reported complete"
             )
         reports = list(result["reports"])
-        if definition.evaluation.primary_report is not None:
-            if not any(
-                report.get("path") == definition.evaluation.primary_report
+        if (
+            spec.primary_report is not None
+            and not any(
+                report.get("path") == spec.primary_report
                 for report in reports
-            ):
-                reports.append(
-                    {
-                        "path": definition.evaluation.primary_report,
-                        "media_type": "text/html",
-                        "title": "Primary benchmark report",
-                        "primary": True,
-                    }
-                )
+            )
+        ):
+            reports.append(
+                {
+                    "path": spec.primary_report,
+                    "media_type": "text/html",
+                    "title": "Primary benchmark report",
+                    "primary": True,
+                }
+            )
         for report in reports:
             _safe_report_path(trial, str(report["path"]))
         result["reports"] = reports
@@ -393,10 +377,11 @@ def evaluate_trial(
                 disposition="candidate_failed",
                 retryable=False,
             )
+        assert validated is not None
         result.update(
             {
-                "benchmark_id": definition.benchmark_id,
-                "benchmark_version": definition.version,
+                "benchmark_id": spec.benchmark_id,
+                "benchmark_version": spec.benchmark_version,
                 "contract_sha256": contract.sha256,
                 "provider_status": provider_status,
                 "evaluator_return_code": return_code,
@@ -415,7 +400,6 @@ def evaluate_trial(
                 },
             }
         )
-        error_path.unlink(missing_ok=True)
         write_json_atomic(results_path, result)
     except Exception as error:
         error_path.write_text(traceback.format_exc())
@@ -433,8 +417,7 @@ def evaluate_trial(
             ),
         )
         result = _failure_result(
-            definition,
-            contract,
+            spec,
             error=error,
             provider_status=provider_status,
             return_code=return_code,
@@ -442,6 +425,41 @@ def evaluate_trial(
             failure=failure,
         )
         write_json_atomic(results_path, result)
+    return result
+
+
+def finalize_evaluation(
+    definition: BenchmarkDefinition,
+    contract: OutputContract,
+    trial: Path,
+) -> dict[str, Any]:
+    """Validate remote evaluation and run small post-collection assessments."""
+    trial = trial.resolve()
+    results_path = trial / definition.evaluation.results_path
+    if not results_path.is_file():
+        raise EvaluationError(
+            f"Sterling evaluator result was not collected: {results_path}"
+        )
+    result = _validate_evaluation_result(
+        json.loads(results_path.read_text())
+    )
+    expected_identity = {
+        "benchmark_id": definition.benchmark_id,
+        "benchmark_version": definition.version,
+        "contract_sha256": contract.sha256,
+    }
+    mismatch = {
+        key: {"expected": expected, "actual": result.get(key)}
+        for key, expected in expected_identity.items()
+        if result.get(key) != expected
+    }
+    if mismatch:
+        raise IntegrityError(
+            f"Sterling evaluation identity mismatch: {mismatch}"
+        )
+    for report in result["reports"]:
+        _safe_report_path(trial, str(report["path"]))
+
     from brunner.assessment import run_assessments
 
     assessment_index = run_assessments(
@@ -449,7 +467,6 @@ def evaluate_trial(
         contract,
         trial,
         result,
-        deadline_epoch=time.time() + remaining_seconds(),
     )
     result["assessment_status"] = assessment_index["status"]
     result["required_assessments_complete"] = assessment_index[
@@ -459,6 +476,7 @@ def evaluate_trial(
     if "failure" in assessment_index:
         result["assessment_failure"] = assessment_index["failure"]
     write_json_atomic(results_path, result)
+
     from brunner.report import write_run_report
 
     try:
@@ -487,7 +505,5 @@ def evaluate_trial(
     try:
         write_json_atomic(results_path, result)
     except OSError:
-        # The authoritative evaluation and assessment result was persisted
-        # before presentation. Reporting metadata must not block cleanup.
         pass
     return result

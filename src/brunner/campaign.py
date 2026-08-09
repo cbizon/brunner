@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
@@ -16,9 +16,10 @@ from brunner.backends import (
     BackendHandle,
     CONTAINER_ISOLATION,
     ExecutionBackend,
+    TrustedEvaluationSpec,
     WorkloadSpec,
 )
-from brunner.contract import OutputContract
+from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import (
     ArtifactTransferError,
@@ -26,7 +27,10 @@ from brunner.errors import (
     BackendError,
     IntegrityError,
 )
-from brunner.evaluation import evaluate_trial
+from brunner.evaluation import (
+    evaluation_spec,
+    finalize_evaluation,
+)
 from brunner.failure import (
     attach_failure,
     failure_from_exception,
@@ -262,6 +266,10 @@ def default_workload_factory(
     definition: BenchmarkDefinition,
     backend_name: str,
 ) -> WorkloadSpec:
+    contract = load_output_contract(
+        definition.contract_path,
+        expected_benchmark_id=definition.benchmark_id,
+    )
     command = [
         "python",
         "-m",
@@ -272,6 +280,11 @@ def default_workload_factory(
         command.extend(
             ("--provider-executable", plan.provider_executable)
         )
+    trusted_evaluation = _campaign_evaluation_spec(
+        definition,
+        contract,
+        plan,
+    )
     return WorkloadSpec(
         workload_id=trial.name,
         trial=trial,
@@ -287,8 +300,26 @@ def default_workload_factory(
         memory_limit=plan.memory_limit,
         ephemeral_storage_request=plan.ephemeral_storage_request,
         ephemeral_storage_limit=plan.ephemeral_storage_limit,
+        evaluation=trusted_evaluation,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
+
+
+def _campaign_evaluation_spec(
+    definition: BenchmarkDefinition,
+    contract: OutputContract,
+    plan: CampaignPlan,
+) -> TrustedEvaluationSpec:
+    trusted_evaluation = evaluation_spec(definition, contract)
+    if plan.evaluation_timeout_seconds is not None:
+        trusted_evaluation = replace(
+            trusted_evaluation,
+            timeout_seconds=min(
+                trusted_evaluation.timeout_seconds,
+                plan.evaluation_timeout_seconds,
+            ),
+        )
+    return trusted_evaluation
 
 
 def _handle_from_dict(value: dict[str, Any]) -> BackendHandle:
@@ -315,6 +346,11 @@ class CampaignRunner:
             raise ValueError(
                 "campaign backends must run agents in a container isolation "
                 "boundary; host-process execution is not supported"
+            )
+        if getattr(backend, "trusted_evaluation", None) != "kubernetes":
+            raise ValueError(
+                "campaign backends must run trusted evaluation in the "
+                "Kubernetes trial workload; local evaluation is not supported"
             )
         plan.validate()
         definition.validate()
@@ -769,9 +805,16 @@ class CampaignRunner:
         # Default to the backend's own workload deadline plus a margin: past
         # that point the backend itself is stuck, so nothing else will stop it.
         runtime = self.definition.runtime
+        evaluation_timeout = self.definition.evaluation.timeout_seconds
+        if self.plan.evaluation_timeout_seconds is not None:
+            evaluation_timeout = min(
+                evaluation_timeout,
+                self.plan.evaluation_timeout_seconds,
+            )
         return (
             runtime.timeout_seconds
             + runtime.backend_shutdown_grace_seconds
+            + evaluation_timeout
             + self.plan.trial_timeout_margin_seconds
         )
 
@@ -814,6 +857,16 @@ class CampaignRunner:
                 self.definition,
                 self.backend.name,
             )
+            expected_evaluation = _campaign_evaluation_spec(
+                self.definition,
+                self.contract,
+                self.plan,
+            )
+            if workload.evaluation != expected_evaluation:
+                raise ValueError(
+                    "campaign workload must use the benchmark's exact "
+                    "Sterling evaluation specification"
+                )
         except Exception as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
@@ -977,6 +1030,16 @@ class CampaignRunner:
                 self.definition,
                 self.backend.name,
             )
+            expected_evaluation = _campaign_evaluation_spec(
+                self.definition,
+                self.contract,
+                self.plan,
+            )
+            if workload.evaluation != expected_evaluation:
+                raise ValueError(
+                    "campaign workload must use the benchmark's exact "
+                    "Sterling evaluation specification"
+                )
         except Exception as error:
             entry["phase"] = "attention_required"
             entry["error"] = str(error)
@@ -1216,9 +1279,18 @@ class CampaignRunner:
         entry["backend_phase"] = backend_phase
         if entry["phase"] != "evaluation_pending":
             attempt_number = self._begin_collection_attempt(state, entry)
+            collection_handle = replace(
+                handle,
+                metadata={
+                    **handle.metadata,
+                    "evaluation_results_path": (
+                        self.definition.evaluation.results_path
+                    ),
+                },
+            )
             try:
                 collection = self.backend.collect(
-                    handle,
+                    collection_handle,
                     destination,
                     self.definition.artifacts,
                     included_groups=self.plan.included_artifact_groups,
@@ -1436,11 +1508,10 @@ class CampaignRunner:
         entry["phase"] = "evaluating"
         self._save(state)
         try:
-            evaluation = evaluate_trial(
+            evaluation = finalize_evaluation(
                 self.definition,
                 self.contract,
                 destination,
-                timeout_seconds=self.plan.evaluation_timeout_seconds,
             )
         except Exception as error:
             entry["phase"] = "attention_required"

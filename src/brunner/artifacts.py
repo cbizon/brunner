@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -77,15 +78,62 @@ def collectable_artifact(
     return True
 
 
+def _evaluated_artifact_paths(
+    root: Path,
+    evaluation_results_path: str,
+) -> frozenset[str]:
+    relative = Path(evaluation_results_path)
+    if (
+        not evaluation_results_path
+        or relative.is_absolute()
+        or ".." in relative.parts
+    ):
+        raise IntegrityError(
+            "evaluation results path must be a safe relative path"
+        )
+    results_path = root / evaluation_results_path
+    if not results_path.is_file():
+        return frozenset()
+    try:
+        results = json.loads(results_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return frozenset()
+    submission = results.get("submission")
+    if not isinstance(submission, dict):
+        return frozenset()
+    artifacts = submission.get("artifacts")
+    if not isinstance(artifacts, list):
+        return frozenset()
+    paths = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        value = artifact.get("path")
+        if not isinstance(value, str):
+            continue
+        relative = Path(value)
+        if value and not relative.is_absolute() and ".." not in relative.parts:
+            paths.add(relative.as_posix())
+    return frozenset(paths)
+
+
 def file_inventory(
     root: Path,
     policy: ArtifactPolicy,
     *,
     included_groups: frozenset[str] = frozenset(),
+    evaluation_results_path: str = "evaluation/results.json",
 ) -> dict[str, dict[str, Any]]:
     inventory = {}
+    evaluated_artifacts = (
+        frozenset()
+        if policy.collect_evaluated_artifacts
+        else _evaluated_artifact_paths(root, evaluation_results_path)
+    )
     for path in sorted(root.rglob("*")):
         name = path.relative_to(root).as_posix()
+        if name in evaluated_artifacts:
+            continue
         if not collectable_artifact(
             name,
             policy,
@@ -99,7 +147,26 @@ def file_inventory(
         metadata = artifact_metadata(path)
         if metadata is not None:
             inventory[name] = metadata.to_dict()
+    enforce_inventory_size(inventory, policy.max_collection_bytes)
     return inventory
+
+
+def enforce_inventory_size(
+    inventory: dict[str, dict[str, Any]],
+    max_bytes: int | None,
+) -> int:
+    total_bytes = sum(
+        int(metadata["size"])
+        for metadata in inventory.values()
+        if metadata.get("type") == "file"
+    )
+    if max_bytes is not None and total_bytes > max_bytes:
+        raise IntegrityError(
+            "artifact collection inventory is "
+            f"{total_bytes} bytes, exceeding the configured "
+            f"{max_bytes}-byte limit"
+        )
+    return total_bytes
 
 
 def inventory_difference(

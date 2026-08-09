@@ -33,6 +33,7 @@ from brunner.errors import (
     BackendConnectivityError,
     BackendRequestError,
 )
+from brunner.evaluation import evaluation_spec, execute_evaluation
 from brunner.failure import failure_record
 from examples.text_benchmark.definition import build_definition
 
@@ -43,6 +44,7 @@ ROOT = Path(__file__).parents[1]
 class ImmediateBackend:
     name = "fake"
     agent_isolation = "container"
+    trusted_evaluation = "kubernetes"
 
     def __init__(self) -> None:
         self.handles: dict[str, BackendHandle] = {}
@@ -84,6 +86,17 @@ class ImmediateBackend:
                     ],
                 }
             )
+        )
+        assert workload.evaluation is not None
+        execute_evaluation(
+            replace(
+                workload.evaluation,
+                command=(
+                    sys.executable,
+                    str(ROOT / "examples/text_benchmark/evaluator.py"),
+                ),
+            ),
+            workload.trial,
         )
         handle = BackendHandle(
             backend=self.name,
@@ -420,6 +433,10 @@ class HostProcessBackend(ImmediateBackend):
     agent_isolation = "host"
 
 
+class LocalEvaluationBackend(ImmediateBackend):
+    trusted_evaluation = "unsupported"
+
+
 def _workload(
     trial: Path,
     campaign_trial: CampaignTrial,
@@ -427,11 +444,14 @@ def _workload(
     definition: Any,
     backend_name: str,
 ) -> WorkloadSpec:
+    contract = load_output_contract(definition.contract_path)
+    trusted_evaluation = evaluation_spec(definition, contract)
     return WorkloadSpec(
         workload_id=trial.name,
         trial=trial,
         command=("unused",),
         timeout_seconds=10,
+        evaluation=trusted_evaluation,
     )
 
 
@@ -452,6 +472,61 @@ def test_campaign_rejects_host_process_backend(tmp_path: Path) -> None:
             HostProcessBackend(),
             workload_factory=_workload,
         )
+
+
+def test_campaign_rejects_local_evaluation_backend(tmp_path: Path) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="unsafe-evaluation",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("unsafe-a", "codex", "model-a"),),
+    )
+
+    with pytest.raises(ValueError, match="local evaluation is not supported"):
+        CampaignRunner(
+            definition,
+            contract,
+            plan,
+            LocalEvaluationBackend(),
+            workload_factory=_workload,
+        )
+
+
+def test_campaign_rejects_workload_without_exact_evaluator(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    plan = CampaignPlan(
+        campaign_id="missing-evaluation",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("unsafe-a", "codex", "model-a"),),
+    )
+
+    def missing_evaluation(*args, **kwargs):
+        trial = args[0]
+        return WorkloadSpec(
+            workload_id=trial.name,
+            trial=trial,
+            command=("unused",),
+            timeout_seconds=10,
+        )
+
+    runner = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        ImmediateBackend(),
+        workload_factory=missing_evaluation,
+    )
+
+    state = runner.advance()
+
+    entry = state["trials"][0]
+    assert entry["phase"] == "attention_required"
+    assert entry["failure"]["domain"] == "configuration"
+    assert "exact Sterling evaluation" in entry["error"]
 
 
 def test_campaign_rejects_concurrent_orchestrator(
@@ -528,7 +603,7 @@ def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -657,7 +732,7 @@ def test_campaign_run_waits_for_connectivity_and_resumes(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -725,7 +800,7 @@ def test_campaign_reconciles_partial_nonconnectivity_submission(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -799,7 +874,7 @@ def test_campaign_resumes_cleanup_after_connectivity_loss(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -840,7 +915,7 @@ def test_campaign_retries_nonconnectivity_cleanup_failure(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -880,7 +955,7 @@ def test_campaign_dashboard_failure_does_not_block_cleanup(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -957,7 +1032,7 @@ def test_campaign_retries_transient_artifact_transfer(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -995,7 +1070,7 @@ def test_campaign_stops_retrying_artifact_transfer_at_limit(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -1035,7 +1110,7 @@ def test_empty_backend_logs_do_not_overwrite_recovered_log(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -1181,7 +1256,7 @@ def test_required_assessment_failure_marks_campaign_trial_failed(
     )
 
     monkeypatch.setattr(
-        "brunner.campaign.evaluate_trial",
+        "brunner.campaign.finalize_evaluation",
         lambda *args, **kwargs: {
             "status": "complete",
             "assessment_status": "failed",
@@ -1234,7 +1309,7 @@ def test_evaluator_infrastructure_failure_is_not_a_benchmark_failure(
         retryable=False,
     )
     monkeypatch.setattr(
-        "brunner.campaign.evaluate_trial",
+        "brunner.campaign.finalize_evaluation",
         lambda *args, **kwargs: {
             "status": "failed",
             "assessment_status": "not_configured",
@@ -1281,7 +1356,7 @@ def test_candidate_submission_failure_remains_a_benchmark_failure(
         retryable=False,
     )
     monkeypatch.setattr(
-        "brunner.campaign.evaluate_trial",
+        "brunner.campaign.finalize_evaluation",
         lambda *args, **kwargs: {
             "status": "failed",
             "assessment_status": "not_configured",
@@ -1306,7 +1381,7 @@ def test_campaign_appends_new_ids_without_invalidating_completed_work(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -1582,7 +1657,7 @@ def test_unexpected_backend_log_failure_does_not_block_collection(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -1641,7 +1716,7 @@ def test_campaign_trial_id_must_be_a_safe_path_segment() -> None:
         CampaignTrial("../escape", "codex", "model-a").validate()
 
 
-def test_campaign_backend_deadline_includes_shutdown_grace(
+def test_campaign_workload_includes_agent_and_sterling_evaluator(
     tmp_path: Path,
 ) -> None:
     definition = build_definition()
@@ -1653,9 +1728,10 @@ def test_campaign_backend_deadline_includes_shutdown_grace(
             campaign_id="deadline",
             root=tmp_path / "campaign",
             trials=(trial,),
+            evaluation_timeout_seconds=90,
         ),
         definition,
-        "container",
+        "kubernetes",
     )
 
     assert workload.command[:3] == (
@@ -1668,6 +1744,10 @@ def test_campaign_backend_deadline_includes_shutdown_grace(
         definition.runtime.timeout_seconds
         + definition.runtime.backend_shutdown_grace_seconds
     )
+    assert workload.evaluation is not None
+    assert workload.evaluation.image == definition.evaluation.image
+    assert workload.evaluation.command == definition.evaluation.command
+    assert workload.evaluation.timeout_seconds == 90
 
 
 def test_default_workload_factory_preserves_burst_resources(
@@ -2039,7 +2119,7 @@ def test_campaign_does_not_evaluate_interrupted_infrastructure_run(
         workload_factory=_workload,
     )
     monkeypatch.setattr(
-        "brunner.campaign.evaluate_trial",
+        "brunner.campaign.finalize_evaluation",
         lambda *args, **kwargs: pytest.fail(
             "interrupted agent output must not be evaluated"
         ),
@@ -2136,7 +2216,7 @@ def test_campaign_pause_clock_resets_after_connectivity_returns(
 ) -> None:
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT) + os.pathsep + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )

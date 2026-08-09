@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,8 +17,13 @@ from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
 from brunner.errors import ContractError, IntegrityError
 from brunner import evaluation as evaluation_module
-from brunner.evaluation import evaluate_trial, evaluator_invocation
+from brunner.evaluation import (
+    evaluation_spec,
+    execute_evaluation,
+    finalize_evaluation,
+)
 from brunner.reference import (
+    REFERENCE_POLICY,
     build_reference_manifest,
     validate_reference_manifest,
 )
@@ -30,6 +36,26 @@ from examples.numeric_benchmark.definition import (
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def evaluate_trial(
+    definition,
+    contract,
+    trial: Path,
+    *,
+    timeout_seconds: float | None = None,
+):
+    execute_evaluation(
+        evaluation_spec(definition, contract),
+        trial,
+        reference_root=(
+            definition.reference.root
+            if definition.reference is not None
+            else None
+        ),
+        timeout_seconds=timeout_seconds,
+    )
+    return finalize_evaluation(definition, contract, trial)
 
 
 def _write_valid_submission(trial: Path) -> None:
@@ -77,7 +103,9 @@ def test_evaluate_trial_uses_contract_validated_input(
     _write_valid_submission(trial)
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -91,6 +119,73 @@ def test_evaluate_trial_uses_contract_validated_input(
         "transformed-text"
     )
     assert (trial / "evaluation/run-report.html").is_file()
+
+
+def test_evaluation_cli_runs_deterministic_evaluator_in_subprocess(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("evaluation-cli", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+    spec = replace(
+        evaluation_spec(definition, contract),
+        command=(
+            sys.executable,
+            str(definition.root / "evaluator.py"),
+        ),
+    )
+    termination_log = tmp_path / "termination.log"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = (
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
+        + os.pathsep
+        + environment.get("PYTHONPATH", "")
+    )
+    environment["BRUNNER_TERMINATION_LOG"] = str(termination_log)
+    environment["BRUNNER_EVALUATION_SPEC"] = json.dumps(
+        {
+            "schema_version": "1.0",
+            "benchmark_id": spec.benchmark_id,
+            "benchmark_version": spec.benchmark_version,
+            "contract_sha256": spec.contract_sha256,
+            "command": list(spec.command),
+            "results_path": spec.results_path,
+            "primary_report": spec.primary_report,
+            "timeout_seconds": spec.timeout_seconds,
+            "reference_manifest_path": spec.reference_manifest_path,
+            "reference_validate_command": list(
+                spec.reference_validate_command
+            ),
+        }
+    )
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "brunner.evaluation_cli",
+            str(trial),
+        ),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads((trial / "evaluation/results.json").read_text())
+    assert result["status"] == "complete"
+    summary = json.loads(termination_log.read_text())
+    assert summary["brunner_evaluation"]["status"] == "complete"
 
 
 def test_invalid_submission_is_identified_as_candidate_failure(
@@ -153,7 +248,9 @@ def test_report_failure_does_not_replace_evaluation_result(
     _write_valid_submission(trial)
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -186,7 +283,9 @@ def test_report_metadata_persistence_failure_is_non_gating(
     _write_valid_submission(trial)
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -233,6 +332,7 @@ def test_reference_manifest_excludes_itself_and_detects_tampering(
     (reference / "answer.json").write_text('{"answer": 43}\n')
     with pytest.raises(IntegrityError, match="inventory mismatch"):
         validate_reference_manifest(reference, manifest_path)
+    assert REFERENCE_POLICY.max_collection_bytes is None
 
 
 def test_artifact_collection_resumes_and_honors_groups(
@@ -262,6 +362,92 @@ def test_artifact_collection_resumes_and_honors_groups(
         included_groups=frozenset({"debug"}),
     )
     assert "debug/trace.log" in with_debug
+
+
+def test_collection_omits_evaluated_artifacts_unless_explicitly_enabled(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    artifact = source / "workspace/submission/trajectory.bin"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"x" * 1024)
+    evaluation = source / "evaluation"
+    evaluation.mkdir()
+    (evaluation / "results.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "status": "complete",
+                "summary": {},
+                "metrics": {},
+                "reports": [],
+                "submission": {
+                    "artifacts": [
+                        {
+                            "path": (
+                                "workspace/submission/trajectory.bin"
+                            )
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    default_destination = tmp_path / "default"
+    collect_local_artifacts(
+        source,
+        default_destination,
+        ArtifactPolicy(max_collection_bytes=512),
+    )
+
+    assert not (
+        default_destination / "workspace/submission/trajectory.bin"
+    ).exists()
+    assert (default_destination / "evaluation/results.json").is_file()
+    with pytest.raises(IntegrityError, match="exceeding the configured"):
+        collect_local_artifacts(
+            source,
+            tmp_path / "explicit",
+            ArtifactPolicy(
+                collect_evaluated_artifacts=True,
+                max_collection_bytes=512,
+            ),
+        )
+
+
+def test_collection_uses_configured_evaluation_results_path(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "workspace/submission/trajectory.bin"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"x" * 1024)
+    results = tmp_path / "evaluation/custom-results.json"
+    results.parent.mkdir()
+    results.write_text(
+        json.dumps(
+            {
+                "submission": {
+                    "artifacts": [
+                        {
+                            "path": (
+                                "workspace/submission/trajectory.bin"
+                            )
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    inventory = file_inventory(
+        tmp_path,
+        ArtifactPolicy(),
+        evaluation_results_path="evaluation/custom-results.json",
+    )
+
+    assert "workspace/submission/trajectory.bin" not in inventory
+    assert "evaluation/custom-results.json" in inventory
 
 
 def test_artifact_inventory_rejects_symlinks(tmp_path: Path) -> None:
@@ -334,7 +520,9 @@ def test_reference_backed_benchmark_uses_staged_artifact_schema(
     )
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
@@ -381,7 +569,7 @@ def test_artifact_json_schema_is_enforced_before_evaluation(
         validate_submission(trial / "workspace", contract)
 
 
-def test_evaluator_container_invocation_mounts_reference_read_only(
+def test_evaluation_spec_carries_remote_reference_contract(
     tmp_path: Path,
 ) -> None:
     base = build_numeric_definition()
@@ -395,34 +583,12 @@ def test_evaluator_container_invocation_mounts_reference_read_only(
         }
     )
     contract = load_output_contract(definition.contract_path)
-    trial = tmp_path / "trial"
-    (trial / "workspace/submission").mkdir(parents=True)
-    environment = {
-        "BRUNNER_SUBMISSION_MANIFEST": str(
-            trial / "workspace/submission/manifest.json"
-        ),
-        "BRUNNER_RUN_STATUS": str(
-            trial / "workspace/submission/run-status.json"
-        ),
-        "BRUNNER_EVALUATION_RESULTS": str(
-            trial / "evaluation/results.json"
-        ),
-    }
+    spec = evaluation_spec(definition, contract)
 
-    command, cwd, process_environment = evaluator_invocation(
-        definition,
-        contract,
-        trial.resolve(),
-        environment,
-    )
-
-    encoded = " ".join(command)
-    assert command[0] == "docker"
-    assert "--network none" in encoded
-    assert "numeric-evaluator:1 evaluate" in encoded
-    assert "dst=/brunner/reference,readonly" in encoded
-    assert cwd == trial.resolve()
-    assert process_environment is not environment
+    assert spec.image == "numeric-evaluator:1"
+    assert spec.command == ("evaluate",)
+    assert spec.reference_manifest_path == "manifest.json"
+    assert spec.contract_sha256 == contract.sha256
 
 
 
@@ -476,7 +642,9 @@ def test_evaluation_timeout_is_one_shared_budget(
     )
     monkeypatch.setenv(
         "PYTHONPATH",
-        str(ROOT / "src")
+        str(ROOT)
+        + os.pathsep
+        + str(ROOT / "src")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
     )
