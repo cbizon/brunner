@@ -185,14 +185,22 @@ capabilities dropped, privilege escalation disabled, and a read-only container
 root. The trial PVC and an ephemeral `/tmp` volume are their only writable
 mounts. Agent and artifact-reader images must support this non-root contract.
 
-Brunner creates workload-scoped NetworkPolicies before staging. Pipeline Pods
-may reach only cluster DNS and, when configured, a deployment-owned proxy Pod
-selector and TCP port. Stager and artifact-reader Pods have no egress. Brunner
-sets the agent's proxy variables itself and rejects proxy variables supplied
-through generic environment mappings. The proxy deployment owns provider
-domain allowlists; benchmark packages do not encode URLs or domains in
-Brunner. A profile with no proxy is an offline workload, not unrestricted
-egress. Sterling must use a CNI that enforces Kubernetes NetworkPolicy;
+Brunner installs a namespace-scoped Squid Deployment, ConfigMap, Service, and
+NetworkPolicy before staging. Squid permits HTTPS `CONNECT` only to
+`.openai.com`, `.openai.azure.com`, `.anthropic.com`, and `.claude.ai`;
+everything else is denied. Squid alone may query the selected cluster DNS Pods
+and open outbound TCP 443 connections.
+
+Workload-scoped NetworkPolicies allow pipeline Pods to reach only Squid on TCP
+3128. Brunner reads the Service's numeric ClusterIP and injects that address
+into the agent's proxy variables, so pipeline Pods receive no DNS egress at
+all. Stager and artifact-reader Pods have no egress. Generic environment
+mappings cannot override proxy variables. The Squid image and ACL
+configuration digest are recorded in the Job and persisted backend handle;
+resume and restart reject identity drift. Because Kubernetes egress policies
+are additive, Brunner also lists existing namespace NetworkPolicies and
+refuses to launch when another policy with nonempty egress rules selects the
+pipeline Pod. Sterling must use a CNI that enforces Kubernetes NetworkPolicy;
 successful API creation alone does not prove packet-level enforcement.
 
 Each remote Job runs `python -m brunner.agent_cli` in an agent init container.
@@ -389,11 +397,12 @@ GPU counts remain equal requests and limits because Kubernetes extended
 resources are not overcommitted.
 
 Before launching, Kubernetes preflight checks API access, required RBAC,
-reference-PVC identity, runtime images, and ResourceQuota headroom. Capacity
-accounts for Jobs, Pods, PVCs, storage, CPU, memory, ephemeral storage,
-extended resources, and NetworkPolicies. Init-container resources use
-Kubernetes' effective `max(init, sum(regular))` scheduling rule, and quota
-capacity is combined with the configured parallel limit.
+reference-PVC identity, runtime images, managed-proxy rollout, overlapping
+egress policies, and ResourceQuota headroom. Capacity accounts for Jobs, Pods,
+PVCs, storage, CPU, memory, ephemeral storage, extended resources, and
+NetworkPolicies. Init-container resources use Kubernetes' effective
+`max(init, sum(regular))` scheduling rule, and quota capacity is combined with
+the configured parallel limit.
 
 Kubernetes distinguishes connectivity failures from rejected requests and
 workload failures. The agent and evaluator each write compact summaries to

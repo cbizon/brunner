@@ -20,11 +20,21 @@ from brunner.backends.base import (
     native_resource_name,
 )
 from brunner.backends.kubernetes import (
+    EGRESS_PROXY_SHA256_ANNOTATION,
     REFERENCE_MANIFEST_SHA256_ANNOTATION,
     KubernetesBackend,
     KubernetesProfile,
     render_job,
     render_network_policies,
+)
+from brunner.backends.squid import (
+    MANAGED_PROXY_LABELS,
+    MANAGED_PROXY_NAME,
+    PROVIDER_DOMAINS,
+    SQUID_CONFIG,
+    managed_proxy_sha256,
+    proxy_url_from_service,
+    render_managed_proxy_resources,
 )
 from brunner.campaign import CampaignPlan, CampaignRunner, CampaignTrial
 from brunner.contract import load_output_contract
@@ -64,7 +74,7 @@ def _workload(trial: Path, **kwargs: object) -> WorkloadSpec:
     return WorkloadSpec(**values)
 
 
-def test_network_policy_only_allows_dns_and_configured_proxy(
+def test_network_policy_allows_only_managed_proxy_without_dns(
     tmp_path: Path,
 ) -> None:
     trial = _trial(tmp_path)
@@ -73,10 +83,7 @@ def test_network_policy_only_allows_dns_and_configured_proxy(
         namespace="benchmarks",
         agent_image=IMAGE,
         artifact_reader_image=IMAGE,
-        proxy_url="http://egress-proxy.proxy.svc:3128",
-        proxy_namespace="proxy",
-        proxy_pod_selector={"app": "egress-proxy"},
-        proxy_port=3128,
+        proxy_image=IMAGE,
     )
     labels = {
         "app.kubernetes.io/name": "brunner",
@@ -97,29 +104,251 @@ def test_network_policy_only_allows_dns_and_configured_proxy(
         workload,
         profile,
         labels,
+        proxy_url="http://10.96.4.12:3128",
     )
 
-    assert pipeline["spec"]["podSelector"]["matchLabels"][
-        "dev.brunner/role"
-    ] == "pipeline"
-    assert len(pipeline["spec"]["egress"]) == 2
+    assert (
+        pipeline["spec"]["podSelector"]["matchLabels"][
+            "dev.brunner/role"
+        ]
+        == "pipeline"
+    )
+    assert len(pipeline["spec"]["egress"]) == 1
     assert pipeline["spec"]["egress"][0]["ports"] == [
+        {"protocol": "TCP", "port": 3128},
+    ]
+    assert (
+        pipeline["spec"]["egress"][0]["to"][0]["podSelector"][
+            "matchLabels"
+        ]
+        == MANAGED_PROXY_LABELS
+    )
+    assert '"port": 53' not in json.dumps(pipeline)
+    assert helpers["spec"]["egress"] == []
+    assert (
+        job["spec"]["template"]["metadata"]["labels"][
+            "dev.brunner/role"
+        ]
+        == "pipeline"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in job["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+    }
+    assert environment["HTTPS_PROXY"] == "http://10.96.4.12:3128"
+    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
+    assert job["metadata"]["annotations"][
+        EGRESS_PROXY_SHA256_ANNOTATION
+    ] == managed_proxy_sha256(IMAGE)
+    assert job["spec"]["backoffLimit"] == 6
+
+
+def test_managed_proxy_owns_provider_allowlist_and_dns() -> None:
+    resources = render_managed_proxy_resources(
+        namespace="benchmarks",
+        image=IMAGE,
+        image_pull_secrets=("registry",),
+        dns_namespace="kube-system",
+        dns_pod_selector={"k8s-app": "kube-dns"},
+        cpu_request="100m",
+        cpu_limit="1",
+        memory_request="256Mi",
+        memory_limit="1Gi",
+    )
+    by_kind = {resource["kind"]: resource for resource in resources}
+
+    assert set(by_kind) == {
+        "ConfigMap",
+        "Service",
+        "NetworkPolicy",
+        "Deployment",
+    }
+    assert by_kind["ConfigMap"]["data"]["squid.conf"] == SQUID_CONFIG
+    assert all(domain in SQUID_CONFIG for domain in PROVIDER_DOMAINS)
+    assert "acl provider_domains dstdomain -n " in SQUID_CONFIG
+    assert "http_access deny !CONNECT" in SQUID_CONFIG
+    assert SQUID_CONFIG.rstrip().endswith("cache deny all")
+
+    policy = by_kind["NetworkPolicy"]["spec"]
+    assert policy["ingress"][0]["from"][0]["podSelector"][
+        "matchLabels"
+    ] == {
+        "app.kubernetes.io/name": "brunner",
+        "dev.brunner/role": "pipeline",
+    }
+    assert policy["egress"][0]["ports"] == [
         {"protocol": "UDP", "port": 53},
         {"protocol": "TCP", "port": 53},
     ]
-    assert pipeline["spec"]["egress"][1]["to"][0]["podSelector"][
-        "matchLabels"
-    ] == {"app": "egress-proxy"}
-    assert helpers["spec"]["egress"] == []
-    assert job["spec"]["template"]["metadata"]["labels"][
-        "dev.brunner/role"
-    ] == "pipeline"
-    environment = {
-        item["name"]: item.get("value")
-        for item in job["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert policy["egress"][1] == {
+        "ports": [{"protocol": "TCP", "port": 443}]
     }
-    assert environment["HTTPS_PROXY"] == profile.proxy_url
-    assert job["spec"]["backoffLimit"] == 6
+    pod_spec = by_kind["Deployment"]["spec"]["template"]["spec"]
+    assert pod_spec["automountServiceAccountToken"] is False
+    assert pod_spec["imagePullSecrets"] == [{"name": "registry"}]
+    assert pod_spec["containers"][0]["image"] == IMAGE
+
+
+def test_proxy_url_requires_numeric_cluster_ip() -> None:
+    service = {
+        "spec": {
+            "clusterIP": "10.96.4.12",
+            "ports": [{"port": 3128, "protocol": "TCP"}],
+        }
+    }
+    assert proxy_url_from_service(service) == "http://10.96.4.12:3128"
+
+    service["spec"]["clusterIP"] = "proxy.namespace.svc"
+    with pytest.raises(ValueError, match="invalid ClusterIP"):
+        proxy_url_from_service(service)
+
+
+def test_backend_installs_proxy_and_uses_service_cluster_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            proxy_image=IMAGE,
+            preflight_enabled=False,
+        )
+    )
+    applied: list[str] = []
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        backend,
+        "_apply",
+        lambda resource: applied.append(str(resource["kind"])),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *arguments, **kwargs: (
+            calls.append(arguments)
+            or subprocess.CompletedProcess(arguments, 0, "ready", "")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, name=None, **kwargs: (
+            {
+                "spec": {
+                    "clusterIP": "10.96.4.12",
+                    "ports": [{"port": 3128, "protocol": "TCP"}],
+                }
+            }
+            if (kind, name) == ("service", MANAGED_PROXY_NAME)
+            else None
+        ),
+    )
+
+    backend._ensure_managed_proxy()
+    backend._ensure_managed_proxy()
+
+    assert applied == [
+        "ConfigMap",
+        "Service",
+        "NetworkPolicy",
+        "Deployment",
+    ]
+    assert calls == [
+        (
+            "rollout",
+            "status",
+            f"deployment/{MANAGED_PROXY_NAME}",
+            "-n",
+            "benchmarks",
+            "--timeout=120s",
+        )
+    ]
+    assert backend._proxy_url == "http://10.96.4.12:3128"
+
+
+def test_proxy_rollout_failure_aborts_with_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            proxy_image=IMAGE,
+            preflight_enabled=False,
+        )
+    )
+    monkeypatch.setattr(backend, "_apply", lambda resource: None)
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *arguments, **kwargs: subprocess.CompletedProcess(
+            arguments,
+            1,
+            "deployment not ready",
+            "forbidden by policy",
+        ),
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="rollout status deployment/brunner-egress-proxy",
+    ):
+        backend._ensure_managed_proxy()
+
+
+def test_additive_egress_policy_matching_pipeline_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = _trial(tmp_path)
+    workload = _workload(trial)
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            proxy_image=IMAGE,
+            preflight_enabled=False,
+        )
+    )
+    policies = {
+        "items": [
+            {
+                "metadata": {"name": "namespace-wide-egress"},
+                "spec": {
+                    "podSelector": {},
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "ports": [
+                                {"protocol": "UDP", "port": 53},
+                            ]
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, **kwargs: (
+            policies if kind == "networkpolicies" else None
+        ),
+    )
+    labels = {
+        "app.kubernetes.io/name": "brunner",
+        "dev.brunner/workload": native_resource_name(
+            workload.workload_id,
+            workload.resource_id,
+        ),
+    }
+
+    with pytest.raises(
+        BackendRequestError,
+        match="namespace-wide-egress",
+    ):
+        backend._validate_exclusive_pipeline_egress(workload, labels)
+
+    policies["items"][0]["spec"]["egress"] = []
+    backend._validate_exclusive_pipeline_egress(workload, labels)
 
 
 def test_network_policy_is_applied_before_staging_or_job(
@@ -132,6 +361,7 @@ def test_network_policy_is_applied_before_staging_or_job(
         KubernetesProfile(
             agent_image="agent:test",
             artifact_reader_image="reader:test",
+            proxy_image="proxy:test",
             preflight_enabled=False,
             require_image_digests=False,
         )
@@ -141,6 +371,13 @@ def test_network_policy_is_applied_before_staging_or_job(
         backend,
         "_get",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ensure_managed_proxy",
+        lambda: setattr(
+            backend, "_proxy_url", "http://10.96.4.12:3128"
+        ),
     )
     monkeypatch.setattr(
         backend,
@@ -180,6 +417,7 @@ def test_mutable_images_are_rejected_by_default(tmp_path: Path) -> None:
         KubernetesProfile(
             agent_image="agent:latest",
             artifact_reader_image=IMAGE,
+            proxy_image=IMAGE,
         )
     )
 
@@ -198,6 +436,7 @@ def test_profile_agent_image_is_part_of_workload_identity(
         KubernetesProfile(
             agent_image=IMAGE,
             artifact_reader_image=IMAGE,
+            proxy_image=IMAGE,
         )
     ).prepare_workload(workload)
     second = KubernetesBackend(
@@ -498,6 +737,7 @@ def test_preflight_checks_remote_operations_before_launch(
         KubernetesProfile(
             agent_image=IMAGE,
             artifact_reader_image=IMAGE,
+            proxy_image=IMAGE,
         )
     )
     calls: list[tuple[str, ...]] = []
@@ -511,6 +751,13 @@ def test_preflight_checks_remote_operations_before_launch(
         return subprocess.CompletedProcess(arguments, 0, stdout, "")
 
     monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(
+        backend,
+        "_ensure_managed_proxy",
+        lambda: setattr(
+            backend, "_proxy_url", "http://10.96.4.12:3128"
+        ),
+    )
 
     backend._ensure_preflight(workload)
 
@@ -521,6 +768,14 @@ def test_preflight_checks_remote_operations_before_launch(
         "can-i",
         "create",
         "networkpolicies.networking.k8s.io",
+        "-n",
+        "default",
+    ) in calls
+    assert (
+        "auth",
+        "can-i",
+        "create",
+        "deployments.apps",
         "-n",
         "default",
     ) in calls

@@ -621,10 +621,11 @@ def build_campaign(definition, contract):
                         "OPENAI_API_KEY",
                     ),
                 },
-                proxy_url="http://proxy.proxy.svc:3128",
-                proxy_namespace="proxy",
-                proxy_pod_selector={"app": "egress-proxy"},
-                proxy_port=3128,
+                proxy_image=(
+                    "ubuntu/squid@sha256:"
+                    "0123456789abcdef0123456789abcdef"
+                    "0123456789abcdef0123456789abcdef"
+                ),
                 max_parallel=2,
             )
         ),
@@ -676,14 +677,17 @@ Production images must use `image@sha256:<digest>` references and must contain
 a compatible Brunner runtime protocol. Set
 `KubernetesProfile.require_image_digests=False` only in controlled tests.
 
-Before any staging helper is created, Brunner applies two workload
-NetworkPolicies. The pipeline may use cluster DNS and the proxy selected by
-`proxy_namespace`, `proxy_pod_selector`, and `proxy_port`; helpers have no
-egress. `proxy_url` is injected only into the agent. The selected proxy owns
-external provider-domain allowlists. Do not place proxy variables in
-`nonsecret_environment`, and do not encode provider URLs in Brunner.
-Sterling's CNI must enforce Kubernetes NetworkPolicy; Brunner cannot infer
-enforcement from successful object creation.
+Before any staging helper is created, Brunner installs its namespace-scoped
+Squid proxy and applies two workload NetworkPolicies. The pipeline may reach
+only Squid on TCP 3128; helpers have no egress. Brunner injects the proxy's
+numeric Service ClusterIP only into the agent, so the pipeline does not receive
+DNS access. Squid alone may query cluster DNS and connect to external TCP 443,
+and its deny-by-default ACL permits only OpenAI, Azure OpenAI, Anthropic, and
+Claude domains. Brunner rejects another standard Kubernetes NetworkPolicy with
+nonempty egress rules that also selects the pipeline Pod, because egress
+permissions are additive. Do not place proxy variables in
+`nonsecret_environment`. Sterling's CNI must enforce Kubernetes NetworkPolicy;
+Brunner cannot infer enforcement from successful object creation.
 
 The stager clears an incomplete trial PVC before copying, verifies every
 remote challenge file against the local stage inventory, rejects remote
@@ -773,8 +777,10 @@ credentials and deployment networking belong to the backend configuration:
   Kubernetes Secret name/key references for the agent init container.
 - `KubernetesProfile.nonsecret_environment` supplies explicit non-secret agent
   deployment settings such as certificate paths.
-- `proxy_url`, `proxy_namespace`, `proxy_pod_selector`, and `proxy_port`
-  define the only allowed agent egress route.
+- `proxy_image` supplies the digest-pinned Squid image for Brunner's managed
+  provider-only egress proxy.
+- `proxy_cpu_request`, `proxy_cpu_limit`, `proxy_memory_request`, and
+  `proxy_memory_limit` configure the shared proxy Deployment.
 
 The evaluator container receives neither mapping.
 
@@ -786,8 +792,9 @@ connectivity returns or the process is interrupted; it does not alter remote
 workloads while disconnected.
 
 Before launch, Brunner checks cluster access, required Job/PVC/Pod/Event/
-NetworkPolicy RBAC, immutable images, reference identity, and ResourceQuota
-capacity. Quota capacity includes object counts, PVC storage, CPU, memory,
+NetworkPolicy/ConfigMap/Service/Deployment RBAC, immutable images, reference
+identity, managed-proxy rollout, and ResourceQuota capacity. Quota capacity
+includes object counts, PVC storage, CPU, memory,
 ephemeral storage, and extended resources, using Kubernetes' effective
 init-container scheduling request. A quota limit appears as a visible
 `backend_capacity` scheduler wait rather than oversubmission.

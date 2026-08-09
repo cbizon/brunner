@@ -38,7 +38,7 @@ fault-injection coverage.
 - Append-only campaign task lists with caller-owned trial IDs
 - ResourceQuota-aware campaign capacity, recovery, and persistent monitors
 - Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
-- Default-deny Sterling egress with deployment-owned proxy allowlisting
+- Default-deny Sterling egress through Brunner-managed provider-only Squid
 - Immutable image, runtime protocol, challenge, workload, and reference identity
 
 ## Benchmark Slots
@@ -76,11 +76,11 @@ so neither phase depends on the orchestrating machine remaining awake or
 connected. Brunner does not provide host-process, local-container, or
 orchestrator-side evaluation campaigns.
 
-Production profiles require digest-pinned agent, evaluator, and reader images.
-Brunner applies workload NetworkPolicies before staging, permits the pipeline
-to use only DNS and an explicitly selected proxy, and gives helper Pods no
-egress. The proxy deployment, not Brunner or the benchmark, owns external
-domain allowlists.
+Production profiles require digest-pinned agent, evaluator, reader, and Squid
+images. Brunner installs the proxy and its deny-by-default provider allowlist,
+then applies workload NetworkPolicies before staging. Pipeline Pods may reach
+only the proxy's numeric ClusterIP and cannot issue DNS queries; helper Pods
+have no egress. Squid alone receives DNS and outbound TCP 443 access.
 
 Evaluator-consumed submission artifacts are not copied back by default.
 `ArtifactPolicy.collect_evaluated_artifacts=True` is an explicit opt-in, and
