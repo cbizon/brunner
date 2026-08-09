@@ -545,6 +545,13 @@ image must contain Brunner, the benchmark evaluator package, and every runtime
 dependency used by the evaluator; the command is interpreted inside that image,
 not on the orchestrator.
 
+Brunner starts the evaluator in its own empty `/tmp` volume and invokes both
+reference validation and benchmark evaluation from a fresh directory there.
+Do not depend on the candidate workspace or reference root being the process
+working directory; use the supplied `BRUNNER_*` paths. Prefer installed console
+scripts or otherwise ensure the evaluator package is importable without the
+current directory.
+
 ## References
 
 Create or refresh the reference manifest after the contract is valid:
@@ -692,10 +699,14 @@ numeric Service ClusterIP only into the agent, so the pipeline does not receive
 DNS access. Squid alone may query cluster DNS and connect to external TCP 443,
 and its deny-by-default ACL permits only OpenAI, Azure OpenAI, Anthropic, and
 Claude domains. Brunner rejects another standard Kubernetes NetworkPolicy with
-nonempty egress rules that also selects the pipeline Pod, because egress
-permissions are additive. Do not place proxy variables in
-`nonsecret_environment`. Sterling's CNI must enforce Kubernetes NetworkPolicy;
-Brunner cannot infer enforcement from successful object creation.
+nonempty ingress or egress rules that also selects a pipeline, stager, or
+artifact-reader Pod, because permissions are additive. It checks before helper
+creation and again immediately before Job creation. Use a dedicated Sterling
+namespace where RBAC or admission policy prevents other principals from
+creating or changing NetworkPolicies after validation. Do not place proxy
+variables in `nonsecret_environment`. Sterling's CNI must enforce Kubernetes
+NetworkPolicy; Brunner cannot infer enforcement from successful object
+creation.
 
 The stager clears an incomplete trial PVC before copying, verifies every
 remote challenge file against the local stage inventory, rejects remote

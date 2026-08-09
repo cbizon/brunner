@@ -477,7 +477,8 @@ def render_network_policies(
                         "dev.brunner/role": PIPELINE_ROLE,
                     }
                 },
-                "policyTypes": ["Egress"],
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
                 "egress": pipeline_egress,
             },
         },
@@ -501,7 +502,8 @@ def render_network_policies(
                         }
                     ],
                 },
-                "policyTypes": ["Egress"],
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
                 "egress": [],
             },
         },
@@ -536,8 +538,12 @@ def _pod_spec_common(
     *,
     claim_name: str,
     container: dict[str, Any],
+    claim_read_only: bool = False,
     excluded_nodes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    claim: dict[str, Any] = {"claimName": claim_name}
+    if claim_read_only:
+        claim["readOnly"] = True
     container["securityContext"] = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -548,6 +554,7 @@ def _pod_spec_common(
     )
     spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
+        "enableServiceLinks": False,
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": 30,
         "securityContext": {
@@ -561,7 +568,7 @@ def _pod_spec_common(
         "volumes": [
             {
                 "name": "trial",
-                "persistentVolumeClaim": {"claimName": claim_name},
+                "persistentVolumeClaim": claim,
             },
             {"name": "tmp", "emptyDir": {}},
         ],
@@ -604,15 +611,22 @@ def render_helper_pod(
     profile: KubernetesProfile,
     labels: dict[str, str],
     *,
+    trial_read_only: bool = False,
     excluded_nodes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    trial_mount: dict[str, Any] = {
+        "name": "trial",
+        "mountPath": "/brunner/trial",
+    }
+    if trial_read_only:
+        trial_mount["readOnly"] = True
     container = {
         "name": "helper",
         "image": image,
         "command": ["sh", "-c", "trap : TERM INT; sleep 86400 & wait"],
         # Never inherit an image WORKDIR hidden by the trial PVC mount.
         "workingDir": "/tmp",
-        "volumeMounts": [{"name": "trial", "mountPath": "/brunner/trial"}],
+        "volumeMounts": [trial_mount],
     }
     return {
         "apiVersion": "v1",
@@ -626,6 +640,7 @@ def render_helper_pod(
             profile,
             claim_name=claim_name,
             container=container,
+            claim_read_only=trial_read_only,
             excluded_nodes=excluded_nodes,
         ),
     }
@@ -799,7 +814,7 @@ def render_job(
                 "brunner.evaluation_cli",
                 "/brunner/trial",
             ],
-            "workingDir": "/brunner/trial/workspace",
+            "workingDir": "/tmp",
             "env": [
                 {
                     "name": "BRUNNER_EVALUATION_SPEC",
@@ -812,6 +827,14 @@ def render_job(
                 {
                     "name": TERMINATION_LOG_ENV,
                     "value": "/dev/termination-log",
+                },
+                {
+                    "name": "PYTHONSAFEPATH",
+                    "value": "1",
+                },
+                {
+                    "name": "PYTHONNOUSERSITE",
+                    "value": "1",
                 },
             ],
             "securityContext": {
@@ -1583,7 +1606,7 @@ class KubernetesBackend:
         except ValueError as error:
             raise BackendRequestError(str(error)) from error
 
-    def _validate_exclusive_pipeline_egress(
+    def _validate_exclusive_workload_networking(
         self,
         workload: WorkloadSpec,
         labels: dict[str, str],
@@ -1595,11 +1618,23 @@ class KubernetesBackend:
             _network_policy_name(workload, "-network"),
             _network_policy_name(workload, "-helpers"),
         }
-        pipeline_labels = {
-            **labels,
-            "dev.brunner/role": PIPELINE_ROLE,
+        workload_name = str(labels["dev.brunner/workload"])
+        role_labels = {
+            PIPELINE_ROLE: {
+                **labels,
+                "dev.brunner/role": PIPELINE_ROLE,
+            },
+            "trial-stager": {
+                **labels,
+                "dev.brunner/role": "trial-stager",
+            },
+            "artifact-reader": {
+                "app.kubernetes.io/name": "brunner",
+                "dev.brunner/workload": workload_name,
+                "dev.brunner/role": "artifact-reader",
+            },
         }
-        conflicts = []
+        conflicts: list[str] = []
         for policy in value.get("items", ()):
             if not isinstance(policy, dict):
                 raise BackendRequestError(
@@ -1626,10 +1661,14 @@ class KubernetesBackend:
                     f"NetworkPolicy {name} has a malformed podSelector"
                 )
             try:
-                matches = _selector_matches_labels(
-                    selector,
-                    pipeline_labels,
-                )
+                matching_roles = [
+                    role
+                    for role, candidate_labels in role_labels.items()
+                    if _selector_matches_labels(
+                        selector,
+                        candidate_labels,
+                    )
+                ]
             except ValueError as error:
                 raise BackendRequestError(
                     f"cannot evaluate NetworkPolicy {name}: {error}"
@@ -1639,21 +1678,33 @@ class KubernetesBackend:
                 raise BackendRequestError(
                     f"NetworkPolicy {name} has malformed policyTypes"
                 )
+            controls_ingress = "Ingress" in policy_types or not policy_types
             controls_egress = "Egress" in policy_types or (
                 not policy_types and "egress" in spec
             )
+            ingress = spec.get("ingress", [])
+            if not isinstance(ingress, list):
+                raise BackendRequestError(
+                    f"NetworkPolicy {name} has malformed ingress rules"
+                )
             egress = spec.get("egress", [])
             if not isinstance(egress, list):
                 raise BackendRequestError(
                     f"NetworkPolicy {name} has malformed egress rules"
                 )
-            if matches and controls_egress and egress:
-                conflicts.append(name)
+            if matching_roles and controls_ingress and ingress:
+                conflicts.append(
+                    f"{name} (ingress: {', '.join(matching_roles)})"
+                )
+            if matching_roles and controls_egress and egress:
+                conflicts.append(
+                    f"{name} (egress: {', '.join(matching_roles)})"
+                )
         if conflicts:
             raise BackendRequestError(
-                "Brunner cannot guarantee exclusive pipeline egress because "
-                "other NetworkPolicies with nonempty egress rules select the "
-                "agent Pod: " + ", ".join(sorted(conflicts))
+                "Brunner cannot guarantee exclusive workload networking "
+                "because other NetworkPolicies with nonempty rules select "
+                "pipeline or helper Pods: " + ", ".join(sorted(conflicts))
             )
 
     def _stage_trial(
@@ -1954,7 +2005,7 @@ class KubernetesBackend:
             "dev.brunner/workload": job_name,
             **workload.labels,
         }
-        self._validate_exclusive_pipeline_egress(workload, labels)
+        self._validate_exclusive_workload_networking(workload, labels)
         for policy in render_network_policies(
             workload,
             self.profile,
@@ -2124,6 +2175,7 @@ class KubernetesBackend:
                 ),
                 "--overwrite",
             )
+        self._validate_exclusive_workload_networking(workload, labels)
         self._apply(
             render_job(
                 job_name,
@@ -2188,7 +2240,7 @@ class KubernetesBackend:
             "dev.brunner/restart-generation": str(generation),
             **workload.labels,
         }
-        self._validate_exclusive_pipeline_egress(workload, labels)
+        self._validate_exclusive_workload_networking(workload, labels)
         pvc = self._get("pvc", claim_name)
         if pvc is None:
             raise BackendRequestError(
@@ -2252,6 +2304,7 @@ class KubernetesBackend:
             )
 
         self._delete_and_wait("job", handle.native_id)
+        self._validate_exclusive_workload_networking(workload, labels)
         self._apply(
             render_job(
                 job_name,
@@ -2740,6 +2793,7 @@ class KubernetesBackend:
                 image,
                 self.profile,
                 labels,
+                trial_read_only=True,
                 excluded_nodes=excluded_nodes,
             )
         )

@@ -261,6 +261,58 @@ def test_invalid_submission_is_identified_as_candidate_failure(
     assert result["failure"]["reason"] == "CandidateSubmissionInvalid"
 
 
+def test_evaluator_workspace_setup_failure_requires_attention(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("workspace-setup-failure", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+
+    result = execute_evaluation(
+        evaluation_spec(definition, contract),
+        trial,
+        working_directory_root=tmp_path / "missing",
+    )
+
+    assert result["status"] == "failed"
+    assert result["failure"]["domain"] == "evaluation"
+    assert result["failure"]["reason"] == "EvaluatorWorkspaceSetupFailed"
+    assert result["failure"]["disposition"] == "attention"
+    assert result["failure"]["resource"] == "evaluator_tmp"
+
+
+def test_evaluator_workspace_overlap_is_integrity_failure(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = create_trial(
+        definition,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("workspace-overlap", "codex", "fake", None),
+    )
+    _write_valid_submission(trial)
+
+    result = execute_evaluation(
+        evaluation_spec(definition, contract),
+        trial,
+        working_directory_root=trial / "workspace",
+    )
+
+    assert result["status"] == "failed"
+    assert result["failure"]["domain"] == "integrity"
+    assert result["failure"]["reason"] == "EvaluatorIsolationInvalid"
+    assert result["failure"]["disposition"] == "attention"
+    assert result["failure"]["resource"] == "evaluator_tmp"
+
+
 def test_evaluator_failure_is_identified_as_trusted_infrastructure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -703,10 +755,14 @@ def test_evaluation_timeout_is_one_shared_budget(
         + os.environ.get("PYTHONPATH", ""),
     )
     recorded: list[float] = []
+    working_directories: list[Path] = []
+    environments: list[dict[str, str]] = []
     real_run = evaluation_module._run_evaluator
 
     def capture(command, **kwargs):
         recorded.append(kwargs["timeout_seconds"])
+        working_directories.append(kwargs["cwd"])
+        environments.append(kwargs["environment"])
         return real_run(command, **kwargs)
 
     monkeypatch.setattr(evaluation_module, "_run_evaluator", capture)
@@ -717,3 +773,13 @@ def test_evaluation_timeout_is_one_shared_budget(
     assert recorded[0] <= 30
     # The evaluator gets what the reference validator left, not a fresh 30s.
     assert recorded[1] < recorded[0] - 0.3
+    assert working_directories[0] == working_directories[1]
+    assert not working_directories[0].is_relative_to(trial)
+    assert not working_directories[0].is_relative_to(
+        definition.reference.root
+    )
+    assert all(
+        environment["PYTHONSAFEPATH"] == "1"
+        and environment["PYTHONNOUSERSITE"] == "1"
+        for environment in environments
+    )

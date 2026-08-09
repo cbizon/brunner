@@ -462,6 +462,8 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
         "brunner.evaluation_cli",
         "/brunner/trial",
     ]
+    assert evaluator["workingDir"] == "/tmp"
+    assert pod["enableServiceLinks"] is False
     agent_environment = {item["name"] for item in agent["env"]}
     evaluator_environment = {
         item["name"] for item in evaluator["env"]
@@ -470,6 +472,8 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
     assert "HTTPS_PROXY" in agent_environment
     assert "OPENAI_API_KEY" not in evaluator_environment
     assert "HTTPS_PROXY" not in evaluator_environment
+    assert "PYTHONSAFEPATH" in evaluator_environment
+    assert "PYTHONNOUSERSITE" in evaluator_environment
     encoded_spec = next(
         item["value"]
         for item in evaluator["env"]
@@ -980,6 +984,27 @@ def test_kubernetes_helper_pod_uses_neutral_working_directory() -> None:
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
         "readOnlyRootFilesystem": True,
+    }
+
+
+def test_kubernetes_artifact_reader_mounts_trial_read_only() -> None:
+    helper = render_helper_pod(
+        "case-1-reader",
+        "case-1-data",
+        "reader:latest",
+        KubernetesProfile(namespace="benchmarks"),
+        {"dev.brunner/role": "artifact-reader"},
+        trial_read_only=True,
+    )
+
+    assert helper["spec"]["containers"][0]["volumeMounts"][0] == {
+        "name": "trial",
+        "mountPath": "/brunner/trial",
+        "readOnly": True,
+    }
+    assert helper["spec"]["volumes"][0]["persistentVolumeClaim"] == {
+        "claimName": "case-1-data",
+        "readOnly": True,
     }
 
 
