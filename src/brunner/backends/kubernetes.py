@@ -29,6 +29,14 @@ from brunner.backends.base import (
     trial_resource_id,
     workload_sha256,
 )
+from brunner.backends.squid import (
+    MANAGED_PROXY_LABELS,
+    MANAGED_PROXY_NAME,
+    MANAGED_PROXY_PORT,
+    managed_proxy_sha256,
+    proxy_url_from_service,
+    render_managed_proxy_resources,
+)
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
     ArtifactTransferError,
@@ -81,6 +89,7 @@ STAGED_ANNOTATION = "dev.brunner/staged"
 CHALLENGE_SHA256_ANNOTATION = "dev.brunner/challenge-sha256"
 WORKLOAD_SHA256_ANNOTATION = "dev.brunner/workload-sha256"
 RUNTIME_PROTOCOL_ANNOTATION = "dev.brunner/runtime-protocol"
+EGRESS_PROXY_SHA256_ANNOTATION = "dev.brunner/egress-proxy-sha256"
 REFERENCE_MANIFEST_SHA256_ANNOTATION = (
     "dev.brunner/reference-manifest-sha256"
 )
@@ -146,10 +155,11 @@ class KubernetesProfile:
         default_factory=dict
     )
     nonsecret_environment: dict[str, str] = field(default_factory=dict)
-    proxy_url: str | None = None
-    proxy_pod_selector: dict[str, str] = field(default_factory=dict)
-    proxy_namespace: str | None = None
-    proxy_port: int | None = None
+    proxy_image: str | None = None
+    proxy_cpu_request: str = "100m"
+    proxy_cpu_limit: str = "1"
+    proxy_memory_request: str = "256Mi"
+    proxy_memory_limit: str = "1Gi"
     dns_namespace: str = "kube-system"
     dns_pod_selector: dict[str, str] = field(
         default_factory=lambda: {"k8s-app": "kube-dns"}
@@ -180,19 +190,22 @@ class KubernetesProfile:
             raise ValueError(
                 "Kubernetes reference_claim_name cannot be empty"
             )
-        configured_proxy = self.proxy_url is not None
-        if configured_proxy != bool(self.proxy_pod_selector):
+        if self.proxy_image is not None and not self.proxy_image.strip():
+            raise ValueError("Kubernetes proxy_image cannot be empty")
+        if not self.dns_namespace.strip():
+            raise ValueError("Kubernetes dns_namespace cannot be empty")
+        if not self.dns_pod_selector:
             raise ValueError(
-                "Kubernetes proxy_url and proxy_pod_selector must be "
-                "configured together"
+                "Kubernetes dns_pod_selector cannot be empty"
             )
-        if configured_proxy and (
-            self.proxy_port is None or self.proxy_port < 1
+        for name, value in (
+            ("proxy_cpu_request", self.proxy_cpu_request),
+            ("proxy_cpu_limit", self.proxy_cpu_limit),
+            ("proxy_memory_request", self.proxy_memory_request),
+            ("proxy_memory_limit", self.proxy_memory_limit),
         ):
-            raise ValueError(
-                "Kubernetes proxy_port must be positive when proxying is "
-                "configured"
-            )
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Kubernetes {name} cannot be empty")
         if PROXY_ENVIRONMENT & (
             set(self.nonsecret_environment)
             | set(self.secret_environment)
@@ -331,6 +344,54 @@ def _network_policy_name(workload: WorkloadSpec, suffix: str) -> str:
     )
 
 
+def _selector_matches_labels(
+    selector: dict[str, Any],
+    labels: dict[str, str],
+) -> bool:
+    match_labels = selector.get("matchLabels", {})
+    if not isinstance(match_labels, dict):
+        raise ValueError("matchLabels must be an object")
+    if any(
+        labels.get(str(key)) != str(value)
+        for key, value in match_labels.items()
+    ):
+        return False
+    expressions = selector.get("matchExpressions", [])
+    if not isinstance(expressions, list):
+        raise ValueError("matchExpressions must be an array")
+    for expression in expressions:
+        if not isinstance(expression, dict):
+            raise ValueError("matchExpressions entries must be objects")
+        key = expression.get("key")
+        operator = expression.get("operator")
+        values = expression.get("values", [])
+        if not isinstance(key, str) or not isinstance(operator, str):
+            raise ValueError("label selector expression is incomplete")
+        if not isinstance(values, list):
+            raise ValueError("label selector values must be an array")
+        normalized = {str(value) for value in values}
+        present = key in labels
+        if operator == "In" and (
+            not present or labels[key] not in normalized
+        ):
+            return False
+        if (
+            operator == "NotIn"
+            and present
+            and labels[key] in normalized
+        ):
+            return False
+        if operator == "Exists" and not present:
+            return False
+        if operator == "DoesNotExist" and present:
+            return False
+        if operator not in {"In", "NotIn", "Exists", "DoesNotExist"}:
+            raise ValueError(
+                f"unsupported label selector operator {operator!r}"
+            )
+    return True
+
+
 def render_network_policies(
     workload: WorkloadSpec,
     profile: KubernetesProfile,
@@ -343,52 +404,16 @@ def render_network_policies(
         {
             "to": [
                 {
-                    "namespaceSelector": {
-                        "matchLabels": {
-                            "kubernetes.io/metadata.name": (
-                                profile.dns_namespace
-                            )
-                        }
-                    },
                     "podSelector": {
-                        "matchLabels": dict(profile.dns_pod_selector)
+                        "matchLabels": dict(MANAGED_PROXY_LABELS)
                     },
                 }
             ],
             "ports": [
-                {"protocol": "UDP", "port": 53},
-                {"protocol": "TCP", "port": 53},
+                {"protocol": "TCP", "port": MANAGED_PROXY_PORT},
             ],
         }
     ]
-    if profile.proxy_url is not None:
-        pipeline_egress.append(
-            {
-                "to": [
-                    {
-                        "namespaceSelector": {
-                            "matchLabels": {
-                                "kubernetes.io/metadata.name": (
-                                    profile.proxy_namespace
-                                    or profile.namespace
-                                )
-                            }
-                        },
-                        "podSelector": {
-                            "matchLabels": dict(
-                                profile.proxy_pod_selector
-                            )
-                        },
-                    }
-                ],
-                "ports": [
-                    {
-                        "protocol": "TCP",
-                        "port": profile.proxy_port,
-                    }
-                ],
-            }
-        )
     common = {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -568,6 +593,8 @@ def render_job(
     workload: WorkloadSpec,
     profile: KubernetesProfile,
     labels: dict[str, str],
+    *,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     image = workload.image or profile.agent_image
     if not image:
@@ -585,19 +612,26 @@ def render_job(
         {"name": key, "value": value}
         for key, value in sorted(profile.nonsecret_environment.items())
     ]
-    if profile.proxy_url is not None:
-        no_proxy = "localhost,127.0.0.1,.svc,.cluster.local"
+    if (
+        not profile.unsafe_disable_network_policy_for_tests
+        and proxy_url is None
+    ):
+        raise BackendRequestError(
+            "Kubernetes workloads require the managed proxy ClusterIP"
+        )
+    if proxy_url is not None:
+        no_proxy = "localhost,127.0.0.1,::1"
         environment.extend(
             {
                 "name": name,
                 "value": value,
             }
             for name, value in (
-                ("HTTP_PROXY", profile.proxy_url),
-                ("HTTPS_PROXY", profile.proxy_url),
+                ("HTTP_PROXY", proxy_url),
+                ("HTTPS_PROXY", proxy_url),
                 ("NO_PROXY", no_proxy),
-                ("http_proxy", profile.proxy_url),
-                ("https_proxy", profile.proxy_url),
+                ("http_proxy", proxy_url),
+                ("https_proxy", proxy_url),
                 ("no_proxy", no_proxy),
             )
         )
@@ -793,6 +827,15 @@ def render_job(
         WORKLOAD_SHA256_ANNOTATION: workload_sha256(workload),
         RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
     }
+    if not profile.unsafe_disable_network_policy_for_tests:
+        if not profile.proxy_image:
+            raise BackendRequestError(
+                "Kubernetes workloads require proxy_image for Brunner's "
+                "managed Squid egress proxy"
+            )
+        annotations[EGRESS_PROXY_SHA256_ANNOTATION] = (
+            managed_proxy_sha256(profile.proxy_image)
+        )
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -829,6 +872,7 @@ class KubernetesBackend:
         self.profile = profile
         self.kubectl = kubectl
         self._preflight_complete = False
+        self._proxy_url: str | None = None
 
     def prepare_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
         image = workload.image or self.profile.agent_image
@@ -1203,12 +1247,22 @@ class KubernetesBackend:
         }
 
     def _validate_images(self, workload: WorkloadSpec) -> None:
+        if (
+            not self.profile.unsafe_disable_network_policy_for_tests
+            and not self.profile.proxy_image
+        ):
+            raise BackendRequestError(
+                "Kubernetes campaigns require proxy_image for Brunner's "
+                "managed Squid egress proxy"
+            )
         if not self.profile.require_image_digests:
             return
         images = {
             "agent": workload.image or self.profile.agent_image,
             "artifact reader": self.profile.artifact_reader_image,
         }
+        if not self.profile.unsafe_disable_network_policy_for_tests:
+            images["egress proxy"] = self.profile.proxy_image
         if workload.evaluation is not None:
             images["evaluator"] = workload.evaluation.image
         mutable = [
@@ -1248,6 +1302,7 @@ class KubernetesBackend:
 
     def _ensure_preflight(self, workload: WorkloadSpec) -> None:
         if not self.profile.preflight_enabled:
+            self._ensure_managed_proxy()
             return
         if not self.profile.artifact_reader_image:
             raise BackendRequestError(
@@ -1295,13 +1350,153 @@ class KubernetesBackend:
                 (
                     ("create", "networkpolicies.networking.k8s.io"),
                     ("get", "networkpolicies.networking.k8s.io"),
+                    ("list", "networkpolicies.networking.k8s.io"),
                     ("patch", "networkpolicies.networking.k8s.io"),
                     ("delete", "networkpolicies.networking.k8s.io"),
+                    ("create", "configmaps"),
+                    ("get", "configmaps"),
+                    ("patch", "configmaps"),
+                    ("create", "services"),
+                    ("get", "services"),
+                    ("patch", "services"),
+                    ("create", "deployments.apps"),
+                    ("get", "deployments.apps"),
+                    ("patch", "deployments.apps"),
                 )
             )
         for verb, resource in permissions:
             self._check_permission(verb, resource)
+        self._ensure_managed_proxy()
         self._preflight_complete = True
+
+    def _ensure_managed_proxy(self) -> None:
+        if self.profile.unsafe_disable_network_policy_for_tests:
+            self._proxy_url = None
+            return
+        if self._proxy_url is not None:
+            return
+        image = self.profile.proxy_image
+        if not image:
+            raise BackendRequestError(
+                "Kubernetes campaigns require proxy_image for Brunner's "
+                "managed Squid egress proxy"
+            )
+        for resource in render_managed_proxy_resources(
+            namespace=self.profile.namespace,
+            image=image,
+            image_pull_secrets=self.profile.image_pull_secrets,
+            dns_namespace=self.profile.dns_namespace,
+            dns_pod_selector=self.profile.dns_pod_selector,
+            cpu_request=self.profile.proxy_cpu_request,
+            cpu_limit=self.profile.proxy_cpu_limit,
+            memory_request=self.profile.proxy_memory_request,
+            memory_limit=self.profile.proxy_memory_limit,
+        ):
+            self._apply(resource)
+        rollout = self._run(
+            "rollout",
+            "status",
+            f"deployment/{MANAGED_PROXY_NAME}",
+            "-n",
+            self.profile.namespace,
+            f"--timeout={math.ceil(self.profile.command_timeout_seconds)}s",
+            check=False,
+        )
+        if rollout.returncode:
+            raise self._error(
+                (
+                    "rollout",
+                    "status",
+                    f"deployment/{MANAGED_PROXY_NAME}",
+                    "-n",
+                    self.profile.namespace,
+                ),
+                rollout.returncode,
+                rollout.stdout.encode(),
+                rollout.stderr.encode(),
+            )
+        service = self._get("service", MANAGED_PROXY_NAME)
+        if service is None:
+            raise BackendRequestError(
+                f"managed proxy Service disappeared: {MANAGED_PROXY_NAME}"
+            )
+        try:
+            self._proxy_url = proxy_url_from_service(service)
+        except ValueError as error:
+            raise BackendRequestError(str(error)) from error
+
+    def _validate_exclusive_pipeline_egress(
+        self,
+        workload: WorkloadSpec,
+        labels: dict[str, str],
+    ) -> None:
+        if self.profile.unsafe_disable_network_policy_for_tests:
+            return
+        value = self._get("networkpolicies") or {"items": []}
+        expected_names = {
+            _network_policy_name(workload, "-network"),
+            _network_policy_name(workload, "-helpers"),
+        }
+        pipeline_labels = {
+            **labels,
+            "dev.brunner/role": PIPELINE_ROLE,
+        }
+        conflicts = []
+        for policy in value.get("items", ()):
+            if not isinstance(policy, dict):
+                raise BackendRequestError(
+                    "Kubernetes returned a malformed NetworkPolicy list"
+                )
+            metadata = policy.get("metadata")
+            spec = policy.get("spec")
+            if not isinstance(metadata, dict) or not isinstance(
+                spec, dict
+            ):
+                raise BackendRequestError(
+                    "Kubernetes returned a malformed NetworkPolicy"
+                )
+            name = metadata.get("name")
+            if not isinstance(name, str) or not name:
+                raise BackendRequestError(
+                    "Kubernetes returned a NetworkPolicy without a name"
+                )
+            if name in expected_names:
+                continue
+            selector = spec.get("podSelector")
+            if not isinstance(selector, dict):
+                raise BackendRequestError(
+                    f"NetworkPolicy {name} has a malformed podSelector"
+                )
+            try:
+                matches = _selector_matches_labels(
+                    selector,
+                    pipeline_labels,
+                )
+            except ValueError as error:
+                raise BackendRequestError(
+                    f"cannot evaluate NetworkPolicy {name}: {error}"
+                ) from error
+            policy_types = spec.get("policyTypes", [])
+            if not isinstance(policy_types, list):
+                raise BackendRequestError(
+                    f"NetworkPolicy {name} has malformed policyTypes"
+                )
+            controls_egress = "Egress" in policy_types or (
+                not policy_types and "egress" in spec
+            )
+            egress = spec.get("egress", [])
+            if not isinstance(egress, list):
+                raise BackendRequestError(
+                    f"NetworkPolicy {name} has malformed egress rules"
+                )
+            if matches and controls_egress and egress:
+                conflicts.append(name)
+        if conflicts:
+            raise BackendRequestError(
+                "Brunner cannot guarantee exclusive pipeline egress because "
+                "other NetworkPolicies with nonempty egress rules select the "
+                "agent Pod: " + ", ".join(sorted(conflicts))
+            )
 
     def _stage_trial(
         self,
@@ -1409,6 +1604,11 @@ class KubernetesBackend:
         claim_name: str,
         submitted_at: str | None = None,
     ) -> BackendHandle:
+        egress_proxy_sha256 = (
+            managed_proxy_sha256(self.profile.proxy_image)
+            if self.profile.proxy_image
+            else None
+        )
         return BackendHandle(
             backend=self.name,
             workload_id=workload.workload_id,
@@ -1424,6 +1624,7 @@ class KubernetesBackend:
                     "challenge_sha256"
                 ],
                 "runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
+                "egress_proxy_sha256": egress_proxy_sha256,
                 "evaluation_results_path": (
                     workload.evaluation.results_path
                     if workload.evaluation is not None
@@ -1442,6 +1643,7 @@ class KubernetesBackend:
         workload_name: str | None = None,
         workload_sha256_value: str,
         challenge_sha256: str,
+        egress_proxy_sha256: str | None,
     ) -> None:
         labels = job.get("metadata", {}).get("labels", {})
         if labels.get("dev.brunner/workload") != (
@@ -1459,6 +1661,10 @@ class KubernetesBackend:
             WORKLOAD_SHA256_ANNOTATION: workload_sha256_value,
             RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
         }
+        if egress_proxy_sha256 is not None:
+            expected_job_annotations[EGRESS_PROXY_SHA256_ANNOTATION] = (
+                egress_proxy_sha256
+            )
         job_mismatches = {
             key: {
                 "expected": expected,
@@ -1589,6 +1795,7 @@ class KubernetesBackend:
             "dev.brunner/workload": job_name,
             **workload.labels,
         }
+        self._validate_exclusive_pipeline_egress(workload, labels)
         for policy in render_network_policies(
             workload,
             self.profile,
@@ -1613,6 +1820,11 @@ class KubernetesBackend:
                 "workload_sha256": workload_digest,
                 "challenge_sha256": stage_report["challenge_sha256"],
                 "runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
+                "egress_proxy_sha256": (
+                    managed_proxy_sha256(self.profile.proxy_image)
+                    if self.profile.proxy_image
+                    else None
+                ),
             }
             actual_handle = {
                 "native_id": handle.native_id,
@@ -1626,6 +1838,7 @@ class KubernetesBackend:
                         "workload_sha256",
                         "challenge_sha256",
                         "runtime_protocol",
+                        "egress_proxy_sha256",
                     )
                 },
             }
@@ -1661,6 +1874,9 @@ class KubernetesBackend:
                     challenge_sha256=str(
                         stage_report["challenge_sha256"]
                     ),
+                    egress_proxy_sha256=expected_handle[
+                        "egress_proxy_sha256"
+                    ],
                 )
             return handle
 
@@ -1675,6 +1891,11 @@ class KubernetesBackend:
                 workload_sha256_value=workload_digest,
                 challenge_sha256=str(
                     stage_report["challenge_sha256"]
+                ),
+                egress_proxy_sha256=(
+                    managed_proxy_sha256(self.profile.proxy_image)
+                    if self.profile.proxy_image
+                    else None
                 ),
             )
             handle = self._submission_handle(
@@ -1751,6 +1972,7 @@ class KubernetesBackend:
                 workload,
                 self.profile,
                 labels,
+                proxy_url=self._proxy_url,
             )
         )
         handle = self._submission_handle(
@@ -1773,6 +1995,18 @@ class KubernetesBackend:
             raise BackendRequestError(
                 "Kubernetes restart generation must be positive"
             )
+        expected_proxy_sha256 = (
+            managed_proxy_sha256(self.profile.proxy_image)
+            if self.profile.proxy_image
+            else None
+        )
+        if handle.metadata.get("egress_proxy_sha256") != (
+            expected_proxy_sha256
+        ):
+            raise BackendRequestError(
+                "cannot restart Kubernetes workload with a different "
+                "managed egress proxy identity"
+            )
         image = workload.image
         if not image:
             raise BackendRequestError(
@@ -1794,6 +2028,7 @@ class KubernetesBackend:
             "dev.brunner/restart-generation": str(generation),
             **workload.labels,
         }
+        self._validate_exclusive_pipeline_egress(workload, labels)
         pvc = self._get("pvc", claim_name)
         if pvc is None:
             raise BackendRequestError(
@@ -1842,6 +2077,7 @@ class KubernetesBackend:
                 workload_name=workload_name,
                 workload_sha256_value=workload.sha256,
                 challenge_sha256=str(stage_report["challenge_sha256"]),
+                egress_proxy_sha256=expected_proxy_sha256,
             )
             restarted = self._submission_handle(
                 workload,
@@ -1863,6 +2099,7 @@ class KubernetesBackend:
                 workload,
                 self.profile,
                 labels,
+                proxy_url=self._proxy_url,
             )
         )
         restarted = self._submission_handle(
@@ -2901,6 +3138,7 @@ class KubernetesBackend:
                     workload,
                     self.profile,
                     labels,
+                    proxy_url=self._proxy_url,
                 ),
                 render_pvc(
                     "capacity-probe-data",

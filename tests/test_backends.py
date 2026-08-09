@@ -75,9 +75,6 @@ def test_kubernetes_resources_preserve_secret_boundary(
         secret_environment={
             "OPENAI_API_KEY": ("provider-credentials", "openai")
         },
-        proxy_url="http://proxy.internal:3128",
-        proxy_pod_selector={"app": "egress-proxy"},
-        proxy_port=3128,
         node_selector={"pool": "bench"},
     )
     workload = WorkloadSpec(
@@ -95,7 +92,14 @@ def test_kubernetes_resources_preserve_secret_boundary(
     labels = {"app.kubernetes.io/name": "brunner"}
 
     pvc = render_pvc("case-1-data", profile, labels)
-    job = render_job("case-1", "case-1-data", workload, profile, labels)
+    job = render_job(
+        "case-1",
+        "case-1-data",
+        workload,
+        profile,
+        labels,
+        proxy_url="http://10.96.4.12:3128",
+    )
     reader = render_helper_pod(
         "case-1-reader",
         "case-1-data",
@@ -141,7 +145,7 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert secret["valueFrom"]["secretKeyRef"]["name"] == (
         "provider-credentials"
     )
-    assert proxy["value"] == "http://proxy.internal:3128"
+    assert proxy["value"] == "http://10.96.4.12:3128"
     assert termination_log["value"] == "/dev/termination-log"
     assert pod_spec["containers"][0]["resources"] == {
         "requests": {
@@ -179,9 +183,6 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
         secret_environment={
             "OPENAI_API_KEY": ("provider-credentials", "openai")
         },
-        proxy_url="http://proxy.internal:3128",
-        proxy_pod_selector={"app": "egress-proxy"},
-        proxy_port=3128,
     )
     workload = WorkloadSpec(
         workload_id="pipeline",
@@ -211,6 +212,7 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
         workload,
         profile,
         {"app.kubernetes.io/name": "brunner"},
+        proxy_url="http://10.96.4.12:3128",
     )
 
     pod = job["spec"]["template"]["spec"]
