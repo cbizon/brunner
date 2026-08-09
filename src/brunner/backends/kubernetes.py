@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import re
 import subprocess
 import time
@@ -27,6 +28,7 @@ from brunner.backends.base import (
     WorkloadSpec,
     native_resource_name,
     trial_resource_id,
+    validate_secret_environment,
     workload_sha256,
 )
 from brunner.backends.squid import (
@@ -40,6 +42,7 @@ from brunner.backends.squid import (
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
     ArtifactTransferError,
+    BackendConfigurationError,
     BackendError,
     BackendConnectivityError,
     BackendRequestError,
@@ -179,6 +182,10 @@ class KubernetesProfile:
     artifact_chunk_retry_seconds: float = 1
 
     def __post_init__(self) -> None:
+        validate_secret_environment(
+            self.secret_environment,
+            owner="Kubernetes profile",
+        )
         if self.artifact_chunk_bytes < 1:
             raise ValueError(
                 "Kubernetes artifact_chunk_bytes must be positive"
@@ -233,6 +240,43 @@ class KubernetesProfile:
             raise ValueError(
                 "Kubernetes artifact_chunk_retry_seconds must not be negative"
             )
+
+
+def _effective_secret_environment(
+    workload: WorkloadSpec,
+    profile: KubernetesProfile,
+) -> dict[str, tuple[str, str]]:
+    effective = dict(profile.secret_environment)
+    conflicts = {
+        name: (effective[name], reference)
+        for name, reference in workload.secret_environment.items()
+        if name in effective and effective[name] != reference
+    }
+    if conflicts:
+        raise BackendConfigurationError(
+            "workload secret environment conflicts with shared Kubernetes "
+            f"profile credentials: {conflicts}"
+        )
+    effective.update(workload.secret_environment)
+    nonsecret_conflicts = sorted(
+        set(effective) & set(profile.nonsecret_environment)
+    )
+    if nonsecret_conflicts:
+        raise BackendConfigurationError(
+            "Kubernetes environment names cannot be both secret and "
+            "non-secret: " + ", ".join(nonsecret_conflicts)
+        )
+    managed = sorted(PROXY_ENVIRONMENT & set(effective))
+    if managed:
+        raise BackendConfigurationError(
+            "Kubernetes proxy environment is managed by Brunner: "
+            + ", ".join(managed)
+        )
+    if TERMINATION_LOG_ENV in effective:
+        raise BackendConfigurationError(
+            f"{TERMINATION_LOG_ENV} is reserved by Brunner"
+        )
+    return effective
 
 
 def _image_is_immutable(image: str) -> bool:
@@ -601,10 +645,8 @@ def render_job(
         raise BackendRequestError(
             "Kubernetes workloads require an agent image"
         )
-    if (
-        TERMINATION_LOG_ENV in profile.nonsecret_environment
-        or TERMINATION_LOG_ENV in profile.secret_environment
-    ):
+    secret_environment = _effective_secret_environment(workload, profile)
+    if TERMINATION_LOG_ENV in profile.nonsecret_environment:
         raise BackendRequestError(
             f"{TERMINATION_LOG_ENV} is reserved by Brunner"
         )
@@ -645,7 +687,7 @@ def render_job(
                 }
             },
         }
-        for name, reference in sorted(profile.secret_environment.items())
+        for name, reference in sorted(secret_environment.items())
     )
     environment.append(
         {
@@ -872,6 +914,7 @@ class KubernetesBackend:
         self.profile = profile
         self.kubectl = kubectl
         self._preflight_complete = False
+        self._secret_preflight_complete = False
         self._proxy_url: str | None = None
 
     def prepare_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
@@ -1292,7 +1335,21 @@ class KubernetesBackend:
             self.profile.namespace,
             check=False,
         )
-        if result.returncode or result.stdout.strip().lower() != "yes":
+        if result.returncode:
+            raise self._error(
+                (
+                    "auth",
+                    "can-i",
+                    verb,
+                    resource,
+                    "-n",
+                    self.profile.namespace,
+                ),
+                result.returncode,
+                result.stdout.encode(),
+                result.stderr.encode(),
+            )
+        if result.stdout.strip().lower() != "yes":
             message = (result.stderr or result.stdout).strip()
             raise BackendRequestError(
                 "Kubernetes preflight permission denied: "
@@ -1301,6 +1358,7 @@ class KubernetesBackend:
             )
 
     def _ensure_preflight(self, workload: WorkloadSpec) -> None:
+        _effective_secret_environment(workload, self.profile)
         if not self.profile.preflight_enabled:
             self._ensure_managed_proxy()
             return
@@ -1368,6 +1426,106 @@ class KubernetesBackend:
             self._check_permission(verb, resource)
         self._ensure_managed_proxy()
         self._preflight_complete = True
+
+    def _ensure_workload_secrets(self, workload: WorkloadSpec) -> None:
+        secret_environment = _effective_secret_environment(
+            workload,
+            self.profile,
+        )
+        if not secret_environment:
+            return
+        if (
+            self.profile.preflight_enabled
+            and not self._secret_preflight_complete
+        ):
+            for verb in ("get", "create", "update"):
+                self._check_permission(verb, "secrets")
+            self._secret_preflight_complete = True
+
+        references: dict[str, dict[str, str]] = {}
+        sources: dict[tuple[str, str], str] = {}
+        for environment_name, (secret_name, secret_key) in sorted(
+            secret_environment.items()
+        ):
+            source_key = (secret_name, secret_key)
+            previous_source = sources.setdefault(
+                source_key,
+                environment_name,
+            )
+            if previous_source != environment_name:
+                raise BackendConfigurationError(
+                    "multiple agent environment variables reference the same "
+                    "Kubernetes Secret key and cannot be provisioned "
+                    f"unambiguously: {secret_name}/{secret_key}"
+                )
+            references.setdefault(secret_name, {})[
+                secret_key
+            ] = environment_name
+
+        for secret_name, keys in sorted(references.items()):
+            existing = self._get("secret", secret_name)
+            existing_data: dict[str, Any] = {}
+            if existing is not None:
+                value = existing.get("data", {})
+                if not isinstance(value, dict):
+                    raise BackendConfigurationError(
+                        f"Kubernetes Secret {secret_name} has malformed data"
+                    )
+                existing_data = value
+            missing = {
+                secret_key: environment_name
+                for secret_key, environment_name in keys.items()
+                if secret_key not in existing_data
+            }
+            if not missing:
+                continue
+            unavailable = sorted(
+                environment_name
+                for environment_name in missing.values()
+                if not os.environ.get(environment_name)
+            )
+            if unavailable:
+                missing_keys = ", ".join(sorted(missing))
+                raise BackendConfigurationError(
+                    f"Kubernetes Secret {secret_name} is absent or missing "
+                    f"keys [{missing_keys}], and the orchestrator environment "
+                    "does not provide non-empty variables: "
+                    + ", ".join(unavailable)
+                )
+            encoded_missing = {
+                secret_key: base64.b64encode(
+                    os.environ[environment_name].encode()
+                ).decode()
+                for secret_key, environment_name in sorted(missing.items())
+            }
+            if existing is None:
+                resource = {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": secret_name,
+                        "namespace": self.profile.namespace,
+                    },
+                    "type": "Opaque",
+                    "data": encoded_missing,
+                }
+                operation = "create"
+            else:
+                resource = dict(existing)
+                resource["data"] = {
+                    **existing_data,
+                    **encoded_missing,
+                }
+                metadata = dict(resource.get("metadata", {}))
+                metadata.pop("managedFields", None)
+                resource["metadata"] = metadata
+                operation = "replace"
+            self._run(
+                operation,
+                "-f",
+                "-",
+                input_value=json.dumps(resource),
+            )
 
     def _ensure_managed_proxy(self) -> None:
         if self.profile.unsafe_disable_network_policy_for_tests:
@@ -1772,6 +1930,7 @@ class KubernetesBackend:
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         workload = self.prepare_workload(workload)
         workload.validate()
+        self._ensure_workload_secrets(workload)
         self._ensure_preflight(workload)
         image = workload.image
         if not image:
@@ -1990,6 +2149,7 @@ class KubernetesBackend:
     ) -> BackendHandle:
         workload = self.prepare_workload(workload)
         workload.validate()
+        self._ensure_workload_secrets(workload)
         self._ensure_preflight(workload)
         if generation < 1:
             raise BackendRequestError(

@@ -153,7 +153,7 @@ The agent runtime receives only:
 - The staged challenge
 - Generated schemas and contract
 - Minimal `metadata/agent-run.json`
-- Provider credentials supplied by the runtime
+- Only the selected provider's credential references
 
 Challenge materialization runs earlier as trusted orchestrator-side benchmark
 code. Brunner gives it the temporary challenge root, does not pass trial,
@@ -208,6 +208,11 @@ After it produces a terminal provider result, Kubernetes starts the trusted
 evaluator as the Job's main container. Both use the trial PVC, but only the
 evaluator mounts the separately provisioned reference PVC, read-only. Provider
 Secrets and proxy settings are present only in the agent init container.
+Campaign configuration maps providers to Secret name/key references, and the
+workload factory selects only the current trial's provider mapping. Before any
+staging, the orchestrator reuses an existing Secret key or creates a missing
+one from the same-named laptop environment variable. Secret values never enter
+campaign state, workload identity, trial contents, or Pod manifests.
 
 Agent, evaluator, and artifact-reader images are immutable digest references by
 default. Every image reports or validates Brunner's runtime protocol before it
@@ -532,8 +537,9 @@ Campaign reconciliation:
 - Recovers an unreadable primary campaign state from the last atomic backup and
   records that recovery in campaign state
 
-Campaign trials contain no environment passthrough. Kubernetes credentials are
-represented only as Secret name/key references. Deployment networking is
-configured with the explicit proxy URL, proxy Pod selector, namespace, and
-port fields; evaluator containers inherit neither provider Secrets nor agent
-proxy environment.
+Campaign trials contain no environment values. Kubernetes credentials are
+represented only as provider-scoped Secret name/key references; profile-level
+references are limited to credentials intentionally shared by every workload.
+Deployment networking is configured with the explicit proxy URL, proxy Pod
+selector, namespace, and port fields; evaluator containers inherit neither
+provider Secrets nor agent proxy environment.

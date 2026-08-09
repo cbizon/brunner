@@ -32,6 +32,33 @@ RESERVED_WORKLOAD_LABELS = frozenset(
 )
 
 
+def validate_secret_environment(
+    secret_environment: dict[str, tuple[str, str]],
+    *,
+    owner: str,
+) -> None:
+    if not isinstance(secret_environment, dict):
+        raise ValueError(f"{owner} secret environment must be a mapping")
+    for environment_name, reference in secret_environment.items():
+        if not isinstance(environment_name, str) or not environment_name:
+            raise ValueError(
+                f"{owner} secret environment names must be non-empty strings"
+            )
+        if (
+            not isinstance(reference, tuple)
+            or len(reference) != 2
+            or any(
+                not isinstance(value, str) or not value
+                for value in reference
+            )
+        ):
+            raise ValueError(
+                f"{owner} secret environment reference for "
+                f"{environment_name!r} must be a "
+                "(secret_name, secret_key) tuple"
+            )
+
+
 def native_resource_name(
     workload_id: str,
     resource_identity: str | Path,
@@ -215,6 +242,9 @@ class WorkloadSpec:
     memory_limit: str | None = None
     ephemeral_storage_request: str | None = None
     ephemeral_storage_limit: str | None = None
+    secret_environment: dict[str, tuple[str, str]] = field(
+        default_factory=dict
+    )
     evaluation: TrustedEvaluationSpec | None = None
 
     def validate(self) -> None:
@@ -248,6 +278,10 @@ class WorkloadSpec:
             )
         if self.evaluation is not None:
             self.evaluation.validate()
+        validate_secret_environment(
+            self.secret_environment,
+            owner="workload",
+        )
         for name, value in (
             ("cpu", self.cpu),
             ("memory", self.memory),
@@ -306,6 +340,13 @@ def workload_sha256(workload: WorkloadSpec) -> str:
         "ephemeral_storage_limit": workload.ephemeral_storage_limit,
         "evaluation": evaluation_value,
     }
+    if workload.secret_environment:
+        value["secret_environment"] = {
+            name: list(reference)
+            for name, reference in sorted(
+                workload.secret_environment.items()
+            )
+        }
     encoded = json.dumps(
         value,
         sort_keys=True,
