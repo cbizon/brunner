@@ -8,7 +8,7 @@ import os
 import re
 import socket
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
@@ -19,12 +19,14 @@ from brunner.backends import (
     ExecutionBackend,
     TrustedEvaluationSpec,
     WorkloadSpec,
+    validate_secret_environment,
     workload_sha256,
 )
 from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import (
     ArtifactTransferError,
+    BackendConfigurationError,
     BackendConnectivityError,
     BackendError,
     IntegrityError,
@@ -155,6 +157,10 @@ class CampaignPlan:
     memory_limit: str | None = None
     ephemeral_storage_request: str | None = None
     ephemeral_storage_limit: str | None = None
+    provider_secret_environment: dict[
+        str,
+        dict[str, tuple[str, str]],
+    ] = field(default_factory=dict)
     included_artifact_groups: frozenset[str] = frozenset()
     submission_retry_seconds: float = 60.0
     submission_max_attempts: int = 3
@@ -184,6 +190,17 @@ class CampaignPlan:
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"campaign {name} cannot be empty")
+        for provider, secret_environment in (
+            self.provider_secret_environment.items()
+        ):
+            if not isinstance(provider, str) or not provider.strip():
+                raise ValueError(
+                    "campaign provider secret names must be non-empty strings"
+                )
+            validate_secret_environment(
+                secret_environment,
+                owner=f"campaign provider {provider!r}",
+            )
         if self.submission_retry_seconds < 0:
             raise ValueError(
                 "campaign submission_retry_seconds must not be negative"
@@ -255,6 +272,15 @@ class CampaignPlan:
             "memory_limit": self.memory_limit,
             "ephemeral_storage_request": self.ephemeral_storage_request,
             "ephemeral_storage_limit": self.ephemeral_storage_limit,
+            "provider_secret_environment": {
+                provider: {
+                    name: list(reference)
+                    for name, reference in sorted(environment.items())
+                }
+                for provider, environment in sorted(
+                    self.provider_secret_environment.items()
+                )
+            },
             "included_artifact_groups": sorted(
                 self.included_artifact_groups
             ),
@@ -316,6 +342,12 @@ def default_workload_factory(
         memory_limit=plan.memory_limit,
         ephemeral_storage_request=plan.ephemeral_storage_request,
         ephemeral_storage_limit=plan.ephemeral_storage_limit,
+        secret_environment=dict(
+            plan.provider_secret_environment.get(
+                campaign_trial.provider,
+                {},
+            )
+        ),
         evaluation=trusted_evaluation,
         labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
     )
@@ -1048,6 +1080,28 @@ class CampaignRunner:
             handle = self.backend.submit(workload)
         except BackendConnectivityError:
             raise
+        except BackendConfigurationError as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="backend_configuration",
+                    domain="configuration",
+                    reason="BackendConfigurationFailed",
+                    disposition="attention",
+                    retryable=False,
+                ),
+            )
+            self._event(
+                state,
+                "backend_configuration_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
         except BackendError as error:
             entry["error"] = str(error)
             attempts = int(entry["attempts"]["submission"])

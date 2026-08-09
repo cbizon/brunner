@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import traceback
 from datetime import UTC, datetime
@@ -212,6 +213,7 @@ def execute_evaluation(
     *,
     reference_root: Path | None = None,
     timeout_seconds: float | None = None,
+    working_directory_root: Path | None = None,
 ) -> dict[str, Any]:
     """Execute deterministic evaluation inside the trusted environment."""
     spec.validate()
@@ -271,9 +273,18 @@ def execute_evaluation(
             "disposition": "candidate_failed",
         }
         validated = validate_submission(trial / "workspace", contract)
+        failure_context = {
+            "operation": "evaluator_workspace_setup",
+            "domain": "evaluation",
+            "reason": "EvaluatorWorkspaceSetupFailed",
+            "disposition": "attention",
+            "resource": "evaluator_tmp",
+        }
         environment = os.environ.copy()
         environment.update(
             {
+                "PYTHONSAFEPATH": "1",
+                "PYTHONNOUSERSITE": "1",
                 "BRUNNER_TRIAL_ROOT": str(trial),
                 "BRUNNER_WORKSPACE": str(trial / "workspace"),
                 "BRUNNER_SUBMISSION_MANIFEST": str(
@@ -285,97 +296,126 @@ def execute_evaluation(
                 "BRUNNER_EVALUATION_RESULTS": str(results_path),
             }
         )
-        if spec.reference_manifest_path is not None:
-            if reference_root is None:
-                raise IntegrityError(
-                    "trusted evaluation requires a mounted reference bundle"
-                )
-            failure_context = {
-                "operation": "reference_validation",
-                "domain": "integrity",
-                "reason": "ReferenceValidationFailed",
-                "disposition": "attention",
-            }
-            reference_root = reference_root.resolve()
-            reference_manifest_path = (
-                reference_root / spec.reference_manifest_path
-            )
-            if (
-                sha256_file(reference_manifest_path)
-                != spec.reference_manifest_sha256
+        temporary_root = (
+            working_directory_root.resolve()
+            if working_directory_root is not None
+            else None
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="brunner-evaluation-",
+            dir=temporary_root,
+        ) as temporary_name:
+            trusted_working_directory = Path(temporary_name).resolve()
+            forbidden_roots = [trial]
+            if reference_root is not None:
+                forbidden_roots.append(reference_root.resolve())
+            if any(
+                trusted_working_directory.is_relative_to(root)
+                for root in forbidden_roots
             ):
-                raise IntegrityError(
-                    "mounted reference manifest digest does not match the "
-                    "orchestrator-approved manifest"
-                )
-            reference_manifest = validate_reference_manifest(
-                reference_root,
-                reference_manifest_path,
-            )
-            reference_metadata = reference_manifest.get("metadata")
-            expected_reference_metadata = {
-                "benchmark_id": spec.benchmark_id,
-                "benchmark_version": spec.benchmark_version,
-                "contract_sha256": contract.sha256,
-            }
-            if not isinstance(reference_metadata, dict):
-                raise IntegrityError(
-                    "reference bundle metadata is missing"
-                )
-            mismatches = {
-                key: {
-                    "expected": expected,
-                    "actual": reference_metadata.get(key),
-                }
-                for key, expected in expected_reference_metadata.items()
-                if reference_metadata.get(key) != expected
-            }
-            if mismatches:
-                raise IntegrityError(
-                    f"reference bundle identity mismatch: {mismatches}"
-                )
-            environment["BRUNNER_REFERENCE_ROOT"] = str(reference_root)
-            environment["BRUNNER_REFERENCE_MANIFEST"] = str(
-                reference_manifest_path.resolve()
-            )
-            if spec.reference_validate_command:
                 failure_context = {
-                    "operation": "reference_validation_command",
-                    "domain": "evaluation",
-                    "reason": "ReferenceValidatorFailed",
+                    "operation": "evaluator_isolation_validation",
+                    "domain": "integrity",
+                    "reason": "EvaluatorIsolationInvalid",
+                    "disposition": "attention",
+                    "resource": "evaluator_tmp",
+                }
+                raise IntegrityError(
+                    "trusted evaluator working directory overlaps an "
+                    "untrusted or read-only benchmark mount"
+                )
+            if spec.reference_manifest_path is not None:
+                if reference_root is None:
+                    raise IntegrityError(
+                        "trusted evaluation requires a mounted reference "
+                        "bundle"
+                    )
+                failure_context = {
+                    "operation": "reference_validation",
+                    "domain": "integrity",
+                    "reason": "ReferenceValidationFailed",
                     "disposition": "attention",
                 }
-                reference_return_code = _run_evaluator(
-                    spec.reference_validate_command,
-                    cwd=reference_root,
-                    environment=environment,
-                    timeout_seconds=remaining_seconds(),
-                    stdout_path=results_path.with_name(
-                        "reference-validator.stdout.log"
-                    ),
-                    stderr_path=results_path.with_name(
-                        "reference-validator.stderr.log"
-                    ),
+                reference_root = reference_root.resolve()
+                reference_manifest_path = (
+                    reference_root / spec.reference_manifest_path
                 )
-                if reference_return_code != 0:
-                    raise EvaluationError(
-                        "reference validation command exited "
-                        f"{reference_return_code}"
+                if (
+                    sha256_file(reference_manifest_path)
+                    != spec.reference_manifest_sha256
+                ):
+                    raise IntegrityError(
+                        "mounted reference manifest digest does not match the "
+                        "orchestrator-approved manifest"
                     )
-        failure_context = {
-            "operation": "evaluator_execution",
-            "domain": "evaluation",
-            "reason": "EvaluatorFailed",
-            "disposition": "attention",
-        }
-        return_code = _run_evaluator(
-            spec.command,
-            cwd=trial / "workspace",
-            environment=environment,
-            timeout_seconds=remaining_seconds(),
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-        )
+                reference_manifest = validate_reference_manifest(
+                    reference_root,
+                    reference_manifest_path,
+                )
+                reference_metadata = reference_manifest.get("metadata")
+                expected_reference_metadata = {
+                    "benchmark_id": spec.benchmark_id,
+                    "benchmark_version": spec.benchmark_version,
+                    "contract_sha256": contract.sha256,
+                }
+                if not isinstance(reference_metadata, dict):
+                    raise IntegrityError(
+                        "reference bundle metadata is missing"
+                    )
+                mismatches = {
+                    key: {
+                        "expected": expected,
+                        "actual": reference_metadata.get(key),
+                    }
+                    for key, expected in expected_reference_metadata.items()
+                    if reference_metadata.get(key) != expected
+                }
+                if mismatches:
+                    raise IntegrityError(
+                        f"reference bundle identity mismatch: {mismatches}"
+                    )
+                environment["BRUNNER_REFERENCE_ROOT"] = str(reference_root)
+                environment["BRUNNER_REFERENCE_MANIFEST"] = str(
+                    reference_manifest_path.resolve()
+                )
+                if spec.reference_validate_command:
+                    failure_context = {
+                        "operation": "reference_validation_command",
+                        "domain": "evaluation",
+                        "reason": "ReferenceValidatorFailed",
+                        "disposition": "attention",
+                    }
+                    reference_return_code = _run_evaluator(
+                        spec.reference_validate_command,
+                        cwd=trusted_working_directory,
+                        environment=environment,
+                        timeout_seconds=remaining_seconds(),
+                        stdout_path=results_path.with_name(
+                            "reference-validator.stdout.log"
+                        ),
+                        stderr_path=results_path.with_name(
+                            "reference-validator.stderr.log"
+                        ),
+                    )
+                    if reference_return_code != 0:
+                        raise EvaluationError(
+                            "reference validation command exited "
+                            f"{reference_return_code}"
+                        )
+            failure_context = {
+                "operation": "evaluator_execution",
+                "domain": "evaluation",
+                "reason": "EvaluatorFailed",
+                "disposition": "attention",
+            }
+            return_code = _run_evaluator(
+                spec.command,
+                cwd=trusted_working_directory,
+                environment=environment,
+                timeout_seconds=remaining_seconds(),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
         if not results_path.is_file():
             raise EvaluationError(
                 f"evaluator did not write required result: {results_path}"
@@ -453,9 +493,13 @@ def execute_evaluation(
             disposition=str(failure_context["disposition"]),
             retryable=False,
             resource=(
-                "evaluation_runtime"
-                if failure_context["domain"] == "evaluation"
-                else None
+                str(failure_context["resource"])
+                if failure_context.get("resource") is not None
+                else (
+                    "evaluation_runtime"
+                    if failure_context["domain"] == "evaluation"
+                    else None
+                )
             ),
         )
         result = _failure_result(

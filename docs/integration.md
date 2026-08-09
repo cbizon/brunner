@@ -545,6 +545,13 @@ image must contain Brunner, the benchmark evaluator package, and every runtime
 dependency used by the evaluator; the command is interpreted inside that image,
 not on the orchestrator.
 
+Brunner starts the evaluator in its own empty `/tmp` volume and invokes both
+reference validation and benchmark evaluation from a fresh directory there.
+Do not depend on the candidate workspace or reference root being the process
+working directory; use the supplied `BRUNNER_*` paths. Prefer installed console
+scripts or otherwise ensure the evaluator package is importable without the
+current directory.
+
 ## References
 
 Create or refresh the reference manifest after the contract is valid:
@@ -597,6 +604,20 @@ def build_campaign(definition, contract):
         cpu_limit="8",
         memory_request="8Gi",
         memory_limit="32Gi",
+        provider_secret_environment={
+            "codex": {
+                "OPENAI_API_KEY": (
+                    "codex-provider-credentials",
+                    "OPENAI_API_KEY",
+                ),
+            },
+            "claude": {
+                "CLAUDE_CODE_OAUTH_TOKEN": (
+                    "claude-provider-credentials",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ),
+            },
+        },
         max_parallel=2,
         included_artifact_groups=frozenset({"debug"}),
         collection_retry_seconds=60,
@@ -615,12 +636,6 @@ def build_campaign(definition, contract):
                 storage_size="250Gi",
                 storage_class_name="sterling-storage-class",
                 image_pull_secrets=("registry-credentials",),
-                secret_environment={
-                    "OPENAI_API_KEY": (
-                        "provider-credentials",
-                        "OPENAI_API_KEY",
-                    ),
-                },
                 proxy_image=(
                     "ubuntu/squid@sha256:"
                     "0123456789abcdef0123456789abcdef"
@@ -684,10 +699,14 @@ numeric Service ClusterIP only into the agent, so the pipeline does not receive
 DNS access. Squid alone may query cluster DNS and connect to external TCP 443,
 and its deny-by-default ACL permits only OpenAI, Azure OpenAI, Anthropic, and
 Claude domains. Brunner rejects another standard Kubernetes NetworkPolicy with
-nonempty egress rules that also selects the pipeline Pod, because egress
-permissions are additive. Do not place proxy variables in
-`nonsecret_environment`. Sterling's CNI must enforce Kubernetes NetworkPolicy;
-Brunner cannot infer enforcement from successful object creation.
+nonempty ingress or egress rules that also selects a pipeline, stager, or
+artifact-reader Pod, because permissions are additive. It checks before helper
+creation and again immediately before Job creation. Use a dedicated Sterling
+namespace where RBAC or admission policy prevents other principals from
+creating or changing NetworkPolicies after validation. Do not place proxy
+variables in `nonsecret_environment`. Sterling's CNI must enforce Kubernetes
+NetworkPolicy; Brunner cannot infer enforcement from successful object
+creation.
 
 The stager clears an incomplete trial PVC before copying, verifies every
 remote challenge file against the local stage inventory, rejects remote
@@ -770,11 +789,18 @@ existing code can add only limit fields to become burstable. New benchmark
 code should use the explicit request and limit fields. Evaluator requests and
 limits are configured independently on `EvaluationDefinition`.
 
-Campaign trials do not accept environment-variable names or values. Provider
-credentials and deployment networking belong to the backend configuration:
+Provider credentials are selected per trial without placing secret values in
+campaign state:
 
-- `KubernetesProfile.secret_environment` maps container variable names to
-  Kubernetes Secret name/key references for the agent init container.
+- `CampaignPlan.provider_secret_environment` maps each provider name to the
+  agent environment variables and Kubernetes Secret name/key references it
+  requires. `default_workload_factory` copies only the selected provider's
+  mapping into that trial's `WorkloadSpec`.
+- `WorkloadSpec.secret_environment` supports the same mapping for custom
+  workload factories.
+- `KubernetesProfile.secret_environment` is reserved for credentials genuinely
+  shared by every workload. Profile and workload mappings are merged only when
+  duplicate environment names reference the same Secret key.
 - `KubernetesProfile.nonsecret_environment` supplies explicit non-secret agent
   deployment settings such as certificate paths.
 - `proxy_image` supplies the digest-pinned Squid image for Brunner's managed
@@ -782,7 +808,20 @@ credentials and deployment networking belong to the backend configuration:
 - `proxy_cpu_request`, `proxy_cpu_limit`, `proxy_memory_request`, and
   `proxy_memory_limit` configure the shared proxy Deployment.
 
-The evaluator container receives neither mapping.
+Before staging, Brunner checks every selected Secret reference. An existing
+Secret containing the requested key is reused without requiring the
+corresponding laptop variable. If the Secret or key is missing, Brunner creates
+or completes it from the orchestrator environment variable with the same name
+as the agent environment variable. For example, a missing
+`OPENAI_API_KEY` binding is populated from the laptop's `OPENAI_API_KEY`.
+Missing or empty local variables fail submission immediately. Existing Secret
+values are never overwritten, and values are never written to campaign state,
+trial metadata, workload hashes, Pod manifests, command arguments, or
+client-side apply annotations.
+
+Only the agent init container receives these Secret references. The evaluator,
+staging helpers, and artifact readers receive neither provider mappings nor
+secret values.
 
 Do not put secret values in non-secret environment mappings.
 
@@ -792,8 +831,8 @@ connectivity returns or the process is interrupted; it does not alter remote
 workloads while disconnected.
 
 Before launch, Brunner checks cluster access, required Job/PVC/Pod/Event/
-NetworkPolicy/ConfigMap/Service/Deployment RBAC, immutable images, reference
-identity, managed-proxy rollout, and ResourceQuota capacity. Quota capacity
+Secret/NetworkPolicy/ConfigMap/Service/Deployment RBAC, immutable images,
+reference identity, managed-proxy rollout, and ResourceQuota capacity. Quota capacity
 includes object counts, PVC storage, CPU, memory,
 ephemeral storage, and extended resources, using Kubernetes' effective
 init-container scheduling request. A quota limit appears as a visible

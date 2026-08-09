@@ -153,7 +153,7 @@ The agent runtime receives only:
 - The staged challenge
 - Generated schemas and contract
 - Minimal `metadata/agent-run.json`
-- Provider credentials supplied by the runtime
+- Only the selected provider's credential references
 
 Challenge materialization runs earlier as trusted orchestrator-side benchmark
 code. Brunner gives it the temporary challenge root, does not pass trial,
@@ -183,7 +183,10 @@ Kubernetes candidate and helper pods do not mount service-account tokens. They
 run as UID/GID 1000 with the runtime-default seccomp profile, all Linux
 capabilities dropped, privilege escalation disabled, and a read-only container
 root. The trial PVC and an ephemeral `/tmp` volume are their only writable
-mounts. Agent and artifact-reader images must support this non-root contract.
+mounts during staging and execution. Artifact readers mount the trial PVC
+read-only so collection cannot alter remote results. Agent and artifact-reader
+images must support this non-root contract. Service-link environment injection
+is disabled.
 
 Brunner installs a namespace-scoped Squid Deployment, ConfigMap, Service, and
 NetworkPolicy before staging. Squid permits HTTPS `CONNECT` only to
@@ -194,20 +197,29 @@ and open outbound TCP 443 connections.
 Workload-scoped NetworkPolicies allow pipeline Pods to reach only Squid on TCP
 3128. Brunner reads the Service's numeric ClusterIP and injects that address
 into the agent's proxy variables, so pipeline Pods receive no DNS egress at
-all. Stager and artifact-reader Pods have no egress. Generic environment
-mappings cannot override proxy variables. The Squid image and ACL
-configuration digest are recorded in the Job and persisted backend handle;
-resume and restart reject identity drift. Because Kubernetes egress policies
-are additive, Brunner also lists existing namespace NetworkPolicies and
-refuses to launch when another policy with nonempty egress rules selects the
-pipeline Pod. Sterling must use a CNI that enforces Kubernetes NetworkPolicy;
-successful API creation alone does not prove packet-level enforcement.
+all. Pipeline, stager, and artifact-reader Pods deny ingress; stager and
+artifact-reader Pods also have no egress. Generic environment mappings cannot
+override proxy variables. The Squid image and ACL configuration digest are
+recorded in the Job and persisted backend handle; resume and restart reject
+identity drift. Because Kubernetes policies are additive, Brunner lists
+existing namespace NetworkPolicies before helper or pipeline creation and
+again immediately before Job creation. It refuses to launch when another
+policy with nonempty ingress or egress rules selects any Brunner workload Pod.
+Sterling must use a dedicated namespace where RBAC or admission policy prevents
+other principals from adding NetworkPolicies after validation, and a CNI that
+enforces Kubernetes NetworkPolicy. Successful API creation alone does not
+prove packet-level enforcement.
 
 Each remote Job runs `python -m brunner.agent_cli` in an agent init container.
 After it produces a terminal provider result, Kubernetes starts the trusted
 evaluator as the Job's main container. Both use the trial PVC, but only the
 evaluator mounts the separately provisioned reference PVC, read-only. Provider
 Secrets and proxy settings are present only in the agent init container.
+Campaign configuration maps providers to Secret name/key references, and the
+workload factory selects only the current trial's provider mapping. Before any
+staging, the orchestrator reuses an existing Secret key or creates a missing
+one from the same-named laptop environment variable. Secret values never enter
+campaign state, workload identity, trial contents, or Pod manifests.
 
 Agent, evaluator, and artifact-reader images are immutable digest references by
 default. Every image reports or validates Brunner's runtime protocol before it
@@ -219,7 +231,10 @@ probe. Mutable tags are available only through the explicit
 The evaluator image contains benchmark-specific scoring code and Brunner's
 evaluator helper API. `python -m brunner.evaluation_cli` validates the staged
 contract, candidate submission, reference bundle, evaluator result, and report
-paths before recording a terminal evaluation summary. The orchestrator does
+paths before recording a terminal evaluation summary. The evaluator bootstrap
+and all benchmark/reference validation commands run from a fresh evaluator-only
+`/tmp` directory with safe Python path settings, never from the
+candidate-controlled workspace or the reference mount. The orchestrator does
 not execute evaluator code.
 
 ## Durable Agent Runtime
@@ -532,8 +547,9 @@ Campaign reconciliation:
 - Recovers an unreadable primary campaign state from the last atomic backup and
   records that recovery in campaign state
 
-Campaign trials contain no environment passthrough. Kubernetes credentials are
-represented only as Secret name/key references. Deployment networking is
-configured with the explicit proxy URL, proxy Pod selector, namespace, and
-port fields; evaluator containers inherit neither provider Secrets nor agent
-proxy environment.
+Campaign trials contain no environment values. Kubernetes credentials are
+represented only as provider-scoped Secret name/key references; profile-level
+references are limited to credentials intentionally shared by every workload.
+Deployment networking is configured with the explicit proxy URL, proxy Pod
+selector, namespace, and port fields; evaluator containers inherit neither
+provider Secrets nor agent proxy environment.

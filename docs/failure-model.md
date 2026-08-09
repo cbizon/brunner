@@ -73,6 +73,7 @@ state publication must be atomic so they cannot expose partial state.
 | State persistence | Disk/inodes, permission, serialization, machine loss | Orchestrator | Preserve previous valid state; stop new side effects if authoritative state cannot be written |
 | Campaign locking | Concurrent orchestrator or stale diagnostic owner text | OS file lock | Terminal local orchestration error; kernel lock is authoritative |
 | Capacity/preflight | API loss, RBAC, quota, no nodes, mutable/incompatible images, bad reference claim | Scheduler/backend | Connectivity pause, terminal configuration, or visible quota `wait`; never an invisible running state |
+| Credential preparation | Missing local variable, absent Secret key, malformed Secret, RBAC, API loss | Kubernetes backend before staging | Reuse an existing key; create or complete from the orchestrator environment; terminal configuration for missing input, connectivity pause for API loss |
 | Submission | Partial NetworkPolicy/PVC/helper/Job, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation | Adopt only matching digests after ambiguity; possible side effects require cleanup |
 | Scheduling/startup | Unschedulable, image pull, mount, secret, GPU/storage unavailable | Backend inspection | Typed backend failure; retry only transient infrastructure |
 | Agent startup | Missing executable/config, corrupt trial state, permission/disk failure | Agent CLI and backend | Durable nonzero infrastructure result with diagnostics |

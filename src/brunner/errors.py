@@ -34,6 +34,10 @@ class BackendRequestError(BackendError):
     """The backend rejected a request."""
 
 
+class BackendConfigurationError(BackendRequestError):
+    """The workload's backend configuration cannot succeed as supplied."""
+
+
 class WorkloadFailure(BackendError):
     """A submitted workload terminated unsuccessfully."""
 

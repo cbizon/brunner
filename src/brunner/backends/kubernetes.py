@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import re
 import subprocess
 import time
@@ -27,6 +28,7 @@ from brunner.backends.base import (
     WorkloadSpec,
     native_resource_name,
     trial_resource_id,
+    validate_secret_environment,
     workload_sha256,
 )
 from brunner.backends.squid import (
@@ -40,6 +42,7 @@ from brunner.backends.squid import (
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
     ArtifactTransferError,
+    BackendConfigurationError,
     BackendError,
     BackendConnectivityError,
     BackendRequestError,
@@ -179,6 +182,10 @@ class KubernetesProfile:
     artifact_chunk_retry_seconds: float = 1
 
     def __post_init__(self) -> None:
+        validate_secret_environment(
+            self.secret_environment,
+            owner="Kubernetes profile",
+        )
         if self.artifact_chunk_bytes < 1:
             raise ValueError(
                 "Kubernetes artifact_chunk_bytes must be positive"
@@ -233,6 +240,43 @@ class KubernetesProfile:
             raise ValueError(
                 "Kubernetes artifact_chunk_retry_seconds must not be negative"
             )
+
+
+def _effective_secret_environment(
+    workload: WorkloadSpec,
+    profile: KubernetesProfile,
+) -> dict[str, tuple[str, str]]:
+    effective = dict(profile.secret_environment)
+    conflicts = {
+        name: (effective[name], reference)
+        for name, reference in workload.secret_environment.items()
+        if name in effective and effective[name] != reference
+    }
+    if conflicts:
+        raise BackendConfigurationError(
+            "workload secret environment conflicts with shared Kubernetes "
+            f"profile credentials: {conflicts}"
+        )
+    effective.update(workload.secret_environment)
+    nonsecret_conflicts = sorted(
+        set(effective) & set(profile.nonsecret_environment)
+    )
+    if nonsecret_conflicts:
+        raise BackendConfigurationError(
+            "Kubernetes environment names cannot be both secret and "
+            "non-secret: " + ", ".join(nonsecret_conflicts)
+        )
+    managed = sorted(PROXY_ENVIRONMENT & set(effective))
+    if managed:
+        raise BackendConfigurationError(
+            "Kubernetes proxy environment is managed by Brunner: "
+            + ", ".join(managed)
+        )
+    if TERMINATION_LOG_ENV in effective:
+        raise BackendConfigurationError(
+            f"{TERMINATION_LOG_ENV} is reserved by Brunner"
+        )
+    return effective
 
 
 def _image_is_immutable(image: str) -> bool:
@@ -433,7 +477,8 @@ def render_network_policies(
                         "dev.brunner/role": PIPELINE_ROLE,
                     }
                 },
-                "policyTypes": ["Egress"],
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
                 "egress": pipeline_egress,
             },
         },
@@ -457,7 +502,8 @@ def render_network_policies(
                         }
                     ],
                 },
-                "policyTypes": ["Egress"],
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
                 "egress": [],
             },
         },
@@ -492,8 +538,12 @@ def _pod_spec_common(
     *,
     claim_name: str,
     container: dict[str, Any],
+    claim_read_only: bool = False,
     excluded_nodes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    claim: dict[str, Any] = {"claimName": claim_name}
+    if claim_read_only:
+        claim["readOnly"] = True
     container["securityContext"] = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -504,6 +554,7 @@ def _pod_spec_common(
     )
     spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
+        "enableServiceLinks": False,
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": 30,
         "securityContext": {
@@ -517,7 +568,7 @@ def _pod_spec_common(
         "volumes": [
             {
                 "name": "trial",
-                "persistentVolumeClaim": {"claimName": claim_name},
+                "persistentVolumeClaim": claim,
             },
             {"name": "tmp", "emptyDir": {}},
         ],
@@ -560,15 +611,22 @@ def render_helper_pod(
     profile: KubernetesProfile,
     labels: dict[str, str],
     *,
+    trial_read_only: bool = False,
     excluded_nodes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    trial_mount: dict[str, Any] = {
+        "name": "trial",
+        "mountPath": "/brunner/trial",
+    }
+    if trial_read_only:
+        trial_mount["readOnly"] = True
     container = {
         "name": "helper",
         "image": image,
         "command": ["sh", "-c", "trap : TERM INT; sleep 86400 & wait"],
         # Never inherit an image WORKDIR hidden by the trial PVC mount.
         "workingDir": "/tmp",
-        "volumeMounts": [{"name": "trial", "mountPath": "/brunner/trial"}],
+        "volumeMounts": [trial_mount],
     }
     return {
         "apiVersion": "v1",
@@ -582,6 +640,7 @@ def render_helper_pod(
             profile,
             claim_name=claim_name,
             container=container,
+            claim_read_only=trial_read_only,
             excluded_nodes=excluded_nodes,
         ),
     }
@@ -601,10 +660,8 @@ def render_job(
         raise BackendRequestError(
             "Kubernetes workloads require an agent image"
         )
-    if (
-        TERMINATION_LOG_ENV in profile.nonsecret_environment
-        or TERMINATION_LOG_ENV in profile.secret_environment
-    ):
+    secret_environment = _effective_secret_environment(workload, profile)
+    if TERMINATION_LOG_ENV in profile.nonsecret_environment:
         raise BackendRequestError(
             f"{TERMINATION_LOG_ENV} is reserved by Brunner"
         )
@@ -645,7 +702,7 @@ def render_job(
                 }
             },
         }
-        for name, reference in sorted(profile.secret_environment.items())
+        for name, reference in sorted(secret_environment.items())
     )
     environment.append(
         {
@@ -757,7 +814,7 @@ def render_job(
                 "brunner.evaluation_cli",
                 "/brunner/trial",
             ],
-            "workingDir": "/brunner/trial/workspace",
+            "workingDir": "/tmp",
             "env": [
                 {
                     "name": "BRUNNER_EVALUATION_SPEC",
@@ -770,6 +827,14 @@ def render_job(
                 {
                     "name": TERMINATION_LOG_ENV,
                     "value": "/dev/termination-log",
+                },
+                {
+                    "name": "PYTHONSAFEPATH",
+                    "value": "1",
+                },
+                {
+                    "name": "PYTHONNOUSERSITE",
+                    "value": "1",
                 },
             ],
             "securityContext": {
@@ -872,6 +937,7 @@ class KubernetesBackend:
         self.profile = profile
         self.kubectl = kubectl
         self._preflight_complete = False
+        self._secret_preflight_complete = False
         self._proxy_url: str | None = None
 
     def prepare_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
@@ -1292,7 +1358,21 @@ class KubernetesBackend:
             self.profile.namespace,
             check=False,
         )
-        if result.returncode or result.stdout.strip().lower() != "yes":
+        if result.returncode:
+            raise self._error(
+                (
+                    "auth",
+                    "can-i",
+                    verb,
+                    resource,
+                    "-n",
+                    self.profile.namespace,
+                ),
+                result.returncode,
+                result.stdout.encode(),
+                result.stderr.encode(),
+            )
+        if result.stdout.strip().lower() != "yes":
             message = (result.stderr or result.stdout).strip()
             raise BackendRequestError(
                 "Kubernetes preflight permission denied: "
@@ -1301,6 +1381,7 @@ class KubernetesBackend:
             )
 
     def _ensure_preflight(self, workload: WorkloadSpec) -> None:
+        _effective_secret_environment(workload, self.profile)
         if not self.profile.preflight_enabled:
             self._ensure_managed_proxy()
             return
@@ -1369,6 +1450,106 @@ class KubernetesBackend:
         self._ensure_managed_proxy()
         self._preflight_complete = True
 
+    def _ensure_workload_secrets(self, workload: WorkloadSpec) -> None:
+        secret_environment = _effective_secret_environment(
+            workload,
+            self.profile,
+        )
+        if not secret_environment:
+            return
+        if (
+            self.profile.preflight_enabled
+            and not self._secret_preflight_complete
+        ):
+            for verb in ("get", "create", "update"):
+                self._check_permission(verb, "secrets")
+            self._secret_preflight_complete = True
+
+        references: dict[str, dict[str, str]] = {}
+        sources: dict[tuple[str, str], str] = {}
+        for environment_name, (secret_name, secret_key) in sorted(
+            secret_environment.items()
+        ):
+            source_key = (secret_name, secret_key)
+            previous_source = sources.setdefault(
+                source_key,
+                environment_name,
+            )
+            if previous_source != environment_name:
+                raise BackendConfigurationError(
+                    "multiple agent environment variables reference the same "
+                    "Kubernetes Secret key and cannot be provisioned "
+                    f"unambiguously: {secret_name}/{secret_key}"
+                )
+            references.setdefault(secret_name, {})[
+                secret_key
+            ] = environment_name
+
+        for secret_name, keys in sorted(references.items()):
+            existing = self._get("secret", secret_name)
+            existing_data: dict[str, Any] = {}
+            if existing is not None:
+                value = existing.get("data", {})
+                if not isinstance(value, dict):
+                    raise BackendConfigurationError(
+                        f"Kubernetes Secret {secret_name} has malformed data"
+                    )
+                existing_data = value
+            missing = {
+                secret_key: environment_name
+                for secret_key, environment_name in keys.items()
+                if secret_key not in existing_data
+            }
+            if not missing:
+                continue
+            unavailable = sorted(
+                environment_name
+                for environment_name in missing.values()
+                if not os.environ.get(environment_name)
+            )
+            if unavailable:
+                missing_keys = ", ".join(sorted(missing))
+                raise BackendConfigurationError(
+                    f"Kubernetes Secret {secret_name} is absent or missing "
+                    f"keys [{missing_keys}], and the orchestrator environment "
+                    "does not provide non-empty variables: "
+                    + ", ".join(unavailable)
+                )
+            encoded_missing = {
+                secret_key: base64.b64encode(
+                    os.environ[environment_name].encode()
+                ).decode()
+                for secret_key, environment_name in sorted(missing.items())
+            }
+            if existing is None:
+                resource = {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": secret_name,
+                        "namespace": self.profile.namespace,
+                    },
+                    "type": "Opaque",
+                    "data": encoded_missing,
+                }
+                operation = "create"
+            else:
+                resource = dict(existing)
+                resource["data"] = {
+                    **existing_data,
+                    **encoded_missing,
+                }
+                metadata = dict(resource.get("metadata", {}))
+                metadata.pop("managedFields", None)
+                resource["metadata"] = metadata
+                operation = "replace"
+            self._run(
+                operation,
+                "-f",
+                "-",
+                input_value=json.dumps(resource),
+            )
+
     def _ensure_managed_proxy(self) -> None:
         if self.profile.unsafe_disable_network_policy_for_tests:
             self._proxy_url = None
@@ -1425,7 +1606,7 @@ class KubernetesBackend:
         except ValueError as error:
             raise BackendRequestError(str(error)) from error
 
-    def _validate_exclusive_pipeline_egress(
+    def _validate_exclusive_workload_networking(
         self,
         workload: WorkloadSpec,
         labels: dict[str, str],
@@ -1437,11 +1618,23 @@ class KubernetesBackend:
             _network_policy_name(workload, "-network"),
             _network_policy_name(workload, "-helpers"),
         }
-        pipeline_labels = {
-            **labels,
-            "dev.brunner/role": PIPELINE_ROLE,
+        workload_name = str(labels["dev.brunner/workload"])
+        role_labels = {
+            PIPELINE_ROLE: {
+                **labels,
+                "dev.brunner/role": PIPELINE_ROLE,
+            },
+            "trial-stager": {
+                **labels,
+                "dev.brunner/role": "trial-stager",
+            },
+            "artifact-reader": {
+                "app.kubernetes.io/name": "brunner",
+                "dev.brunner/workload": workload_name,
+                "dev.brunner/role": "artifact-reader",
+            },
         }
-        conflicts = []
+        conflicts: list[str] = []
         for policy in value.get("items", ()):
             if not isinstance(policy, dict):
                 raise BackendRequestError(
@@ -1468,10 +1661,14 @@ class KubernetesBackend:
                     f"NetworkPolicy {name} has a malformed podSelector"
                 )
             try:
-                matches = _selector_matches_labels(
-                    selector,
-                    pipeline_labels,
-                )
+                matching_roles = [
+                    role
+                    for role, candidate_labels in role_labels.items()
+                    if _selector_matches_labels(
+                        selector,
+                        candidate_labels,
+                    )
+                ]
             except ValueError as error:
                 raise BackendRequestError(
                     f"cannot evaluate NetworkPolicy {name}: {error}"
@@ -1481,21 +1678,33 @@ class KubernetesBackend:
                 raise BackendRequestError(
                     f"NetworkPolicy {name} has malformed policyTypes"
                 )
+            controls_ingress = "Ingress" in policy_types or not policy_types
             controls_egress = "Egress" in policy_types or (
                 not policy_types and "egress" in spec
             )
+            ingress = spec.get("ingress", [])
+            if not isinstance(ingress, list):
+                raise BackendRequestError(
+                    f"NetworkPolicy {name} has malformed ingress rules"
+                )
             egress = spec.get("egress", [])
             if not isinstance(egress, list):
                 raise BackendRequestError(
                     f"NetworkPolicy {name} has malformed egress rules"
                 )
-            if matches and controls_egress and egress:
-                conflicts.append(name)
+            if matching_roles and controls_ingress and ingress:
+                conflicts.append(
+                    f"{name} (ingress: {', '.join(matching_roles)})"
+                )
+            if matching_roles and controls_egress and egress:
+                conflicts.append(
+                    f"{name} (egress: {', '.join(matching_roles)})"
+                )
         if conflicts:
             raise BackendRequestError(
-                "Brunner cannot guarantee exclusive pipeline egress because "
-                "other NetworkPolicies with nonempty egress rules select the "
-                "agent Pod: " + ", ".join(sorted(conflicts))
+                "Brunner cannot guarantee exclusive workload networking "
+                "because other NetworkPolicies with nonempty rules select "
+                "pipeline or helper Pods: " + ", ".join(sorted(conflicts))
             )
 
     def _stage_trial(
@@ -1772,6 +1981,7 @@ class KubernetesBackend:
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         workload = self.prepare_workload(workload)
         workload.validate()
+        self._ensure_workload_secrets(workload)
         self._ensure_preflight(workload)
         image = workload.image
         if not image:
@@ -1795,7 +2005,7 @@ class KubernetesBackend:
             "dev.brunner/workload": job_name,
             **workload.labels,
         }
-        self._validate_exclusive_pipeline_egress(workload, labels)
+        self._validate_exclusive_workload_networking(workload, labels)
         for policy in render_network_policies(
             workload,
             self.profile,
@@ -1965,6 +2175,7 @@ class KubernetesBackend:
                 ),
                 "--overwrite",
             )
+        self._validate_exclusive_workload_networking(workload, labels)
         self._apply(
             render_job(
                 job_name,
@@ -1990,6 +2201,7 @@ class KubernetesBackend:
     ) -> BackendHandle:
         workload = self.prepare_workload(workload)
         workload.validate()
+        self._ensure_workload_secrets(workload)
         self._ensure_preflight(workload)
         if generation < 1:
             raise BackendRequestError(
@@ -2028,7 +2240,7 @@ class KubernetesBackend:
             "dev.brunner/restart-generation": str(generation),
             **workload.labels,
         }
-        self._validate_exclusive_pipeline_egress(workload, labels)
+        self._validate_exclusive_workload_networking(workload, labels)
         pvc = self._get("pvc", claim_name)
         if pvc is None:
             raise BackendRequestError(
@@ -2092,6 +2304,7 @@ class KubernetesBackend:
             )
 
         self._delete_and_wait("job", handle.native_id)
+        self._validate_exclusive_workload_networking(workload, labels)
         self._apply(
             render_job(
                 job_name,
@@ -2580,6 +2793,7 @@ class KubernetesBackend:
                 image,
                 self.profile,
                 labels,
+                trial_read_only=True,
                 excluded_nodes=excluded_nodes,
             )
         )

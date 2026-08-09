@@ -30,6 +30,7 @@ from brunner.definition import ArtifactPolicy
 from brunner.dashboard import write_campaign_dashboard
 from brunner.errors import (
     ArtifactTransferError,
+    BackendConfigurationError,
     BackendConnectivityError,
     BackendRequestError,
 )
@@ -258,6 +259,18 @@ class RejectedSubmissionBackend(ImmediateBackend):
     def submit(self, workload: WorkloadSpec) -> BackendHandle:
         self.submit_calls += 1
         raise BackendRequestError("workload violates cluster policy")
+
+
+class InvalidBackendConfiguration(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_calls = 0
+
+    def submit(self, workload: WorkloadSpec) -> BackendHandle:
+        self.submit_calls += 1
+        raise BackendConfigurationError(
+            "required orchestrator secret is unavailable"
+        )
 
 
 class TransferRetryBackend(ImmediateBackend):
@@ -881,6 +894,38 @@ def test_campaign_bounds_deterministic_submission_retries(
     assert failed["trials"][0]["attempts"]["submission"] == 2
     assert failed["trials"][0]["failure"]["cleanup_required"] is True
     assert backend.submit_calls == 2
+
+
+def test_campaign_does_not_retry_backend_configuration_failure(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = InvalidBackendConfiguration()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="invalid-backend-configuration",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("run-a", "codex", "model-a"),),
+            submission_retry_seconds=0,
+            submission_max_attempts=10,
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+
+    state = runner.advance()
+
+    entry = state["trials"][0]
+    assert state["status"] == "attention_required"
+    assert entry["phase"] == "attention_required"
+    assert entry["attempts"]["submission"] == 1
+    assert entry["failure"]["domain"] == "configuration"
+    assert entry["failure"]["reason"] == "BackendConfigurationFailed"
+    assert entry["failure"]["retryable"] is False
+    assert backend.submit_calls == 1
 
 
 def test_campaign_resumes_cleanup_after_connectivity_loss(
@@ -1763,6 +1808,63 @@ def test_campaign_workload_includes_agent_and_sterling_evaluator(
     assert workload.evaluation.image == definition.evaluation.image
     assert workload.evaluation.command == definition.evaluation.command
     assert workload.evaluation.timeout_seconds == 90
+
+
+def test_default_workload_factory_selects_provider_secret(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    codex_trial = CampaignTrial("codex", "codex", "model-a")
+    claude_trial = CampaignTrial("claude", "claude", "model-b")
+    plan = CampaignPlan(
+        campaign_id="provider-secrets",
+        root=tmp_path / "campaign",
+        trials=(codex_trial, claude_trial),
+        provider_secret_environment={
+            "codex": {
+                "OPENAI_API_KEY": (
+                    "codex-credentials",
+                    "OPENAI_API_KEY",
+                )
+            },
+            "claude": {
+                "CLAUDE_CODE_OAUTH_TOKEN": (
+                    "claude-credentials",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                )
+            },
+        },
+    )
+
+    codex = default_workload_factory(
+        tmp_path,
+        codex_trial,
+        plan,
+        definition,
+        "kubernetes",
+    )
+    claude = default_workload_factory(
+        tmp_path,
+        claude_trial,
+        plan,
+        definition,
+        "kubernetes",
+    )
+
+    assert codex.secret_environment == {
+        "OPENAI_API_KEY": (
+            "codex-credentials",
+            "OPENAI_API_KEY",
+        )
+    }
+    assert claude.secret_environment == {
+        "CLAUDE_CODE_OAUTH_TOKEN": (
+            "claude-credentials",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        )
+    }
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in codex.secret_environment
+    assert "OPENAI_API_KEY" not in claude.secret_environment
 
 
 def test_default_workload_factory_preserves_burst_resources(

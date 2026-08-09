@@ -170,6 +170,240 @@ def test_kubernetes_resources_preserve_secret_boundary(
     assert expression["values"] == ["node-a"]
 
 
+def test_kubernetes_job_uses_only_workload_provider_secret(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    profile = KubernetesProfile(
+        agent_image="agent:latest",
+        secret_environment={
+            "SHARED_CERTIFICATE": ("shared-settings", "certificate")
+        },
+    )
+    workload = WorkloadSpec(
+        workload_id="codex",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "OPENAI_API_KEY": ("codex-credentials", "OPENAI_API_KEY")
+        },
+    )
+
+    job = render_job(
+        "codex",
+        "codex-data",
+        workload,
+        profile,
+        {"app.kubernetes.io/name": "brunner"},
+    )
+
+    encoded = json.dumps(job)
+    assert "codex-credentials" in encoded
+    assert "OPENAI_API_KEY" in encoded
+    assert "shared-settings" in encoded
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in encoded
+    assert "claude-credentials" not in encoded
+
+
+def test_workload_secret_references_affect_identity_without_values(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    baseline = WorkloadSpec(
+        workload_id="codex",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+    )
+    credentialed = WorkloadSpec(
+        workload_id="codex",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "OPENAI_API_KEY": ("codex-credentials", "api-key")
+        },
+    )
+
+    assert baseline.sha256 != credentialed.sha256
+
+
+def test_kubernetes_creates_missing_workload_secret_from_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    workload = WorkloadSpec(
+        workload_id="codex",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "OPENAI_API_KEY": ("codex-credentials", "api-key")
+        },
+    )
+    commands: list[tuple[tuple[str, ...], str | None]] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "local-secret-value")
+    monkeypatch.setattr(backend, "_get", lambda *args, **kwargs: None)
+
+    def run(
+        *arguments: str,
+        input_value: str | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append((arguments, input_value))
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    backend._ensure_workload_secrets(workload)
+
+    assert commands[0][0] == ("create", "-f", "-")
+    assert "local-secret-value" not in commands[0][0]
+    assert json.loads(commands[0][1] or "") == {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "codex-credentials",
+            "namespace": "benchmarks",
+        },
+        "type": "Opaque",
+        "data": {"api-key": "bG9jYWwtc2VjcmV0LXZhbHVl"},
+    }
+
+
+def test_kubernetes_reuses_existing_secret_without_local_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(KubernetesProfile())
+    workload = WorkloadSpec(
+        workload_id="claude",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "CLAUDE_CODE_OAUTH_TOKEN": (
+                "claude-credentials",
+                "oauth-token",
+            )
+        },
+    )
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda *args, **kwargs: {"data": {"oauth-token": "redacted"}},
+    )
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *args, **kwargs: pytest.fail(
+            "existing Secret must be reused"
+        ),
+    )
+
+    backend._ensure_workload_secrets(workload)
+
+
+def test_kubernetes_completes_missing_secret_key_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    workload = WorkloadSpec(
+        workload_id="codex",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "OPENAI_API_KEY": ("provider-credentials", "openai")
+        },
+    )
+    existing = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "provider-credentials",
+            "namespace": "benchmarks",
+            "resourceVersion": "42",
+            "managedFields": [{"manager": "kubectl"}],
+        },
+        "type": "Opaque",
+        "data": {"claude": "ZXhpc3Rpbmc="},
+    }
+    commands: list[tuple[tuple[str, ...], str | None]] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "new-value")
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda *args, **kwargs: existing,
+    )
+
+    def run(
+        *arguments: str,
+        input_value: str | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append((arguments, input_value))
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(backend, "_run", run)
+
+    backend._ensure_workload_secrets(workload)
+
+    assert commands[0][0] == ("replace", "-f", "-")
+    resource = json.loads(commands[0][1] or "")
+    assert resource["data"] == {
+        "claude": "ZXhpc3Rpbmc=",
+        "openai": "bmV3LXZhbHVl",
+    }
+    assert "managedFields" not in resource["metadata"]
+    assert resource["metadata"]["resourceVersion"] == "42"
+
+
+def test_kubernetes_missing_secret_requires_orchestrator_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(KubernetesProfile())
+    workload = WorkloadSpec(
+        workload_id="claude",
+        trial=trial,
+        command=("brunner-worker",),
+        timeout_seconds=60,
+        secret_environment={
+            "CLAUDE_CODE_OAUTH_TOKEN": (
+                "claude-credentials",
+                "oauth-token",
+            )
+        },
+    )
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(backend, "_get", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        BackendRequestError,
+        match="CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        backend._ensure_workload_secrets(workload)
+
+
 def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
     tmp_path: Path,
 ) -> None:
@@ -228,6 +462,8 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
         "brunner.evaluation_cli",
         "/brunner/trial",
     ]
+    assert evaluator["workingDir"] == "/tmp"
+    assert pod["enableServiceLinks"] is False
     agent_environment = {item["name"] for item in agent["env"]}
     evaluator_environment = {
         item["name"] for item in evaluator["env"]
@@ -236,6 +472,8 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
     assert "HTTPS_PROXY" in agent_environment
     assert "OPENAI_API_KEY" not in evaluator_environment
     assert "HTTPS_PROXY" not in evaluator_environment
+    assert "PYTHONSAFEPATH" in evaluator_environment
+    assert "PYTHONNOUSERSITE" in evaluator_environment
     encoded_spec = next(
         item["value"]
         for item in evaluator["env"]
@@ -566,6 +804,11 @@ def test_kubernetes_collection_retries_chunk_on_same_reader(
         return payload[offset : offset + count]
 
     monkeypatch.setattr(backend, "_read_remote", read_remote)
+    monkeypatch.setattr(
+        backend,
+        "_probe_backend_reachable",
+        lambda: True,
+    )
     destination = tmp_path / "collected"
 
     backend._collect_from_reader(
@@ -741,6 +984,27 @@ def test_kubernetes_helper_pod_uses_neutral_working_directory() -> None:
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
         "readOnlyRootFilesystem": True,
+    }
+
+
+def test_kubernetes_artifact_reader_mounts_trial_read_only() -> None:
+    helper = render_helper_pod(
+        "case-1-reader",
+        "case-1-data",
+        "reader:latest",
+        KubernetesProfile(namespace="benchmarks"),
+        {"dev.brunner/role": "artifact-reader"},
+        trial_read_only=True,
+    )
+
+    assert helper["spec"]["containers"][0]["volumeMounts"][0] == {
+        "name": "trial",
+        "mountPath": "/brunner/trial",
+        "readOnly": True,
+    }
+    assert helper["spec"]["volumes"][0]["persistentVolumeClaim"] == {
+        "claimName": "case-1-data",
+        "readOnly": True,
     }
 
 

@@ -113,6 +113,8 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
         ]
         == "pipeline"
     )
+    assert pipeline["spec"]["policyTypes"] == ["Ingress", "Egress"]
+    assert pipeline["spec"]["ingress"] == []
     assert len(pipeline["spec"]["egress"]) == 1
     assert pipeline["spec"]["egress"][0]["ports"] == [
         {"protocol": "TCP", "port": 3128},
@@ -124,6 +126,8 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
         == MANAGED_PROXY_LABELS
     )
     assert '"port": 53' not in json.dumps(pipeline)
+    assert helpers["spec"]["policyTypes"] == ["Ingress", "Egress"]
+    assert helpers["spec"]["ingress"] == []
     assert helpers["spec"]["egress"] == []
     assert (
         job["spec"]["template"]["metadata"]["labels"][
@@ -296,7 +300,7 @@ def test_proxy_rollout_failure_aborts_with_diagnostics(
         backend._ensure_managed_proxy()
 
 
-def test_additive_egress_policy_matching_pipeline_is_rejected(
+def test_additive_network_policy_matching_workload_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -345,10 +349,57 @@ def test_additive_egress_policy_matching_pipeline_is_rejected(
         BackendRequestError,
         match="namespace-wide-egress",
     ):
-        backend._validate_exclusive_pipeline_egress(workload, labels)
+        backend._validate_exclusive_workload_networking(workload, labels)
 
     policies["items"][0]["spec"]["egress"] = []
-    backend._validate_exclusive_pipeline_egress(workload, labels)
+    backend._validate_exclusive_workload_networking(workload, labels)
+
+    policies["items"][0] = {
+        "metadata": {"name": "reader-ingress"},
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "dev.brunner/role": "artifact-reader",
+                }
+            },
+            "policyTypes": ["Ingress"],
+            "ingress": [{"from": [{"podSelector": {}}]}],
+        },
+    }
+    with pytest.raises(
+        BackendRequestError,
+        match=r"reader-ingress \(ingress: artifact-reader\)",
+    ):
+        backend._validate_exclusive_workload_networking(workload, labels)
+
+    policies["items"][0] = {
+        "metadata": {"name": "stager-egress"},
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "dev.brunner/role": "trial-stager",
+                }
+            },
+            "policyTypes": ["Egress"],
+            "egress": [{"to": [{"podSelector": {}}]}],
+        },
+    }
+    with pytest.raises(
+        BackendRequestError,
+        match=r"stager-egress \(egress: trial-stager\)",
+    ):
+        backend._validate_exclusive_workload_networking(workload, labels)
+
+    policies["items"][0] = {
+        "metadata": {"name": "namespace-default-deny"},
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [],
+            "egress": [],
+        },
+    }
+    backend._validate_exclusive_workload_networking(workload, labels)
 
 
 def test_network_policy_is_applied_before_staging_or_job(

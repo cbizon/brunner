@@ -71,6 +71,7 @@ def main() -> None:
                 if spec.reference_manifest_path is not None
                 else None
             ),
+            working_directory_root=Path("/tmp"),
         )
         failure = result.get("failure")
         summary = {
