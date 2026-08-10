@@ -600,7 +600,7 @@ def build_campaign(definition, contract):
             "0123456789abcdef0123456789abcdef"
             "0123456789abcdef0123456789abcdef"
         ),
-        cpu_request="2",
+        cpu_request="1.5",
         cpu_limit="8",
         memory_request="8Gi",
         memory_limit="32Gi",
@@ -630,10 +630,11 @@ def build_campaign(definition, contract):
         KubernetesBackend(
             KubernetesProfile(
                 namespace="bizon",
+                network_isolation_mode="controlled-egress",
                 agent_image=plan.backend_image,
                 artifact_reader_image=plan.backend_image,
                 reference_claim_name="my-benchmark-reference",
-                storage_size="250Gi",
+                storage_size="50Gi",
                 storage_class_name="sterling-storage-class",
                 image_pull_secrets=("registry-credentials",),
                 proxy_image=(
@@ -699,14 +700,26 @@ numeric Service ClusterIP only into the agent, so the pipeline does not receive
 DNS access. Squid alone may query cluster DNS and connect to external TCP 443,
 and its deny-by-default ACL permits only OpenAI, Azure OpenAI, Anthropic, and
 Claude domains. Brunner rejects another standard Kubernetes NetworkPolicy with
-nonempty ingress or egress rules that also selects a pipeline, stager, or
-artifact-reader Pod, because permissions are additive. It checks before helper
-creation and again immediately before Job creation. Use a dedicated Sterling
-namespace where RBAC or admission policy prevents other principals from
-creating or changing NetworkPolicies after validation. Do not place proxy
-variables in `nonsecret_environment`. Sterling's CNI must enforce Kubernetes
-NetworkPolicy; Brunner cannot infer enforcement from successful object
-creation.
+nonempty egress rules that also selects a pipeline, stager, or artifact-reader
+Pod, because permissions are additive. The default
+`network_isolation_mode="strict"` also rejects matching nonempty ingress rules.
+Use `network_isolation_mode="controlled-egress"` only for an
+administrator-owned personal namespace with an accepted baseline ingress
+policy. It preserves exclusive egress enforcement but does not claim that
+Brunner Pods are ingress-isolated. Brunner checks before creating the staging
+helper and again immediately before Job creation, and records the mode in the
+Job and backend handle so adoption or restart cannot change it silently.
+
+The example uses `controlled-egress` because its administrator-owned namespace
+has an accepted baseline ingress policy. Before using this mode, inspect the
+namespace's effective NetworkPolicies and verify that no additive egress rule
+selects Brunner Pods. Also inspect ResourceQuota and LimitRange values and
+reserve capacity for proxy overhead, concurrent trial PVCs, and retained failed
+storage when setting requests and `max_parallel`.
+
+Do not place proxy variables in `nonsecret_environment`. Sterling's CNI must
+enforce Kubernetes NetworkPolicy; Brunner cannot infer enforcement from
+successful object creation.
 
 The stager clears an incomplete trial PVC before copying, verifies every
 remote challenge file against the local stage inventory, rejects remote

@@ -80,7 +80,11 @@ Production profiles require digest-pinned agent, evaluator, reader, and Squid
 images. Brunner installs the proxy and its deny-by-default provider allowlist,
 then applies workload NetworkPolicies before staging. Pipeline Pods may reach
 only the proxy's numeric ClusterIP and cannot issue DNS queries; helper Pods
-have no egress. Squid alone receives DNS and outbound TCP 443 access.
+have no egress. Squid alone receives DNS and outbound TCP 443 access. Strict
+network isolation rejects additive ingress or egress policies selecting
+Brunner Pods. A controlled personal namespace may instead use
+`network_isolation_mode="controlled-egress"` to tolerate its baseline ingress
+policy while preserving exclusive egress enforcement.
 
 Evaluator-consumed submission artifacts are not copied back by default.
 `ArtifactPolicy.collect_evaluated_artifacts=True` is an explicit opt-in, and

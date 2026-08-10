@@ -201,14 +201,26 @@ all. Pipeline, stager, and artifact-reader Pods deny ingress; stager and
 artifact-reader Pods also have no egress. Generic environment mappings cannot
 override proxy variables. The Squid image and ACL configuration digest are
 recorded in the Job and persisted backend handle; resume and restart reject
-identity drift. Because Kubernetes policies are additive, Brunner lists
-existing namespace NetworkPolicies before helper or pipeline creation and
-again immediately before Job creation. It refuses to launch when another
-policy with nonempty ingress or egress rules selects any Brunner workload Pod.
-Sterling must use a dedicated namespace where RBAC or admission policy prevents
-other principals from adding NetworkPolicies after validation, and a CNI that
-enforces Kubernetes NetworkPolicy. Successful API creation alone does not
-prove packet-level enforcement.
+identity drift.
+
+Because Kubernetes policies are additive, Brunner lists existing namespace
+NetworkPolicies before creating the staging helper and again immediately
+before Job creation. The default `strict` isolation mode refuses to launch
+when another policy with nonempty ingress or egress rules selects any Brunner
+workload Pod. `controlled-egress` mode is available for an administrator-owned
+personal namespace whose baseline policy permits ingress: it tolerates
+additive ingress while continuing to reject every additive egress rule that
+selects a pipeline or helper Pod. Brunner still renders its own empty ingress
+rules in that mode, but does not claim exclusive ingress because the namespace
+policy remains additive.
+
+The isolation mode is recorded in the Job and backend handle; adoption and
+restart reject mode drift. A controlled namespace must limit pod and
+NetworkPolicy administration to trusted principals. Shared or multi-tenant
+namespaces require `strict` mode plus RBAC or admission controls that prevent
+other principals from changing matching policies after validation. Sterling
+must use a CNI that enforces Kubernetes NetworkPolicy; successful API creation
+alone does not prove packet-level enforcement.
 
 Each remote Job runs `python -m brunner.agent_cli` in an agent init container.
 After it produces a terminal provider result, Kubernetes starts the trusted
