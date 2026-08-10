@@ -495,6 +495,7 @@ def test_kubernetes_pipeline_runs_evaluator_after_agent_without_secrets(
     assert handle.metadata["evaluation_results_path"] == (
         "evaluation/custom-results.json"
     )
+    assert handle.metadata["network_isolation_mode"] == "strict"
     assert {
         mount["name"]: mount
         for mount in evaluator["volumeMounts"]
@@ -1937,6 +1938,44 @@ def test_kubernetes_restart_reuses_pvc_without_restaging(
     assert restarted.native_id.endswith("-r1")
     assert restarted.metadata["claim_name"] == claim_name
     assert restarted.metadata["restart_generation"] == 1
+
+
+def test_kubernetes_restart_rejects_network_isolation_mode_change(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    _write_stage_marker(trial)
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    previous = BackendHandle(
+        backend="kubernetes",
+        workload_id="case-1",
+        native_id="case-1",
+        trial=trial,
+        metadata={
+            "claim_name": "case-1-data",
+            "egress_proxy_sha256": None,
+            "network_isolation_mode": "strict",
+        },
+    )
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="bizon",
+            network_isolation_mode="controlled-egress",
+        )
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="different network isolation mode",
+    ):
+        backend.restart(previous, workload, 1)
 
 
 @pytest.mark.parametrize("backend_type", ["container", "kubernetes"])

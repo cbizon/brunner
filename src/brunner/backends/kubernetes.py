@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from brunner import BRUNNER_RUNTIME_PROTOCOL
 from brunner.artifacts import (
@@ -93,8 +93,22 @@ CHALLENGE_SHA256_ANNOTATION = "dev.brunner/challenge-sha256"
 WORKLOAD_SHA256_ANNOTATION = "dev.brunner/workload-sha256"
 RUNTIME_PROTOCOL_ANNOTATION = "dev.brunner/runtime-protocol"
 EGRESS_PROXY_SHA256_ANNOTATION = "dev.brunner/egress-proxy-sha256"
+NETWORK_ISOLATION_MODE_ANNOTATION = (
+    "dev.brunner/network-isolation-mode"
+)
 REFERENCE_MANIFEST_SHA256_ANNOTATION = (
     "dev.brunner/reference-manifest-sha256"
+)
+NetworkIsolationMode = Literal["strict", "controlled-egress"]
+STRICT_NETWORK_ISOLATION: Literal["strict"] = "strict"
+CONTROLLED_EGRESS_NETWORK_ISOLATION: Literal["controlled-egress"] = (
+    "controlled-egress"
+)
+NETWORK_ISOLATION_MODES = frozenset(
+    {
+        STRICT_NETWORK_ISOLATION,
+        CONTROLLED_EGRESS_NETWORK_ISOLATION,
+    }
 )
 PIPELINE_ROLE = "pipeline"
 HELPER_ROLES = ("trial-stager", "artifact-reader")
@@ -145,6 +159,7 @@ def _now() -> str:
 @dataclass(frozen=True)
 class KubernetesProfile:
     namespace: str = "default"
+    network_isolation_mode: NetworkIsolationMode = STRICT_NETWORK_ISOLATION
     agent_image: str | None = None
     artifact_reader_image: str | None = None
     reference_claim_name: str | None = None
@@ -186,6 +201,11 @@ class KubernetesProfile:
             self.secret_environment,
             owner="Kubernetes profile",
         )
+        if self.network_isolation_mode not in NETWORK_ISOLATION_MODES:
+            raise ValueError(
+                "Kubernetes network_isolation_mode must be one of: "
+                + ", ".join(sorted(NETWORK_ISOLATION_MODES))
+            )
         if self.artifact_chunk_bytes < 1:
             raise ValueError(
                 "Kubernetes artifact_chunk_bytes must be positive"
@@ -891,6 +911,9 @@ def render_job(
     annotations = {
         WORKLOAD_SHA256_ANNOTATION: workload_sha256(workload),
         RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+        NETWORK_ISOLATION_MODE_ANNOTATION: (
+            profile.network_isolation_mode
+        ),
     }
     if not profile.unsafe_disable_network_policy_for_tests:
         if not profile.proxy_image:
@@ -1692,7 +1715,13 @@ class KubernetesBackend:
                 raise BackendRequestError(
                     f"NetworkPolicy {name} has malformed egress rules"
                 )
-            if matching_roles and controls_ingress and ingress:
+            if (
+                self.profile.network_isolation_mode
+                == STRICT_NETWORK_ISOLATION
+                and matching_roles
+                and controls_ingress
+                and ingress
+            ):
                 conflicts.append(
                     f"{name} (ingress: {', '.join(matching_roles)})"
                 )
@@ -1702,9 +1731,11 @@ class KubernetesBackend:
                 )
         if conflicts:
             raise BackendRequestError(
-                "Brunner cannot guarantee exclusive workload networking "
-                "because other NetworkPolicies with nonempty rules select "
-                "pipeline or helper Pods: " + ", ".join(sorted(conflicts))
+                "Brunner cannot guarantee "
+                f"{self.profile.network_isolation_mode} workload "
+                "networking because other NetworkPolicies with nonempty "
+                "rules select pipeline or helper Pods: "
+                + ", ".join(sorted(conflicts))
             )
 
     def _stage_trial(
@@ -1834,6 +1865,9 @@ class KubernetesBackend:
                 ],
                 "runtime_protocol": BRUNNER_RUNTIME_PROTOCOL,
                 "egress_proxy_sha256": egress_proxy_sha256,
+                "network_isolation_mode": (
+                    self.profile.network_isolation_mode
+                ),
                 "evaluation_results_path": (
                     workload.evaluation.results_path
                     if workload.evaluation is not None
@@ -1853,6 +1887,7 @@ class KubernetesBackend:
         workload_sha256_value: str,
         challenge_sha256: str,
         egress_proxy_sha256: str | None,
+        network_isolation_mode: str,
     ) -> None:
         labels = job.get("metadata", {}).get("labels", {})
         if labels.get("dev.brunner/workload") != (
@@ -1869,18 +1904,24 @@ class KubernetesBackend:
         expected_job_annotations = {
             WORKLOAD_SHA256_ANNOTATION: workload_sha256_value,
             RUNTIME_PROTOCOL_ANNOTATION: BRUNNER_RUNTIME_PROTOCOL,
+            NETWORK_ISOLATION_MODE_ANNOTATION: network_isolation_mode,
         }
         if egress_proxy_sha256 is not None:
             expected_job_annotations[EGRESS_PROXY_SHA256_ANNOTATION] = (
                 egress_proxy_sha256
             )
+        actual_job_annotations = dict(job_annotations)
+        actual_job_annotations.setdefault(
+            NETWORK_ISOLATION_MODE_ANNOTATION,
+            STRICT_NETWORK_ISOLATION,
+        )
         job_mismatches = {
             key: {
                 "expected": expected,
-                "actual": job_annotations.get(key),
+                "actual": actual_job_annotations.get(key),
             }
             for key, expected in expected_job_annotations.items()
-            if job_annotations.get(key) != expected
+            if actual_job_annotations.get(key) != expected
         }
         if job_mismatches:
             raise BackendRequestError(
@@ -2035,6 +2076,9 @@ class KubernetesBackend:
                     if self.profile.proxy_image
                     else None
                 ),
+                "network_isolation_mode": (
+                    self.profile.network_isolation_mode
+                ),
             }
             actual_handle = {
                 "native_id": handle.native_id,
@@ -2049,9 +2093,16 @@ class KubernetesBackend:
                         "challenge_sha256",
                         "runtime_protocol",
                         "egress_proxy_sha256",
+                        "network_isolation_mode",
                     )
                 },
             }
+            actual_handle["network_isolation_mode"] = (
+                handle.metadata.get(
+                    "network_isolation_mode",
+                    STRICT_NETWORK_ISOLATION,
+                )
+            )
             mismatches = {
                 key: {
                     "expected": expected,
@@ -2087,6 +2138,9 @@ class KubernetesBackend:
                     egress_proxy_sha256=expected_handle[
                         "egress_proxy_sha256"
                     ],
+                    network_isolation_mode=(
+                        self.profile.network_isolation_mode
+                    ),
                 )
             return handle
 
@@ -2106,6 +2160,9 @@ class KubernetesBackend:
                     managed_proxy_sha256(self.profile.proxy_image)
                     if self.profile.proxy_image
                     else None
+                ),
+                network_isolation_mode=(
+                    self.profile.network_isolation_mode
                 ),
             )
             handle = self._submission_handle(
@@ -2219,6 +2276,17 @@ class KubernetesBackend:
                 "cannot restart Kubernetes workload with a different "
                 "managed egress proxy identity"
             )
+        handle_isolation_mode = handle.metadata.get(
+            "network_isolation_mode",
+            STRICT_NETWORK_ISOLATION,
+        )
+        if handle_isolation_mode != self.profile.network_isolation_mode:
+            raise BackendRequestError(
+                "cannot restart Kubernetes workload with a different "
+                "network isolation mode: "
+                f"{handle_isolation_mode!r} != "
+                f"{self.profile.network_isolation_mode!r}"
+            )
         image = workload.image
         if not image:
             raise BackendRequestError(
@@ -2290,6 +2358,9 @@ class KubernetesBackend:
                 workload_sha256_value=workload.sha256,
                 challenge_sha256=str(stage_report["challenge_sha256"]),
                 egress_proxy_sha256=expected_proxy_sha256,
+                network_isolation_mode=(
+                    self.profile.network_isolation_mode
+                ),
             )
             restarted = self._submission_handle(
                 workload,

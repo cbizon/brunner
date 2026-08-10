@@ -21,6 +21,7 @@ from brunner.backends.base import (
 )
 from brunner.backends.kubernetes import (
     EGRESS_PROXY_SHA256_ANNOTATION,
+    NETWORK_ISOLATION_MODE_ANNOTATION,
     REFERENCE_MANIFEST_SHA256_ANNOTATION,
     KubernetesBackend,
     KubernetesProfile,
@@ -146,6 +147,9 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
     assert job["metadata"]["annotations"][
         EGRESS_PROXY_SHA256_ANNOTATION
     ] == managed_proxy_sha256(IMAGE)
+    assert job["metadata"]["annotations"][
+        NETWORK_ISOLATION_MODE_ANNOTATION
+    ] == "strict"
     assert job["spec"]["backoffLimit"] == 6
 
 
@@ -400,6 +404,140 @@ def test_additive_network_policy_matching_workload_is_rejected(
         },
     }
     backend._validate_exclusive_workload_networking(workload, labels)
+
+
+def test_controlled_egress_accepts_namespace_ingress_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = _trial(tmp_path)
+    workload = _workload(trial)
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            proxy_image=IMAGE,
+            preflight_enabled=False,
+            network_isolation_mode="controlled-egress",
+        )
+    )
+    policy = {
+        "metadata": {"name": "namespace-wide-ingress"},
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Ingress"],
+            "ingress": [{"from": [{"podSelector": {}}]}],
+        },
+    }
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, **kwargs: (
+            {"items": [policy]}
+            if kind == "networkpolicies"
+            else None
+        ),
+    )
+    labels = {
+        "app.kubernetes.io/name": "brunner",
+        "dev.brunner/workload": native_resource_name(
+            workload.workload_id,
+            workload.resource_id,
+        ),
+    }
+    job = render_job(
+        "controlled-egress",
+        "controlled-egress-data",
+        workload,
+        backend.profile,
+        labels,
+        proxy_url="http://10.96.4.12:3128",
+    )
+
+    backend._validate_exclusive_workload_networking(workload, labels)
+    assert job["metadata"]["annotations"][
+        NETWORK_ISOLATION_MODE_ANNOTATION
+    ] == "controlled-egress"
+
+    policy["spec"] = {
+        "podSelector": {},
+        "policyTypes": ["Ingress", "Egress"],
+        "ingress": [{"from": [{"podSelector": {}}]}],
+        "egress": [{"to": [{"podSelector": {}}]}],
+    }
+    with pytest.raises(
+        BackendRequestError,
+        match=r"controlled-egress.*namespace-wide-ingress",
+    ):
+        backend._validate_exclusive_workload_networking(workload, labels)
+
+
+def test_network_isolation_mode_is_validated() -> None:
+    with pytest.raises(ValueError, match="network_isolation_mode"):
+        KubernetesProfile(network_isolation_mode="permissive")
+
+
+def test_remote_submission_identity_includes_network_isolation_mode() -> None:
+    job = {
+        "metadata": {
+            "labels": {"dev.brunner/workload": "trial-job"},
+            "annotations": {
+                "dev.brunner/workload-sha256": "workload",
+                "dev.brunner/runtime-protocol": BRUNNER_RUNTIME_PROTOCOL,
+                NETWORK_ISOLATION_MODE_ANNOTATION: "strict",
+            },
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "volumes": [
+                        {
+                            "persistentVolumeClaim": {
+                                "claimName": "trial-data",
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+    }
+    pvc = {
+        "metadata": {
+            "annotations": {
+                "dev.brunner/staged": "true",
+                "dev.brunner/challenge-sha256": "challenge",
+                "dev.brunner/workload-sha256": "workload",
+                "dev.brunner/runtime-protocol": BRUNNER_RUNTIME_PROTOCOL,
+            }
+        }
+    }
+    arguments = {
+        "job": job,
+        "pvc": pvc,
+        "job_name": "trial-job",
+        "claim_name": "trial-data",
+        "workload_sha256_value": "workload",
+        "challenge_sha256": "challenge",
+        "egress_proxy_sha256": None,
+    }
+
+    KubernetesBackend._validate_remote_submission(
+        **arguments,
+        network_isolation_mode="strict",
+    )
+    del job["metadata"]["annotations"][
+        NETWORK_ISOLATION_MODE_ANNOTATION
+    ]
+    KubernetesBackend._validate_remote_submission(
+        **arguments,
+        network_isolation_mode="strict",
+    )
+    with pytest.raises(
+        BackendRequestError,
+        match="network-isolation-mode",
+    ):
+        KubernetesBackend._validate_remote_submission(
+            **arguments,
+            network_isolation_mode="controlled-egress",
+        )
 
 
 def test_network_policy_is_applied_before_staging_or_job(
