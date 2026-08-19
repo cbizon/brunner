@@ -141,6 +141,9 @@ Provide a short chronological account of observable milestones:
 
 Summarize observable actions and decisions without exposing or reconstructing
 private chain-of-thought.
+Order milestones with `sequence`, but set their `started_at` and `ended_at`
+fields to `null`. Use the supplied Brunner timing accounting for all time
+claims rather than transcribing timestamps into reviewer-authored milestones.
 
 ## Overall synthesis
 

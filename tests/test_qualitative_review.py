@@ -25,7 +25,11 @@ from brunner.backends import (
     BackendSnapshot,
     WorkloadSpec,
 )
-from brunner.campaign import CampaignPlan, CampaignRunner, CampaignTrial
+from brunner.campaign import (
+    CampaignEngine,
+    CampaignPlan as EngineCampaignPlan,
+    CampaignTrial,
+)
 from brunner.contract import load_output_contract
 from brunner.definition import ArtifactPolicy
 from brunner.errors import ConfigurationError
@@ -39,6 +43,35 @@ from brunner.trial import TrialIdentity, create_trial
 
 ROOT = Path(__file__).parents[1]
 EXAMPLE_ROOT = ROOT / "examples/text_benchmark"
+
+
+class CampaignPlan:
+    """Test-only adapter for the internal cluster reconciliation engine."""
+
+    def __init__(self, *, root: Path, **values: Any) -> None:
+        self.root = root
+        self.engine_plan = EngineCampaignPlan(**values)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.engine_plan, name)
+
+
+def CampaignRunner(
+    definition: Any,
+    contract: Any,
+    plan: CampaignPlan,
+    backend: Any,
+    **kwargs: Any,
+) -> CampaignEngine:
+    return CampaignEngine(
+        definition,
+        contract,
+        plan.engine_plan,
+        backend,
+        control_root=plan.root / "control",
+        results_root=plan.root,
+        **kwargs,
+    )
 
 
 def evaluate_trial(definition, contract, trial):
@@ -144,6 +177,19 @@ def _valid_review() -> dict[str, Any]:
         },
         "review_limitations": ["The fixture contains limited transcript data."],
     }
+
+
+def test_standard_review_does_not_accept_model_authored_timestamps() -> None:
+    schema = json.loads(
+        (
+            ROOT
+            / "src/brunner/qualitative/qualitative-review.schema.json"
+        ).read_text()
+    )
+    milestone = schema["$defs"]["milestone"]["properties"]
+
+    assert milestone["started_at"] == {"type": "null"}
+    assert milestone["ended_at"] == {"type": "null"}
 
 
 def _write_reviewer(path: Path, review: dict[str, Any]) -> None:

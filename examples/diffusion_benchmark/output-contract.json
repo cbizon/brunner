@@ -1,0 +1,177 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "diffusion-equation-solver",
+  "title": "Implement and run a one-dimensional diffusion solver",
+  "description": "Submit a reusable numerical heat-equation solver and profiles for all three materialized analytical cases.",
+  "submission": {
+    "manifest_path": "submission/manifest.json",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "solver", "case_outputs"],
+      "properties": {
+        "schema_version": {
+          "const": "1.0",
+          "description": "Submission contract version."
+        },
+        "solver": {
+          "type": "string",
+          "description": "Path to the Python solver entry point, relative to the submission manifest."
+        },
+        "tests": {
+          "type": "string",
+          "description": "Optional path to focused solver tests, relative to the submission manifest."
+        },
+        "case_outputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "zero-dirichlet-sine",
+            "offset-dirichlet-sine",
+            "insulated-neumann-cosine"
+          ],
+          "properties": {
+            "zero-dirichlet-sine": {
+              "type": "string"
+            },
+            "offset-dirichlet-sine": {
+              "type": "string"
+            },
+            "insulated-neumann-cosine": {
+              "type": "string"
+            }
+          },
+          "description": "Paths to solver outputs keyed by case ID, relative to the submission manifest."
+        }
+      }
+    }
+  },
+  "run_status_path": "submission/run-status.json",
+  "work_units": [
+    {
+      "id": "implement-solver",
+      "description": "Implement a reusable solver supporting Dirichlet and Neumann boundaries."
+    },
+    {
+      "id": "run-dirichlet-cases",
+      "description": "Run both fixed-temperature analytical cases."
+    },
+    {
+      "id": "run-neumann-case",
+      "description": "Run the insulated analytical case."
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "solver-source",
+      "description": "Python entry point implementing the numerical solver.",
+      "manifest_pointer": "/solver",
+      "media_type": "text/x-python",
+      "minimum_bytes": 100,
+      "maximum_bytes": 200000
+    },
+    {
+      "id": "solver-tests",
+      "description": "Optional focused tests for the submitted solver.",
+      "manifest_pointer": "/tests",
+      "media_type": "text/x-python",
+      "required": false,
+      "minimum_bytes": 50,
+      "maximum_bytes": 200000
+    },
+    {
+      "id": "case-results",
+      "description": "Recorded numerical temperature profiles for one required case.",
+      "manifest_pointer": "/case_outputs/*",
+      "media_type": "application/json",
+      "minimum_bytes": 100,
+      "maximum_bytes": 25000000,
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "case_id",
+          "method",
+          "x",
+          "dt_requested",
+          "steps_completed",
+          "simulated_time",
+          "termination",
+          "profiles"
+        ],
+        "properties": {
+          "schema_version": {
+            "const": "1.0"
+          },
+          "case_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "method": {
+            "type": "string",
+            "minLength": 1
+          },
+          "x": {
+            "type": "array",
+            "minItems": 3,
+            "items": {
+              "type": "number"
+            }
+          },
+          "dt_requested": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "steps_completed": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "simulated_time": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "termination": {
+            "type": "string",
+            "minLength": 1
+          },
+          "profiles": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["step", "time", "temperature"],
+              "properties": {
+                "step": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "time": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "temperature": {
+                  "type": "array",
+                  "minItems": 3,
+                  "items": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "instructions": [
+    "Use one general numerical implementation for every case.",
+    "The solver must use only the Python standard library.",
+    "Do not import Brunner or benchmark evaluator modules from the solver.",
+    "Record step 0, each requested interval, and the final profile.",
+    "Keep all artifact paths beneath the submission directory."
+  ]
+}

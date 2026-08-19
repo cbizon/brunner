@@ -20,8 +20,8 @@ from brunner.backends import (
     WorkloadSpec,
 )
 from brunner.campaign import (
-    CampaignPlan,
-    CampaignRunner,
+    CampaignEngine,
+    CampaignPlan as EngineCampaignPlan,
     CampaignTrial,
     default_workload_factory,
 )
@@ -40,6 +40,35 @@ from examples.text_benchmark.definition import build_definition
 
 
 ROOT = Path(__file__).parents[1]
+
+
+class CampaignPlan:
+    """Test-only adapter for exercising the internal reconciliation engine."""
+
+    def __init__(self, *, root: Path, **values: Any) -> None:
+        self.root = root
+        self.engine_plan = EngineCampaignPlan(**values)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.engine_plan, name)
+
+
+def CampaignRunner(
+    definition: Any,
+    contract: Any,
+    plan: CampaignPlan,
+    backend: Any,
+    **kwargs: Any,
+) -> CampaignEngine:
+    return CampaignEngine(
+        definition,
+        contract,
+        plan.engine_plan,
+        backend,
+        control_root=plan.root / "control",
+        results_root=plan.root,
+        **kwargs,
+    )
 
 
 class ImmediateBackend:
@@ -557,7 +586,7 @@ def test_campaign_rejects_workload_without_exact_evaluator(
     assert "exact Sterling evaluation" in entry["error"]
 
 
-def test_campaign_rejects_concurrent_orchestrator(
+def test_campaign_engine_does_not_own_process_locking(
     tmp_path: Path,
 ) -> None:
     definition = build_definition()
@@ -582,16 +611,11 @@ def test_campaign_rejects_concurrent_orchestrator(
         workload_factory=_workload,
     )
 
-    with first._campaign_lock():
-        with pytest.raises(
-            RuntimeError,
-            match="another orchestrator is using campaign locked",
-        ) as raised:
-            second.advance()
+    first.initialize()
+    second.initialize()
 
-    message = str(raised.value)
-    assert f'"pid": {os.getpid()}' in message
-    assert '"campaign_id": "locked"' in message
+    assert not hasattr(first, "_campaign_lock")
+    assert not (plan.root / "campaign.lock").exists()
 
 
 def test_campaign_lock_is_released_after_runner_exits(
@@ -674,6 +698,49 @@ def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
     assert "<th>Pipeline</th><th>Benchmark</th>" in rendered
     assert completed["trials"][0]["pipeline"]["status"] == "complete"
     assert completed["trials"][0]["benchmark"]["succeeded"] is True
+
+
+def test_campaign_retries_results_pvc_publication_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ImmediateBackend()
+    plan = CampaignPlan(
+        campaign_id="publication-retry",
+        root=tmp_path / "campaign",
+        trials=(CampaignTrial("run-a", "codex", "model-a"),),
+        publication_retry_seconds=0,
+    )
+    calls = 0
+
+    def publish(source: Path, entry: dict[str, Any]) -> Path:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("results PVC temporarily unavailable")
+        return source
+
+    runner = CampaignRunner(
+        definition,
+        contract,
+        plan,
+        backend,
+        workload_factory=_workload,
+        result_publisher=publish,
+    )
+
+    runner.advance()
+    waiting = runner.advance()
+
+    assert waiting["trials"][0]["phase"] == "publication_pending"
+    assert waiting["trials"][0]["attempts"]["publication"] == 1
+    assert backend.cleaned == set()
+
+    completed = runner.advance()
+
+    assert completed["trials"][0]["phase"] == "complete"
+    assert backend.cleaned == {"run-a"}
 
 
 def test_campaign_materializes_before_backend_submission(
@@ -1296,6 +1363,72 @@ def test_dashboard_prefers_styled_assessment_report(
     assert rendered.count("qualitative-review.html") == 1
 
 
+def test_dashboard_embeds_primary_benchmark_report_from_results(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "index.html"
+    collected = tmp_path / "collected" / "run-a"
+    evaluation = collected / "evaluation"
+    evaluation.mkdir(parents=True)
+    comparison = evaluation / "comparison.html"
+    comparison.write_text("<html><body>physical diagnostics</body></html>")
+    details = evaluation / "details.json"
+    details.write_text("{}")
+    results = evaluation / "results.json"
+    results.write_text(
+        json.dumps(
+            {
+                "reports": [
+                    {
+                        "path": "evaluation/comparison.html",
+                        "media_type": "text/html",
+                        "title": "Physical comparison",
+                        "primary": True,
+                    },
+                    {
+                        "path": "evaluation/details.json",
+                        "media_type": "application/json",
+                        "title": "Deterministic metrics",
+                    },
+                ]
+            }
+        )
+    )
+
+    write_campaign_dashboard(
+        {
+            "campaign_id": "dashboard",
+            "status": "complete",
+            "benchmark_id": "benchmark",
+            "trials": [
+                {
+                    "test_id": "run-a",
+                    "provider": "codex",
+                    "model": "model-a",
+                    "phase": "complete",
+                    "collected_trial": str(collected),
+                    "evaluation": {
+                        "results": str(results),
+                        "report": str(evaluation / "run-report.html"),
+                    },
+                }
+            ],
+            "events": [],
+        },
+        output,
+    )
+
+    rendered = output.read_text()
+    assert "<h2>Benchmark reports</h2>" in rendered
+    assert "Physical comparison" in rendered
+    assert "Deterministic metrics" in rendered
+    assert "run details" in rendered
+    assert (
+        "src='collected/run-a/evaluation/comparison.html'" in rendered
+    )
+    assert "sandbox" in rendered
+
+
 def test_required_assessment_failure_marks_campaign_trial_failed(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1328,6 +1461,14 @@ def test_required_assessment_failure_marks_campaign_trial_failed(
                     "reports": [],
                 }
             ],
+            "reports": [
+                {
+                    "path": "evaluation/comparison.html",
+                    "media_type": "text/html",
+                    "title": "Physical comparison",
+                    "primary": True,
+                }
+            ],
         },
     )
 
@@ -1338,6 +1479,14 @@ def test_required_assessment_failure_marks_campaign_trial_failed(
     assert entry["phase"] == "complete"
     assert entry["outcome"] == "failed"
     assert entry["evaluation"]["assessment_status"] == "failed"
+    assert entry["evaluation"]["reports"] == [
+        {
+            "path": "evaluation/comparison.html",
+            "media_type": "text/html",
+            "title": "Physical comparison",
+            "primary": True,
+        }
+    ]
     assert entry["benchmark"]["succeeded"] is None
     assert entry["failure_class"] == "infrastructure"
     assert entry["failure"]["domain"] == "assessment"
@@ -1810,6 +1959,107 @@ def test_campaign_workload_includes_agent_and_sterling_evaluator(
     assert workload.evaluation.timeout_seconds == 90
 
 
+def test_campaign_workload_passes_custom_provider_connection(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    trial = CampaignTrial(
+        "azure",
+        "codex",
+        "deployment-name",
+        effort="low",
+        provider_id="azure",
+        provider_name="Example Azure OpenAI",
+        base_url="https://example.openai.azure.com/openai/v1/",
+        environment_key="AZURE_OPENAI_API_KEY",
+    )
+    plan = CampaignPlan(
+        campaign_id="custom-provider",
+        root=tmp_path / "campaign",
+        trials=(trial,),
+    )
+
+    workload = default_workload_factory(
+        tmp_path,
+        trial,
+        plan,
+        definition,
+        "kubernetes",
+    )
+
+    assert trial.to_dict()["provider_connection"] == {
+        "provider_id": "azure",
+        "provider_name": "Example Azure OpenAI",
+        "base_url": "https://example.openai.azure.com/openai/v1/",
+        "environment_key": "AZURE_OPENAI_API_KEY",
+    }
+    assert workload.command[-8:] == (
+        "--provider-id",
+        "azure",
+        "--provider-name",
+        "Example Azure OpenAI",
+        "--environment-key",
+        "AZURE_OPENAI_API_KEY",
+        "--base-url",
+        "https://example.openai.azure.com/openai/v1/",
+    )
+
+
+def test_campaign_trial_rejects_connection_settings_without_provider_id() -> None:
+    with pytest.raises(
+        ValueError,
+        match="custom provider connection settings require provider_id",
+    ):
+        CampaignTrial(
+            "invalid",
+            "codex",
+            "model-a",
+            base_url="https://example.invalid/v1/",
+        ).validate()
+
+
+def test_campaign_reconciliation_preserves_custom_provider_connection(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trial = CampaignTrial(
+        "azure",
+        "codex",
+        "deployment-name",
+        effort="low",
+        provider_id="azure",
+        provider_name="Example Azure OpenAI",
+        base_url="https://example.openai.azure.com/openai/v1/",
+        environment_key="AZURE_OPENAI_API_KEY",
+    )
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="custom-provider-reconciliation",
+            root=tmp_path / "campaign",
+            trials=(trial,),
+        ),
+        ImmediateBackend(),
+    )
+
+    state = runner.initialize()
+    entry = state["trials"][0]
+    workload = runner._configured_workload(entry)
+
+    assert entry["provider_connection"] == {
+        "provider_id": "azure",
+        "provider_name": "Example Azure OpenAI",
+        "base_url": "https://example.openai.azure.com/openai/v1/",
+        "environment_key": "AZURE_OPENAI_API_KEY",
+    }
+    assert "--provider-id" in workload.command
+    assert "https://example.openai.azure.com/openai/v1/" in (
+        workload.command
+    )
+
+
 def test_default_workload_factory_selects_provider_secret(
     tmp_path: Path,
 ) -> None:
@@ -1951,7 +2201,7 @@ def test_campaign_recovers_interrupted_evaluation(
     )
     state = runner.advance()
     entry = state["trials"][0]
-    destination = runner.root / "collected" / entry["test_id"]
+    destination = runner.control_root / "collected" / entry["test_id"]
     handle = entry["handle"]
     backend.collect(
         BackendHandle(
@@ -2311,7 +2561,7 @@ def test_campaign_waits_indefinitely_for_connectivity_by_default(
     )
 
     first = runner.advance()
-    state_path = tmp_path / "campaign/campaign.json"
+    state_path = runner.state_path
     persisted = json.loads(state_path.read_text())
     persisted["paused_since"] = "2026-08-01T00:00:00+00:00"
     state_path.write_text(json.dumps(persisted))

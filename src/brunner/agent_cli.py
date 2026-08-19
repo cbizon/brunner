@@ -26,6 +26,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--finalization-seconds", type=float)
     parser.add_argument("--provider-executable")
+    parser.add_argument("--provider-id")
+    parser.add_argument(
+        "--provider-name",
+        default="OpenAI-compatible provider",
+    )
+    parser.add_argument("--base-url")
+    parser.add_argument("--environment-key", default="OPENAI_API_KEY")
     return parser
 
 
@@ -118,6 +125,10 @@ def main() -> None:
                     provider=identity.provider,
                     model=identity.model,
                     effort=identity.effort,
+                    provider_id=args.provider_id,
+                    provider_name=args.provider_name,
+                    base_url=args.base_url,
+                    environment_key=args.environment_key,
                 ),
                 runtime=runtime,
                 executable=args.provider_executable,

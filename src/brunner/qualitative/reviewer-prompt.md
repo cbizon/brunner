@@ -29,6 +29,9 @@ Requirements:
 - Do not infer prohibited behavior or provenance from similarity alone.
 - Do not expose or reconstruct private chain-of-thought.
 - Do not treat provider API duration as exact thinking time.
+- Set every milestone `started_at` and `ended_at` value to `null`; Brunner's
+  supplied timing accounting is authoritative and model-transcribed timestamps
+  are intentionally prohibited.
 - Ignore candidate provider and model identity when judging quality.
 - Do not calculate a composite numeric score.
 

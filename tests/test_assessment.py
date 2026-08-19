@@ -395,6 +395,15 @@ if [ "${BRUNNER_TRIAL_ROOT+x}" = x ]; then exit 9; fi
 case "$PWD" in
   *assessment-test*) exit 10 ;;
 esac
+case " $* " in
+  *" --dangerously-bypass-approvals-and-sandbox "*) ;;
+  *) exit 11 ;;
+esac
+case " $* " in
+  *" --sandbox "*) exit 12 ;;
+esac
+printf 'reviewer-home=%s\nreviewer-codex-home=%s\n' \
+  "$HOME" "$CODEX_HOME" >&2
 final=""
 previous=""
 for argument in "$@"; do
@@ -446,6 +455,16 @@ printf '%s\n' 'harmless reviewer warning' >&2
         trial
         / "assessments/model-review/reviewer/attempts/0001.stderr.log"
     ).read_text()
+    stderr = (
+        trial
+        / "assessments/model-review/reviewer/attempts/0001.stderr.log"
+    ).read_text()
+    provider_home = (
+        trial / "assessments/model-review/.reviewer-provider-home"
+    )
+    assert f"reviewer-home={provider_home}" in stderr
+    assert f"reviewer-codex-home={provider_home / 'codex'}" in stderr
+    assert not provider_home.exists()
     assert assessment_result["reports"] == [
         {
             "path": "evaluation/model-review.json",
@@ -500,15 +519,37 @@ def test_codex_provider_schema_flattens_unsupported_composition() -> None:
     criterion = provider_schema["$defs"]["criterion"]
 
     assert '"allOf"' not in encoded
+    assert '"dependentRequired"' not in encoded
+    assert '"dependentSchemas"' not in encoded
     assert '"if"' not in encoded
     assert '"then"' not in encoded
     assert '"not"' not in encoded
+    assert '"uniqueItems"' not in encoded
+    assert source["$defs"]["approach"]["properties"]["components"][
+        "uniqueItems"
+    ] is True
+    assert provider_schema["properties"]["schema_version"]["type"] == "string"
+    assert provider_schema["$defs"]["rating"]["type"] == "string"
     assert criterion["type"] == "object"
     assert criterion["additionalProperties"] is False
     assert set(criterion["required"]) == set(criterion["properties"])
     assert criterion["properties"]["rating"] == {
         "$ref": "#/$defs/rating"
     }
+
+    def assert_strict_objects(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                assert_strict_objects(item)
+        elif isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                assert value["additionalProperties"] is False
+                assert set(value["required"]) == set(properties)
+            for item in value.values():
+                assert_strict_objects(item)
+
+    assert_strict_objects(provider_schema)
     _preflight_provider_schema("codex", provider_schema)
 
 
@@ -551,6 +592,32 @@ def test_codex_schema_preflight_rejects_typeless_definition_container() -> None:
                         ),
                         "$defs": {
                             "value": {"type": "string"},
+                        },
+                    }
+                },
+            },
+        )
+
+
+def test_codex_schema_preflight_rejects_optional_nested_property() -> None:
+    with pytest.raises(
+        ProviderSchemaError,
+        match=r"object <root>/properties/result must require every property",
+    ):
+        _preflight_provider_schema(
+            "codex",
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["result"],
+                "properties": {
+                    "result": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["value"],
+                        "properties": {
+                            "value": {"type": "string"},
+                            "location": {"type": "string"},
                         },
                     }
                 },

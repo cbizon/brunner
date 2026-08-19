@@ -27,6 +27,9 @@ def test_contract_generates_final_response_schema() -> None:
     assert schema["properties"]["completed_units"]["items"]["enum"] == [
         "uppercase"
     ]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    assert "details" not in schema["properties"]
     validate_json(
         {
             "status": "complete",

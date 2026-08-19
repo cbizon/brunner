@@ -11,3 +11,4 @@ dist/
 .brunner/
 tests-output/
 .DS_Store
+examples/diffusion_benchmark/secrets.env

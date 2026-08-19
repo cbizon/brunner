@@ -14,9 +14,9 @@ from brunner.definition import (
 )
 from brunner.campaign import (
     CampaignPlan,
-    CampaignRunner,
     CampaignTrial,
 )
+from brunner.cluster import ClusterCampaign, ControllerProfile
 from brunner.providers import ProviderSettings
 from brunner.timing import activity, record_activity
 
@@ -28,8 +28,9 @@ __all__ = [
     "BenchmarkDefinition",
     "ChallengeDefinition",
     "CampaignPlan",
-    "CampaignRunner",
     "CampaignTrial",
+    "ClusterCampaign",
+    "ControllerProfile",
     "EvaluationDefinition",
     "ProviderSettings",
     "QualitativeReviewDefinition",

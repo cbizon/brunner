@@ -48,6 +48,14 @@ TERMINAL_ERROR_FRAGMENTS = (
     "does not exist or you do not have access",
     "model_not_found",
 )
+TERMINAL_HARNESS_ERROR_FRAGMENTS = (
+    "exec format error",
+    "filenotfounderror",
+    "invalid schema for response_format",
+    "invalid_json_schema",
+    "permissionerror",
+    "refusing to create helper binaries under temporary dir",
+)
 TERMINAL_HTTP_STATUSES = frozenset({400, 401, 403, 404})
 CODEX_TOOL_ITEM_TYPES = frozenset(
     {
@@ -302,6 +310,12 @@ class CodexAdapter:
                 or any(fragment in lowered for fragment in TERMINAL_ERROR_FRAGMENTS)
             ):
                 terminal = True
+        if any(
+            fragment in summary.lower()
+            for fragment in TERMINAL_HARNESS_ERROR_FRAGMENTS
+        ):
+            terminal = True
+            reason = "harness_configuration_error"
         if not summary and not terminal:
             return None
         return ProviderFailure(

@@ -247,6 +247,63 @@ def test_claude_credit_failure_is_terminal_but_rate_limit_is_retryable() -> None
     assert retryable is not None and retryable.terminal is False
 
 
+def test_codex_missing_executable_is_terminal_but_network_is_retryable() -> None:
+    adapter = CodexAdapter()
+    terminal = adapter.classify_failure(
+        [],
+        (
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'codex'"
+        ),
+    )
+    retryable = adapter.classify_failure(
+        [],
+        "error sending request: connection reset by peer",
+    )
+
+    assert terminal is not None
+    assert terminal.terminal is True
+    assert terminal.reason == "harness_configuration_error"
+    assert retryable is not None
+    assert retryable.terminal is False
+
+
+def test_codex_invalid_output_schema_is_terminal() -> None:
+    failure = CodexAdapter().classify_failure(
+        [
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": (
+                        "Invalid schema for response_format "
+                        "'codex_output_schema': additionalProperties is "
+                        "required. code=invalid_json_schema"
+                    )
+                },
+            }
+        ],
+        "",
+    )
+
+    assert failure is not None
+    assert failure.terminal is True
+    assert failure.reason == "harness_configuration_error"
+
+
+def test_codex_temporary_home_rejection_is_terminal() -> None:
+    failure = CodexAdapter().classify_failure(
+        [],
+        (
+            "WARNING: Refusing to create helper binaries under temporary dir "
+            '"/tmp/reviewer/provider-home/codex"'
+        ),
+    )
+
+    assert failure is not None
+    assert failure.terminal is True
+    assert failure.reason == "harness_configuration_error"
+
+
 def test_claude_subscription_boundary_exposes_reset_time() -> None:
     failure = ClaudeAdapter().classify_failure(
         [

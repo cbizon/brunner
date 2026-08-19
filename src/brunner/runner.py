@@ -46,6 +46,7 @@ from brunner.usage import read_json_records
 
 STREAM_DRAIN_SECONDS = 5.0
 STREAM_CLOSE_SECONDS = 2.0
+EMPTY_PROCESS_GROUP_GRACE_SECONDS = 0.25
 PROTECTED_CONTROL_PATHS = (
     "metadata",
     "backend",
@@ -62,6 +63,17 @@ class AgentRunConfiguration:
     benchmark_version: str
     rendered_prompt: str
     runtime: RuntimeDefaults
+
+
+@dataclass(frozen=True)
+class ProcessGroupMember:
+    pid: int
+    parent_pid: int
+    state: str
+
+    @property
+    def is_zombie(self) -> bool:
+        return self.state[:1] in {"Z", "X", "x"}
 
 
 def load_agent_run_configuration(
@@ -167,7 +179,79 @@ def finalization_prompt(
     return " ".join(parts)
 
 
-def process_group_alive(process_group_id: int) -> bool:
+def _proc_process_group_members(
+    process_group_id: int,
+) -> tuple[ProcessGroupMember, ...] | None:
+    proc = Path("/proc")
+    if not (proc / "self/stat").is_file():
+        return None
+    members = []
+    try:
+        entries = proc.iterdir()
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            value = (entry / "stat").read_text()
+        except OSError:
+            continue
+        close_paren = value.rfind(")")
+        if close_paren < 0:
+            continue
+        fields = value[close_paren + 2 :].split()
+        if len(fields) < 3:
+            continue
+        try:
+            parent_pid = int(fields[1])
+            process_group = int(fields[2])
+        except ValueError:
+            continue
+        if process_group == process_group_id:
+            members.append(
+                ProcessGroupMember(
+                    pid=int(entry.name),
+                    parent_pid=parent_pid,
+                    state=fields[0],
+                )
+            )
+    return tuple(members)
+
+
+def _process_group_members(
+    process_group_id: int,
+) -> tuple[ProcessGroupMember, ...] | None:
+    return _proc_process_group_members(process_group_id)
+
+
+def _reap_adopted_zombies(
+    members: tuple[ProcessGroupMember, ...],
+) -> bool:
+    reaped = False
+    for member in members:
+        if not member.is_zombie or member.parent_pid != os.getpid():
+            continue
+        try:
+            waited_pid, _ = os.waitpid(member.pid, os.WNOHANG)
+        except OSError:
+            pass
+        else:
+            reaped = reaped or waited_pid == member.pid
+    return reaped
+
+
+def _process_group_alive(
+    process_group_id: int,
+    *,
+    reap_zombies: bool,
+) -> bool:
+    members = _process_group_members(process_group_id)
+    if members is not None:
+        if reap_zombies and _reap_adopted_zombies(members):
+            members = _process_group_members(process_group_id)
+        if members is not None:
+            return any(not member.is_zombie for member in members)
     try:
         os.killpg(process_group_id, 0)
     except ProcessLookupError:
@@ -175,6 +259,10 @@ def process_group_alive(process_group_id: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def process_group_alive(process_group_id: int) -> bool:
+    return _process_group_alive(process_group_id, reap_zombies=False)
 
 
 def terminate_process(
@@ -185,7 +273,7 @@ def terminate_process(
 ) -> bool:
     process_group_id = process.pid
     process.poll()
-    if not process_group_alive(process_group_id):
+    if not _process_group_alive(process_group_id, reap_zombies=True):
         return False
     try:
         os.killpg(process_group_id, signal.SIGTERM)
@@ -198,11 +286,11 @@ def terminate_process(
     term_deadline = time.monotonic() + term_wait_seconds
     while time.monotonic() < term_deadline:
         process.poll()
-        if not process_group_alive(process_group_id):
+        if not _process_group_alive(process_group_id, reap_zombies=True):
             break
         time.sleep(0.05)
     process.poll()
-    if process_group_alive(process_group_id):
+    if _process_group_alive(process_group_id, reap_zombies=True):
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
@@ -213,7 +301,10 @@ def terminate_process(
         kill_deadline = time.monotonic() + kill_wait_seconds
         while time.monotonic() < kill_deadline:
             process.poll()
-            if not process_group_alive(process_group_id):
+            if not _process_group_alive(
+                process_group_id,
+                reap_zombies=True,
+            ):
                 break
             time.sleep(0.05)
     if process.poll() is None:
@@ -221,6 +312,7 @@ def terminate_process(
             process.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
             pass
+    _process_group_alive(process_group_id, reap_zombies=True)
     return True
 
 
@@ -387,7 +479,8 @@ def run_attempt(
     observed_models: list[dict[str, Any]] = []
     observed_model_keys: set[tuple[str, str]] = set()
     model_mismatch: dict[str, Any] | None = None
-    active_provider_activities: set[str] = set()
+    active_provider_activities: dict[str, tuple[str, str | None]] = {}
+    stale_provider_activities: list[dict[str, Any]] = []
     provider_event_index = 0
     prompt_delivery_errors: list[str] = []
     timing_recording_errors: list[str] = []
@@ -466,15 +559,17 @@ def run_attempt(
         for activity in adapter.activity_observations(record):
             with activity_lock:
                 if activity.phase == "start":
-                    active_provider_activities.add(
-                        activity.activity_id
+                    active_provider_activities[activity.activity_id] = (
+                        activity.category,
+                        activity.label,
                     )
                     provider_activity_started[activity.activity_id] = (
                         recorded_epoch
                     )
                 elif activity.phase == "end":
-                    active_provider_activities.discard(
-                        activity.activity_id
+                    active_provider_activities.pop(
+                        activity.activity_id,
+                        None,
                     )
                     provider_activity_started.pop(
                         activity.activity_id,
@@ -514,7 +609,45 @@ def run_attempt(
     )
     provider_activity_started: dict[str, float] = {}
 
+    def release_provider_activities(
+        reason: str,
+        *,
+        activity_ids: set[str] | None = None,
+        now: float | None = None,
+    ) -> None:
+        released_at = time.time() if now is None else now
+        with activity_lock:
+            selected = (
+                set(active_provider_activities)
+                if activity_ids is None
+                else activity_ids
+            )
+            for activity_id in selected:
+                details = active_provider_activities.pop(
+                    activity_id,
+                    None,
+                )
+                started_at = provider_activity_started.pop(
+                    activity_id,
+                    None,
+                )
+                if details is None or started_at is None:
+                    continue
+                category, label = details
+                stale_provider_activities.append(
+                    {
+                        "source": "provider",
+                        "category": category,
+                        "activity_id": activity_id,
+                        "label": label,
+                        "started_at": epoch_to_iso(started_at),
+                        "released_at": epoch_to_iso(released_at),
+                        "reason": reason,
+                    }
+                )
+
     def active_work() -> bool:
+        expired: set[str] = set()
         with activity_lock:
             if active_provider_activities:
                 if max_activity_interval_seconds is None:
@@ -526,11 +659,18 @@ def run_attempt(
                     if now - provider_activity_started.get(activity_id, now)
                     > max_activity_interval_seconds
                 }
-                # A provider that never emits the matching tool-end event must
-                # not hold the attempt open for the rest of the trial.
-                active_provider_activities.difference_update(expired)
-                if active_provider_activities:
-                    return True
+        if expired:
+            # A provider that never emits the matching tool-end event must not
+            # hold the attempt open for the rest of the trial.
+            release_provider_activities(
+                "interval exceeded "
+                f"{max_activity_interval_seconds} seconds without ending",
+                activity_ids=expired,
+                now=now,
+            )
+        with activity_lock:
+            if active_provider_activities:
+                return True
         return bool(
             activity_tracker is not None and activity_tracker.active()
         )
@@ -635,21 +775,33 @@ def run_attempt(
         prompt_thread.start()
 
         terminal_idle_since = None
-        leader_exited_idle_since = None
+        process_group_empty_since = None
         soft_deadline_activity_seen = False
         soft_deadline_idle_since = None
         lingering_processes_terminated = False
         forced_termination_reason = None
         active_work_terminated = False
         next_submission_poll = 0.0
-        while process_group_alive(process.pid):
+        empty_group_grace_seconds = min(
+            terminal_exit_grace_seconds,
+            EMPTY_PROCESS_GROUP_GRACE_SECONDS,
+        )
+        while True:
+            process.poll()
+            group_has_live_processes = _process_group_alive(
+                process.pid,
+                reap_zombies=True,
+            )
+            leader_exited = process.returncode is not None
             work_is_active = active_work()
+            live_descendants = leader_exited and group_has_live_processes
+            effective_work_is_active = work_is_active or live_descendants
             now_epoch = time.time()
             now_monotonic = time.monotonic()
             with model_lock:
                 mismatched_model = model_mismatch is not None
             if mismatched_model:
-                active_work_terminated = work_is_active
+                active_work_terminated = effective_work_is_active
                 terminate_process(process)
                 forced_termination_reason = "model_mismatch"
                 break
@@ -676,7 +828,9 @@ def run_attempt(
                 forced_termination_reason = "prompt_delivery_error"
                 break
             if terminal_exit_ready.is_set():
-                if work_is_active:
+                if effective_work_is_active:
+                    terminal_idle_since = None
+                elif leader_exited:
                     terminal_idle_since = None
                 elif terminal_idle_since is None:
                     terminal_idle_since = now_monotonic
@@ -688,35 +842,46 @@ def run_attempt(
                     lingering_processes_terminated = True
                     forced_termination_reason = "terminal_exit_grace"
                     break
-            if process.poll() is not None and not terminal_exit_ready.is_set():
-                if work_is_active:
-                    leader_exited_idle_since = None
-                elif leader_exited_idle_since is None:
-                    leader_exited_idle_since = now_monotonic
-                elif (
-                    now_monotonic - leader_exited_idle_since
-                    >= terminal_exit_grace_seconds
-                ):
-                    terminate_process(process)
-                    lingering_processes_terminated = True
-                    forced_termination_reason = "orphaned_process_group"
-                    break
             if stop_requested.is_set():
-                active_work_terminated = work_is_active
+                active_work_terminated = effective_work_is_active
                 terminate_process(process)
                 forced_termination_reason = "stop_requested"
                 break
             if now_epoch >= deadline_epoch:
-                active_work_terminated = work_is_active
+                active_work_terminated = effective_work_is_active
                 terminate_process(process)
                 forced_termination_reason = "hard_deadline"
                 break
+            if leader_exited and not group_has_live_processes:
+                if process_group_empty_since is None:
+                    process_group_empty_since = now_monotonic
+                elif (
+                    now_monotonic - process_group_empty_since
+                    >= empty_group_grace_seconds
+                ):
+                    stale_reason = (
+                        "provider exited and no live process remained in its "
+                        "process group"
+                    )
+                    release_provider_activities(
+                        stale_reason,
+                        now=now_epoch,
+                    )
+                    if activity_tracker is not None:
+                        activity_tracker.release_unmatched(
+                            stale_reason,
+                            now=now_epoch,
+                        )
+                    if not active_work():
+                        break
+            else:
+                process_group_empty_since = None
             if (
                 soft_deadline_epoch is not None
                 and now_epoch >= soft_deadline_epoch
                 and not terminal_exit_ready.is_set()
             ):
-                if work_is_active:
+                if effective_work_is_active:
                     soft_deadline_activity_seen = True
                     soft_deadline_idle_since = None
                 else:
@@ -738,6 +903,11 @@ def run_attempt(
             if soft_deadline_idle_since is not None:
                 remaining = terminal_exit_grace_seconds - (
                     now_monotonic - soft_deadline_idle_since
+                )
+                wait_seconds = min(wait_seconds, max(0.0, remaining))
+            if process_group_empty_since is not None:
+                remaining = empty_group_grace_seconds - (
+                    now_monotonic - process_group_empty_since
                 )
                 wait_seconds = min(wait_seconds, max(0.0, remaining))
             stop_requested.wait(wait_seconds)
@@ -812,9 +982,12 @@ def run_attempt(
             else None
         ),
         "stale_activity_intervals": (
-            activity_tracker.stale_intervals()
-            if activity_tracker is not None
-            else []
+            stale_provider_activities
+            + (
+                activity_tracker.stale_intervals()
+                if activity_tracker is not None
+                else []
+            )
         ),
         "prompt_delivery_error": (
             prompt_delivery_errors[0] if prompt_delivery_errors else None

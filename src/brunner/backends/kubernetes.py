@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import os
 import re
 import subprocess
 import time
@@ -183,7 +182,6 @@ class KubernetesProfile:
         default_factory=lambda: {"k8s-app": "kube-dns"}
     )
     unsafe_disable_network_policy_for_tests: bool = False
-    job_backoff_limit: int = 6
     require_image_digests: bool = True
     preflight_enabled: bool = True
     max_parallel: int | None = None
@@ -247,10 +245,6 @@ class KubernetesProfile:
             raise ValueError(
                 "Kubernetes proxy environment is managed by Brunner: "
                 + ", ".join(names)
-            )
-        if self.job_backoff_limit < 0:
-            raise ValueError(
-                "Kubernetes job_backoff_limit cannot be negative"
             )
         if self.artifact_chunk_attempts < 1:
             raise ValueError(
@@ -934,7 +928,10 @@ def render_job(
             "annotations": annotations,
         },
         "spec": {
-            "backoffLimit": profile.job_backoff_limit,
+            # Brunner owns provider and infrastructure retry policy. Repeating
+            # the whole pod would discard that classification and duplicate
+            # an already terminal agent/evaluator execution.
+            "backoffLimit": 0,
             "template": {
                 "metadata": {
                     "labels": pod_labels,
@@ -960,7 +957,6 @@ class KubernetesBackend:
         self.profile = profile
         self.kubectl = kubectl
         self._preflight_complete = False
-        self._secret_preflight_complete = False
         self._proxy_url: str | None = None
 
     def prepare_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
@@ -1478,17 +1474,6 @@ class KubernetesBackend:
             workload,
             self.profile,
         )
-        if not secret_environment:
-            return
-        if (
-            self.profile.preflight_enabled
-            and not self._secret_preflight_complete
-        ):
-            for verb in ("get", "create", "update"):
-                self._check_permission(verb, "secrets")
-            self._secret_preflight_complete = True
-
-        references: dict[str, dict[str, str]] = {}
         sources: dict[tuple[str, str], str] = {}
         for environment_name, (secret_name, secret_key) in sorted(
             secret_environment.items()
@@ -1504,74 +1489,6 @@ class KubernetesBackend:
                     "Kubernetes Secret key and cannot be provisioned "
                     f"unambiguously: {secret_name}/{secret_key}"
                 )
-            references.setdefault(secret_name, {})[
-                secret_key
-            ] = environment_name
-
-        for secret_name, keys in sorted(references.items()):
-            existing = self._get("secret", secret_name)
-            existing_data: dict[str, Any] = {}
-            if existing is not None:
-                value = existing.get("data", {})
-                if not isinstance(value, dict):
-                    raise BackendConfigurationError(
-                        f"Kubernetes Secret {secret_name} has malformed data"
-                    )
-                existing_data = value
-            missing = {
-                secret_key: environment_name
-                for secret_key, environment_name in keys.items()
-                if secret_key not in existing_data
-            }
-            if not missing:
-                continue
-            unavailable = sorted(
-                environment_name
-                for environment_name in missing.values()
-                if not os.environ.get(environment_name)
-            )
-            if unavailable:
-                missing_keys = ", ".join(sorted(missing))
-                raise BackendConfigurationError(
-                    f"Kubernetes Secret {secret_name} is absent or missing "
-                    f"keys [{missing_keys}], and the orchestrator environment "
-                    "does not provide non-empty variables: "
-                    + ", ".join(unavailable)
-                )
-            encoded_missing = {
-                secret_key: base64.b64encode(
-                    os.environ[environment_name].encode()
-                ).decode()
-                for secret_key, environment_name in sorted(missing.items())
-            }
-            if existing is None:
-                resource = {
-                    "apiVersion": "v1",
-                    "kind": "Secret",
-                    "metadata": {
-                        "name": secret_name,
-                        "namespace": self.profile.namespace,
-                    },
-                    "type": "Opaque",
-                    "data": encoded_missing,
-                }
-                operation = "create"
-            else:
-                resource = dict(existing)
-                resource["data"] = {
-                    **existing_data,
-                    **encoded_missing,
-                }
-                metadata = dict(resource.get("metadata", {}))
-                metadata.pop("managedFields", None)
-                resource["metadata"] = metadata
-                operation = "replace"
-            self._run(
-                operation,
-                "-f",
-                "-",
-                input_value=json.dumps(resource),
-            )
 
     def _ensure_managed_proxy(self) -> None:
         if self.profile.unsafe_disable_network_policy_for_tests:

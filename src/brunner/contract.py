@@ -89,18 +89,17 @@ class OutputContract:
             ],
             "properties": {
                 "status": {
+                    "type": "string",
                     "enum": ["complete", "partial", "failed"],
                 },
                 "submission_manifest": {
+                    "type": "string",
                     "const": self.submission_manifest,
                 },
                 "completed_units": completed_units,
                 "limitations": {
                     "type": "array",
                     "items": {"type": "string"},
-                },
-                "details": {
-                    "type": "object",
                 },
             },
         }

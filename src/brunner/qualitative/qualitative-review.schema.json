@@ -273,12 +273,10 @@
           ]
         },
         "started_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
+          "type": "null"
         },
         "ended_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
+          "type": "null"
         },
         "summary": {
           "type": "string",

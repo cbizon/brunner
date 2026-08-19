@@ -191,7 +191,9 @@ class AssessmentDefinition:
     prepare_command: tuple[str, ...] = ()
     render_command: tuple[str, ...] = ()
     trial_evidence_paths: tuple[str, ...] = (
-        "workspace",
+        "workspace/PROMPT.md",
+        "workspace/schema",
+        "workspace/submission",
         "transcript",
         "timing",
         "usage",
@@ -448,7 +450,9 @@ class QualitativeReviewDefinition:
     required: bool = False
     run_if_evaluation_failed: bool = True
     trial_evidence_paths: tuple[str, ...] = (
-        "workspace",
+        "workspace/PROMPT.md",
+        "workspace/schema",
+        "workspace/submission",
         "transcript",
         "timing",
         "usage",

@@ -19,6 +19,12 @@ def test_public_cli_does_not_expose_host_agent_execution() -> None:
     assert "local-run" not in help_text
     assert "trial-run" not in help_text
     assert "trial-evaluate" not in help_text
+    assert "trial-assess" not in help_text
+    assert "campaign-init" not in help_text
+    assert "campaign-step" not in help_text
+    assert "campaign-run" not in help_text
+    assert "campaign-submit" in help_text
+    assert "campaign-retrieve" in help_text
     assert "brunner-agent" not in project["project"]["scripts"]
     assert not hasattr(evaluation, "evaluate_trial")
 

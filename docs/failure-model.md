@@ -38,7 +38,7 @@ Failure domains are:
 | `evaluation` | Deterministic evaluator or reference-validation infrastructure |
 | `assessment` | Trusted qualitative reviewer or renderer infrastructure |
 | `configuration` | Benchmark or deployment configuration |
-| `orchestrator` | Brunner bookkeeping, persistence, or local resources |
+| `orchestrator` | Controller bookkeeping, persistence, or cluster-local resources |
 | `reporting` | Non-authoritative HTML/dashboard presentation |
 | `cleanup` | Removal of backend resources after the result is known |
 
@@ -55,7 +55,7 @@ Every boundary must be tested at five interruption points where applicable:
 2. After a partial side effect but before a handle is persisted.
 3. After operation success but before campaign state is persisted.
 4. During cleanup.
-5. After orchestrator restart.
+5. After controller restart or ConfigMap lock handoff.
 
 Unexpected `Exception` values at an external boundary become a durable
 `orchestrator` failure. `KeyboardInterrupt`, `SystemExit`, and fatal process
@@ -70,10 +70,10 @@ state publication must be atomic so they cannot expose partial state.
 | Materialization | Launch failure, timeout, output volume, disk/inodes, escaped descendants | Staging | Terminal `configuration` or `orchestrator`; delete temporary copy |
 | Challenge staging | Symlink, forbidden name, render/schema/hash failure, source mutation, disk/inodes | Staging or trial creation | Terminal `integrity`/`configuration`; never publish partial workspace |
 | Trial construction | Filesystem failure or interruption | Trial creation | Atomic publish; incomplete temporary trial must not occupy the requested ID |
-| State persistence | Disk/inodes, permission, serialization, machine loss | Orchestrator | Preserve previous valid state; stop new side effects if authoritative state cannot be written |
-| Campaign locking | Concurrent orchestrator or stale diagnostic owner text | OS file lock | Terminal local orchestration error; kernel lock is authoritative |
+| State persistence | Control-PVC disk/inodes, permission, serialization, Pod/node loss | Controller | Preserve previous valid state; stop new side effects if authoritative state cannot be written |
+| Campaign lock | Concurrent controller, API loss, renewal timeout, stale holder, malformed lock state | ConfigMap with `resourceVersion` compare-and-swap | Only the current holder may reconcile; stop after the lock cannot be renewed within its duration; reject malformed state |
 | Capacity/preflight | API loss, RBAC, quota, no nodes, mutable/incompatible images, bad reference claim | Scheduler/backend | Connectivity pause, terminal configuration, or visible quota `wait`; never an invisible running state |
-| Credential preparation | Missing local variable, absent Secret key, malformed Secret, RBAC, API loss | Kubernetes backend before staging | Reuse an existing key; create or complete from the orchestrator environment; terminal configuration for missing input, connectivity pause for API loss |
+| Credential reference | Absent Secret/key or malformed `secretKeyRef` | Kubernetes pod startup | Terminal container-configuration infrastructure failure; Brunner never reads or provisions Secret values |
 | Submission | Partial NetworkPolicy/PVC/helper/Job, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation | Adopt only matching digests after ambiguity; possible side effects require cleanup |
 | Scheduling/startup | Unschedulable, image pull, mount, secret, GPU/storage unavailable | Backend inspection | Typed backend failure; retry only transient infrastructure |
 | Agent startup | Missing executable/config, corrupt trial state, permission/disk failure | Agent CLI and backend | Durable nonzero infrastructure result with diagnostics |
@@ -85,12 +85,14 @@ state publication must be atomic so they cannot expose partial state.
 | Submission validation | Missing/invalid manifest, schema/path/size violation | Evaluator | `candidate_failed`; this is a valid benchmark result |
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
 | Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
-| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, local disk | Backend and campaign | Reuse unchanged staged files locally, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry transport only |
-| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure | Campaign | `assessment`; required-review failure makes result indeterminate |
+| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, control-PVC exhaustion | Backend and controller | Reuse unchanged staged files on the control PVC, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry transport only |
+| Result publication | Results-PVC exhaustion, oversized result, interruption, checksum/path violation | Controller | Omit unchanged challenge and assessment working copies; publish atomically; do not clean trial storage until complete |
+| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure | Trusted assessment Job and controller | `assessment`; required-review failure makes result indeterminate |
+| Final retrieval | Reader startup, laptop disconnect, partial file, manifest/file checksum mismatch, local disk | Retrieval client | Preserve `.part` files, resume by offset, publish only verified files, never delete results automatically |
 | Reporting | Serialization, template error, disk full | Evaluation or campaign save | Record `reporting`; never block cleanup or replace the authoritative result |
-| Cleanup | API loss, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Persist `cleanup_pending` and retry; result remains authoritative |
+| Cleanup | API loss, controller shutdown race, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Stop controller Pods before deleting Jobs, sweep replacement Pods, persist `cleanup_pending`, and retry; result remains authoritative |
 | Aggregation | Unknown phase or contradictory fields | Campaign | Durable `orchestrator` attention; never silently report `running` |
-| Restart recovery | Sleep, SIGTERM, crash between operations | Campaign initialization | Recover only idempotent phases; preserve deadlines, handles, and cleanup obligations |
+| Restart recovery | Pod eviction, SIGTERM, node loss, crash between operations | Controller initialization | Recover only idempotent phases; preserve deadlines, handles, and cleanup obligations |
 
 ## Resource Ownership
 
@@ -103,7 +105,7 @@ system reason:
 | Brunner runner/provider process exceeds a shared pod limit | Infrastructure |
 | Candidate process exceeds an explicitly isolated benchmark limit | Candidate failure |
 | Shared pod `OOMKilled` without process ownership evidence | Infrastructure; retry is bounded |
-| PVC or orchestrator disk full during bookkeeping | Orchestrator/integrity, not candidate |
+| Control/results PVC full during bookkeeping | Orchestrator/integrity, not candidate |
 | Candidate artifact exceeds an output-contract size limit | Candidate failure |
 | Provider token/context/subscription exhaustion | Provider policy |
 | Kubernetes quota or storage-class exhaustion | Backend wait or configuration |
@@ -128,10 +130,16 @@ and event evidence before attributing exhaustion to either phase.
   must match before a remote resource is adopted.
 - Candidate evaluation failure exits the evaluator container successfully; the
   benchmark result carries failure while the Kubernetes pipeline completes.
+- Kubernetes Job backoff is zero. Brunner is the only component allowed to
+  repeat a classified workload generation.
 - A failed old Pod cannot override an active replacement or a successful Job.
 - Missing Events never prevent collection or cleanup.
 - A campaign may wait indefinitely for connectivity by policy, but the wait
   reason and start time must be durable and visible.
+- The laptop is not a reconciliation principal; laptop sleep or disconnect
+  cannot pause a running campaign.
+- Result deletion is explicit and separate from controller/control-PVC
+  retirement.
 - A successful test suite is insufficient unless each external boundary has
   failure injection for side-effect ambiguity and restart recovery.
 
@@ -140,12 +148,13 @@ and event evidence before attributing exhaustion to either phase.
 The fault-injection suite covers atomic JSON replacement, interrupted trial
 construction, source symlink rejection, partial and rejected submission,
 primary-state corruption and backup recovery, malformed and unknown
-campaign/backend states, zero backend capacity, cleanup retry, collection
+campaign/backend states, ConfigMap lock exclusion, zero backend capacity, cleanup retry, collection
 integrity, malformed remote inventories, evaluator versus candidate
 attribution, required assessment failure, non-gating report/dashboard failure,
 NetworkPolicy rendering/order, remote stage verification, runtime identity,
 immutable images, multi-Pod retries, missing Jobs, reference identity,
-ResourceQuota capacity, diagnostic collection, and persistent monitoring.
+ResourceQuota capacity, diagnostic collection, bounded result publication,
+resumable verified retrieval, and persistent cluster monitoring.
 
 Backend-side submission journals, detached child reaping,
 candidate-versus-runner cgroup attribution, and backup recovery after a

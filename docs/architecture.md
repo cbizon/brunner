@@ -15,12 +15,12 @@ stages.
    same trial PVC.
 4. **Collect**: preserve logs, evaluator results, and selected artifacts
    through a resumable, checksum-verified transfer.
-5. **Assess**: on the orchestrator, build compact evidence dossiers and run the
-   configured standard
-   qualitative review plus any domain-specific, schema-bound command or model
-   reviews without changing deterministic evaluation status.
-6. **Campaign**: schedule a matrix, reconcile backend state, recover outputs,
-   finalize reports and reviews, clean up, and publish a dashboard.
+5. **Assess**: in separate trusted Sterling Jobs, build compact evidence
+   dossiers and run the configured standard qualitative review plus any
+   domain-specific, schema-bound command or model reviews.
+6. **Campaign**: a cluster-resident controller schedules the matrix,
+   reconciles backend state, collects outputs, starts assessment Jobs, cleans
+   up trial resources, publishes a monitor, and finalizes a result bundle.
 
 ## Ownership
 
@@ -36,7 +36,7 @@ stages.
 | References | Manifest and integrity validation | Reference content |
 | Artifacts | Inventory, resume, checksum, groups | Retention policy |
 | Infrastructure | Backend interfaces and implementations | Runtime profile/images |
-| Campaigns | Durable state and dashboard | Trial matrix |
+| Campaigns | Controller, ConfigMap lock, durable state/results PVCs, monitor, retrieval | Trial matrix and deployment profile |
 
 ## Canonical Output Contract
 
@@ -67,12 +67,12 @@ submission validation follows manifest pointers, rejects path escape and
 symlink traversal, validates JSON artifacts, hashes accepted files, and
 requires a `complete` status to list every work unit.
 
-When a challenge defines a materialization command, Brunner first copies the
-source challenge into a fresh orchestrator-side temporary directory. It runs
-the command there, rechecks symlinks and forbidden names, then uses that
-materialized copy for prompt rendering, schema generation, staging, and the
-challenge digest. The source checkout is never modified. Without a command,
-the original direct-copy staging path is unchanged.
+When a challenge defines a materialization command, Brunner's trusted cluster
+preparation Job first copies the source challenge into a fresh temporary
+directory. It runs the command there, rechecks symlinks and forbidden names,
+then uses that materialized copy for prompt rendering, schema generation,
+staging, and the challenge digest. The source checkout in the controller image
+is never modified. Without a command, direct-copy staging is unchanged.
 
 Materialization is part of trial creation, before the Kubernetes backend
 receives a workload. Materialized resources are therefore candidate-visible,
@@ -119,16 +119,26 @@ For every assessment Brunner:
 8. optionally runs a benchmark renderer and registers its reports; and
 9. records attempts, usage, hashes, blinding limitations, and failure details.
 
-Model reviewers run without session persistence. Codex uses its read-only
-sandbox; Claude exposes and explicitly authorizes only read, glob, and grep
-tools while denying interactive permission requests. They execute in a
-temporary workspace outside the trial with `BRUNNER_*` environment variables
-removed. Candidate provider and model fields are omitted from the dossier and
-matching structured fields are redacted from copied JSON evidence. The result
-records that provider family may still be inferable from transcript structure.
-The temporary reviewer workspace is a second copy of the selected evidence;
-large benchmarks should select compact review inputs rather than whole
-datasets or trajectory trees.
+Model reviewers run without session persistence. The assessment Job is the
+outer sandbox: it mounts only the selected collected trial subdirectory, has no
+service-account token, and receives provider-only egress. Codex therefore
+bypasses its unsupported nested user-namespace sandbox; Claude exposes and
+explicitly authorizes only read, glob, and grep tools while denying interactive
+permission requests. Reviewers execute in a temporary workspace with
+`BRUNNER_*` environment variables removed. Candidate provider and model fields
+are omitted from the dossier and matching structured fields are redacted from
+copied JSON evidence. The result records that provider family may still be
+inferable from transcript structure. The temporary reviewer workspace is a
+second copy of the selected evidence; large benchmarks should select compact
+review inputs rather than whole datasets or trajectory trees.
+Reviewer-authored milestones are sequence-ordered but carry null timestamps;
+the copied Brunner timing accounting remains the sole source for elapsed time
+and interval timestamps.
+
+Reviewer CLI state uses a separate provider home under the trusted assessment
+work root rather than the operating system temporary directory. Brunner removes
+that home after the review and excludes it from result publication even if an
+assessment process terminates before cleanup.
 
 Brunner also packages
 `https://brunner.dev/schemas/assessment-common.schema.json` as an optional
@@ -138,6 +148,10 @@ domain-specific output structure. Provider schemas inline only referenced
 common definitions and their dependencies; the typeless common-schema document
 is never embedded as a `$defs` entry. Provider-specific preflight failures are
 terminal assessment configuration errors and create no reviewer attempt.
+The Codex projection also closes every object, requires all declared
+properties, and removes unsupported assertion keywords. Brunner still validates
+the response against the unchanged benchmark schema, which remains the single
+source of truth.
 
 Assessment status is separate from deterministic evaluation status. Optional
 assessment failures remain visible but do not fail a campaign trial. A failed
@@ -155,23 +169,22 @@ The agent runtime receives only:
 - Minimal `metadata/agent-run.json`
 - Only the selected provider's credential references
 
-Challenge materialization runs earlier as trusted orchestrator-side benchmark
-code. Brunner gives it the temporary challenge root, does not pass trial,
+Challenge materialization runs earlier as trusted cluster-side benchmark code.
+Brunner gives it the temporary challenge root, does not pass trial,
 reference, evaluation, assessment, or submission `BRUNNER_*` paths, and does
 not copy trusted materials into the temporary challenge. The optional
 `BRUNNER_RESOURCE_CACHE` value is passed through as a location only; download,
 locking, checksum, extraction, conversion, and cache validity semantics remain
 benchmark-owned.
 
-Candidate processes execute inside the Kubernetes workload isolation boundary
-and without inherited user configuration or external tool connections. Codex
-uses `--dangerously-bypass-approvals-and-sandbox` for candidate runs because
-Sterling is the enforced outer sandbox; assessment runs retain Codex's
-read-only sandbox. This also keeps initial and resumed candidate invocations
+Candidate and reviewer processes execute inside Kubernetes workload isolation
+boundaries and without inherited user configuration or external tool
+connections. Codex uses `--dangerously-bypass-approvals-and-sandbox` because
+Sterling is the enforced outer sandbox and does not provide nested user
+namespaces. This also keeps initial and resumed candidate invocations
 compatible because `codex exec resume` does not accept `--sandbox`. Claude
 bypasses its interactive permission system and likewise relies on the outer
-Kubernetes isolation boundary, avoiding unsupported nested user-namespace
-sandboxes. Runner-owned metadata, backend, evaluation,
+Kubernetes isolation boundary. Runner-owned metadata, backend, evaluation,
 assessment, usage, and status paths are snapshotted around every attempt. Any
 mutation is restored and terminates the trial as a provider error.
 
@@ -227,11 +240,13 @@ After it produces a terminal provider result, Kubernetes starts the trusted
 evaluator as the Job's main container. Both use the trial PVC, but only the
 evaluator mounts the separately provisioned reference PVC, read-only. Provider
 Secrets and proxy settings are present only in the agent init container.
-Campaign configuration maps providers to Secret name/key references, and the
-workload factory selects only the current trial's provider mapping. Before any
-staging, the orchestrator reuses an existing Secret key or creates a missing
-one from the same-named laptop environment variable. Secret values never enter
-campaign state, workload identity, trial contents, or Pod manifests.
+Campaign configuration maps providers to existing Secret name/key references,
+and the workload factory selects only the current trial's provider mapping.
+Brunner never reads Secret values and never creates or updates Secrets from
+laptop environment variables. A missing Secret or key prevents the Pod from
+starting and is classified as a terminal infrastructure/configuration failure.
+Secret values never enter campaign state, workload identity, trial contents,
+or Pod manifests.
 
 Agent, evaluator, and artifact-reader images are immutable digest references by
 default. Every image reports or validates Brunner's runtime protocol before it
@@ -310,9 +325,15 @@ submission are valid and declared work has drained. A success event without
 ready output does not terminate a provider that is still finishing work, but
 it does not disable the soft deadline or consume the reserved finalization
 window once declared work is idle.
-Undeclared orphan process groups are terminated and reaped before the attempt
-returns, so artifact collection cannot race a leftover child process or a
-child that writes files after the provider leader exits.
+The provider leader is not the process-group lifetime boundary. If it exits
+while a child command remains live, Brunner waits for that non-zombie process
+to finish rather than treating it as an orphan. Linux process-table inspection
+distinguishes live members from zombies, and the agent process reaps zombies
+that have been adopted by it. Once the group has contained no live process for
+a short drain grace, unmatched provider activity and unguarded benchmark
+activity are released as stale and the attempt closes. A benchmark activity
+with a still-live guard remains authoritative. The hard trial deadline remains
+the final safeguard and terminates descendants that do not finish.
 
 Liveness is never inferred from bookkeeping alone. A declared interval defers
 the soft deadline only while it is credibly open: Brunner ignores starts from
@@ -332,12 +353,13 @@ Stream pumps that stay blocked on a pipe inherited by a grandchild are
 unblocked by closing the pipe, and any output that arrives after the logs
 close is counted rather than lost to an exception inside a daemon thread.
 
-Brunner keeps monitoring the provider's process group until it is gone, even
-after the leader has been reaped, because abandoning it would let descendants
-write into the workspace while artifacts are being collected. Reaping the
-leader frees its PID, so a recycled PID could in principle make the group
-check report a stranger's group. That residual race is accepted: losing the
-orphan-reaping guarantee is the worse failure.
+Brunner keeps monitoring the provider's process group after the leader has
+been reaped because abandoning a live descendant would let it write into the
+workspace while artifacts are being collected. Zombie-only groups do not
+count as live work. Reaping the leader frees its PID, so a recycled PID could
+in principle make the group check report a stranger's group. That residual
+race is accepted: losing the descendant-liveness guarantee is the worse
+failure.
 
 A trial stops after `max_attempts` provider process launches. An attempt is
 checkpointed before launch and again immediately after `Popen` succeeds, so an
@@ -435,12 +457,13 @@ Kubernetes distinguishes connectivity failures from rejected requests and
 workload failures. The agent and evaluator each write compact summaries to
 their Kubernetes termination logs. Inspection treats those summaries,
 container signals, and reasons such as `OOMKilled` as authoritative even when
-Kubernetes records an inconsistent exit code. Jobs use bounded Kubernetes
-backoff and inspection evaluates all Pods in creation order: an old failed Pod
-does not terminate reconciliation while a replacement is active, and a
-completed Job selects its successful Pod. Missing Jobs with intact PVCs are
-retryable infrastructure failures; missing Jobs and PVCs are terminal storage
-loss. Brunner reports pending PVCs, preserves logs from every Job Pod, and
+Kubernetes records an inconsistent exit code. Job-level backoff is disabled:
+each Brunner workload generation runs exactly one Pod, and only Brunner may
+start a replacement after classifying the previous result. Inspection still
+evaluates all Pods in creation order when adopting legacy or externally
+modified Jobs. Missing Jobs with intact PVCs are retryable infrastructure
+failures; missing Jobs and PVCs are terminal storage loss. Brunner reports
+pending PVCs, preserves logs from every Job Pod, and
 captures terminal Job and Pod events before cleanup when available. Event
 RBAC, expiry, or transient failures become warnings and never block artifact
 recovery. It also includes Kubernetes
@@ -463,105 +486,109 @@ expiry, terminal provider/configuration failures, and container configuration
 failures are not retried. The campaign bounds automatic restart generations
 with `infrastructure_max_restarts`.
 
-## Campaign State
+## Cluster Campaign Control
 
 The normative failure taxonomy, operation matrix, resource-ownership rules, and
 fault-injection requirements are defined in
 [`failure-model.md`](failure-model.md). Every external operation must translate
-failure into a durable record before returning control to campaign
-reconciliation.
+failure into durable state before returning control to reconciliation.
+
+The laptop is only a submit, observe, port-forward, retrieve, and explicit
+retirement client. It never calls the campaign reconciliation engine.
+`campaign-submit` creates one campaign control plane in Sterling:
+
+```text
+ServiceAccount + namespace Role/RoleBinding
+control PVC (ReadWriteMany)
+results PVC (ReadWriteMany)
+trusted preparation Job
+one-replica Recreate controller Deployment
+controller lock ConfigMap
+status ConfigMap
+ClusterIP monitor Service
+```
+
+The preparation Job has no service-account token. It loads the benchmark and
+campaign modules from the immutable controller image, materializes and stages
+the challenge, creates durable trials on the control PVC, and writes a
+campaign-digest marker. The controller does not start reconciliation until
+that marker exists.
+
+The submitted control-plane manifests carry the exact agent, artifact-reader,
+proxy, controller, and evaluator image identities as trusted environment
+metadata. Preparation, controller, and assessment processes apply those image
+fields immediately after importing the benchmark modules and before validating
+the campaign or evaluation contract. This avoids a self-referential controller
+build: the controller image may contain an older embedded digest, while the
+submitted immutable digest remains the authoritative runtime identity and part
+of the validated campaign digest. No other benchmark or campaign fields can be
+overridden through this mechanism.
+
+The controller is the only campaign component with Kubernetes API credentials.
+A dedicated ConfigMap lock, renewed by pod UID through Kubernetes
+`resourceVersion` compare-and-swap, prevents two live controller processes from
+reconciling the same campaign. A replacement may take the lock only after the
+recorded renewal duration expires. Malformed lock state is an integrity failure,
+not an implicit takeover. If the controller Pod is evicted, restarted, or moved
+to another node, it reloads `campaign.json` and its atomic backup from the
+control PVC and adopts existing Jobs and PVCs from persisted handles. Laptop
+sleep or network loss has no effect on this loop.
+
+The controller writes:
+
+```text
+control PVC:
+  campaign.json
+  campaign.json.bak
+  trials/<test-id>/
+
+results PVC:
+  index.html
+  trials/<test-id>/
+  campaign.json
+  result-manifest.json
+```
 
 Campaign trial IDs are supplied explicitly by the benchmark. They are not
-derived from provider, model, effort, or a run count. `campaign.json` records
-the contract identity, append-only trial list, handles, snapshots, collection
-attempts, evaluation results, outcomes, and recent events. Each completed entry
-separates:
+derived from provider, model, effort, or a run count. Reordering the configured
+trial list does not change campaign identity. Adding a new ID reopens a
+finalized campaign, invalidates the old result manifest, and preserves already
+completed trial results. Reusing an ID with changed execution attributes is
+rejected.
 
-- `pipeline`: runner status, terminal-result availability, interruption signal,
-  and infrastructure classification
-- `benchmark`: whether trusted evaluation ran and whether it succeeded
-- `outcome`: overall campaign result
-- `failure_class`: `infrastructure` or `benchmark` when the outcome failed
-- `failure`: canonical operation, domain, reason, disposition, retryability,
-  cleanup obligation, and diagnostics
-- `failures`: bounded append-only history of prior failure records
-
-Every initialize, step, and continuous run holds an exclusive operating-system
-lock on `campaign.lock`. A second orchestrator fails immediately with the
-recorded PID and hostname instead of racing state writes or submissions. The
-kernel releases the lock automatically when its process exits or crashes; the
-lock file's owner record is diagnostic and is not itself treated as proof that
-an orchestrator is alive.
-
-Each campaign-state transition atomically replaces both `campaign.json` and
+Each state transition atomically replaces both `campaign.json` and
 `campaign.json.bak`. If the primary JSON is unreadable, initialization loads
-the last valid backup and records an explicit state-recovery failure and event.
+the backup and records an explicit state-recovery failure and event. The
+reconciliation engine persists phases before side effects, adopts existing
+remote resources, pauses on Kubernetes connectivity loss, resumes interrupted
+collection and evaluation, bounds infrastructure restarts, respects
+ResourceQuota capacity, captures terminal Pod/Job Events before cleanup, and
+keeps integrity/configuration failures as explicit attention states.
 
-Campaign reconciliation:
+Collection is resumable and checksum verified, but its destination is the
+results PVC rather than a laptop directory. Trial PVCs are deleted only after
+collection, assessment, and reporting have produced durable results.
 
-- Adds new caller-supplied trial IDs without invalidating existing state
-- Treats an existing matching ID as already known, regardless of list order
-- Rejects only an ID reused with conflicting execution attributes
-- Rejects challenge or workload identity drift for existing campaign entries
-- Submits only up to plan and ResourceQuota-aware backend capacity
-- Persists a `submitting` phase before backend side effects and immediately
-  persists the returned or adopted handle
-- Resumes from persisted handles
-- Pauses individual steps on backend connectivity loss; `run()` waits and
-  resumes without changing remote workloads
-- Collects artifacts for both successful and failed workloads
-- Recovers interrupted collection and evaluation phases after a crash
-- Counts a collection attempt only after the backend transfer returns or
-  reports a non-connectivity failure; an orchestrator crash or connectivity
-  pause while `collect()` is in progress does not consume the retry limit
-- Relaunches retryable infrastructure failures against existing persistent
-  agent state with a bounded restart count
-- Retains an append-only retry history with each generation's backend snapshot,
-  including Pod and Job events captured before that generation is deleted
-- Retries interrupted artifact transfers with a bounded, configurable policy
-- Uses the same persisted cleanup transition for initial and resumed cleanup,
-  including identical completion and retry events; non-connectivity cleanup
-  failures remain `cleanup_pending` instead of becoming a dead manual state
-- Keeps integrity and evaluation failures durable instead of retrying them
-- Continues healthy running or pending trials when another needs attention
-- Flags a trial the backend still reports as pending or running past
-  `trial_timeout_seconds`, which defaults to the backend workload deadline
-  plus `trial_timeout_margin_seconds`, while continuing to inspect it until it
-  reaches a terminal state
-- Waits indefinitely for an unreachable backend by default, preserving remote
-  lifecycle state across orchestrator sleep or network loss; deployments may
-  set `max_pause_seconds` to require manual attention after a bounded interval
-- Bounds Sterling evaluation with `evaluation_timeout_seconds`; Kubernetes
-  enforces that budget independently of orchestrator connectivity
-- Keeps an overdue trial's backend slot reserved while the backend still
-  reports its workload as pending or running, so flagging it cannot let the
-  campaign exceed `max_parallel`
-- Does not clean up when recovery fails
-- Runs trusted evaluation on Sterling against the trial PVC before collection
-- Omits evaluator-consumed submission artifacts from collection by default and
-  enforces a configurable total collection-byte ceiling
-- Falls back to a bounded diagnostic inventory when an incomplete trial's
-  undeclared files exceed the normal collection ceiling, recording omitted
-  files and bytes instead of transferring an unbounded PVC
-- Collects diagnostics but records `benchmark.status = "not_run"` for an
-  interrupted or incomplete agent pipeline
-- Runs the configured standard qualitative review and domain assessments after
-  deterministic evaluation
-- Regenerates `index.html` after each transition with live elapsed time,
-  backend warnings, usage, timing, and report links
-- Serves the campaign directory while `campaign-run` is active and keeps the
-  monitor available after terminal state until interrupted
-- Treats dashboard and run-report generation as non-authoritative
-  presentation; reporting failure is recorded but cannot block cleanup
-- Converts unknown persisted phases and unexpected backend exceptions into
-  explicit attention states rather than silently leaving the campaign running
-- Records backend capacity exhaustion as a visible scheduler wait
-- Recovers an unreadable primary campaign state from the last atomic backup and
-  records that recovery in campaign state
+Qualitative and domain assessments run in separate trusted Jobs that mount only
+the selected collected trial subdirectory from the control PVC plus an empty
+`/tmp`; they cannot traverse into another trial or campaign-control state. Only
+model-review Jobs receive reviewer Secret references and managed-proxy
+environment; the controller receives neither provider nor reviewer
+credentials. Assessment Pods have no service-account token and their
+NetworkPolicy permits egress only to Brunner's numeric Squid ClusterIP.
 
-Campaign trials contain no environment values. Kubernetes credentials are
-represented only as provider-scoped Secret name/key references; profile-level
-references are limited to credentials intentionally shared by every workload.
-Deployment networking is configured with the explicit proxy URL, proxy Pod
-selector, namespace, and port fields; evaluator containers inherit neither
-provider Secrets nor agent proxy environment.
+At terminal campaign state, the controller copies authoritative state to the
+results PVC and creates `result-manifest.json` with every result file's path,
+size, and SHA-256. It annotates the results PVC with the manifest identity and
+then stops mutating the result tree. The status ConfigMap remains a small
+observable summary; it is not the authoritative campaign record.
+
+`campaign-retrieve` starts a short-lived, tokenless, read-only helper Pod with
+deny-all ingress and egress. It reads files in bounded chunks, resumes local
+`.part` files by byte offset, verifies every SHA-256, and atomically publishes
+completed files. Retrieval remains possible after controller retirement
+because the results PVC annotations carry the manifest identity.
+
+`campaign-delete` removes controller resources and the control PVC. It
+preserves the results PVC unless `--delete-results` is explicit. This makes
+result deletion a separate irreversible decision after verified retrieval.

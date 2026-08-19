@@ -196,10 +196,10 @@ qualitative_review=QualitativeReviewDefinition(
 )
 ```
 
-When configured, the campaign runs the review after Sterling's deterministic
-evaluator result has been selectively collected and before cleanup.
-`trial-assess` can rerun assessments over an existing collected evaluation.
-Trial creation records the review contract before execution.
+When configured, the cluster controller starts a trusted assessment Job after
+Sterling's deterministic evaluator result has been selectively collected and
+before trial cleanup. Trial creation records the review contract before
+execution.
 
 Brunner writes:
 
@@ -228,9 +228,11 @@ References to Brunner's common assessment schema are resolved by copying only
 the referenced definitions and their transitive dependencies into the provider
 schema. Benchmark-local `$defs` remain unchanged. Before a Codex reviewer is
 launched, Brunner verifies that the resolved schema is a self-contained object
-schema with closed, required root properties and resolvable local references.
-Construction or preflight errors fail the assessment with zero reviewer
-attempts.
+schema with closed objects, recursively required properties, and resolvable
+local references. The provider projection removes unsupported assertion
+keywords, but Brunner validates the returned value against the unchanged
+benchmark schema. Construction or preflight errors fail the assessment with
+zero reviewer attempts.
 
 The standard review is non-gating by default. Set `required=True` only when a
 missing or invalid review should make the campaign trial unsuccessful. If
@@ -246,6 +248,27 @@ Brunner uses each schema as the structural source of truth: the reviewer
 receives it and Brunner validates the returned JSON against the same file.
 The rubric remains the semantic source of truth and should not duplicate a
 field list already represented by the schema.
+
+## Complete Example
+
+[`examples/diffusion_benchmark`](../examples/diffusion_benchmark/README.md)
+is the end-to-end reference benchmark. It demonstrates:
+
+- cluster-side materialization of harmless candidate-visible cases;
+- one low-effort Codex/Azure trial and one low-effort Claude trial;
+- one canonical output contract that generates the candidate-facing schemas
+  and drives submission validation;
+- an isolated trusted evaluator that reruns the submitted diffusion solver,
+  compares three cases with analytical solutions, measures temperature error,
+  runtime, steady-state convergence, and grid-convergence order, and writes an
+  HTML profile report;
+- standard qualitative review of solver source, tests, deterministic results,
+  transcript, timing, and usage evidence; and
+- cluster dashboard serving plus checksum-verified final retrieval.
+
+The agent image excludes benchmark and evaluator sources. The controller image
+contains Brunner, the benchmark definition and evaluator, the qualitative
+review runtime, and `kubectl`.
 
 An assessment must define exactly one execution method:
 
@@ -319,6 +342,15 @@ trajectories, videos, or generated resources should narrow
 `trial_evidence_paths` to the source, summaries, metrics, and representative
 artifacts the reviewer actually needs.
 
+The reviewer provider home is created beside the durable assessment workspace,
+not under the operating system temporary directory. It persists across attempts
+within one review, is removed afterward, and is never published as a result.
+The trusted assessment Job mounts only the selected collected trial subpath,
+not the campaign's complete control PVC. It has no Kubernetes service-account
+token and can reach the network only through the managed provider proxy.
+Codex relies on that outer boundary rather than its nested user-namespace
+sandbox, which Sterling does not support.
+
 The packaged common schema can be referenced without copying it:
 
 ```json
@@ -370,9 +402,12 @@ the exact run-status JSON as the provider's final response. A successful turn
 that returns prose or a mismatched response receives an immediate corrective
 continuation, but Brunner still requires current-attempt structured output and
 never accepts the workspace run-status file by itself. Before an attempt
-returns, Brunner terminates and reaps its remaining process group, including
-undeclared children that could otherwise modify the workspace during
-collection.
+returns, Brunner waits for live child commands in the provider process group,
+even after the provider leader exits. It reaps adopted zombies and treats a
+zombie-only group as empty. After a short empty-group grace drains buffered
+output, unmatched activity events without a live guard are recorded as stale
+instead of holding the wrapper open. The hard deadline still terminates any
+child that does not finish.
 
 ## Resource Accounting
 
@@ -434,8 +469,10 @@ protect declared work from the soft finalization boundary. Brunner waits for
 the interval to close, up to the trial's hard deadline. A provider terminal
 event likewise waits for valid current output and declared work to drain before
 its exit grace starts.
-Undeclared child processes are reaped as an orphaned process group before the
-attempt returns.
+Child commands in the provider process group are allowed to finish after the
+provider leader exits. Brunner waits while any non-zombie member remains,
+reaps adopted zombies, and closes the attempt after a short empty-group grace.
+The absolute hard deadline remains the upper bound.
 
 An interval that is never closed cannot hold the trial open indefinitely.
 Brunner releases it when:
@@ -567,20 +604,22 @@ fails before scoring if reference content or contract identity has drifted.
 
 ## Campaigns
 
-A campaign module supplies the runtime profile but reuses the loaded
-definition and contract:
+A campaign module returns the declarative cluster control plane. It reuses the
+loaded definition and contract but does not construct or run an orchestrator:
 
 ```python
-from pathlib import Path
-
-from brunner import CampaignPlan, CampaignRunner, CampaignTrial
-from brunner.backends import KubernetesBackend, KubernetesProfile
+from brunner import (
+    CampaignPlan,
+    CampaignTrial,
+    ClusterCampaign,
+    ControllerProfile,
+)
+from brunner.backends import KubernetesProfile
 
 
 def build_campaign(definition, contract):
     plan = CampaignPlan(
         campaign_id="comparison-01",
-        root=Path("campaigns/comparison-01"),
         trials=(
             CampaignTrial(
                 "codex-a-first-pass",
@@ -623,27 +662,47 @@ def build_campaign(definition, contract):
         collection_retry_seconds=60,
         collection_max_attempts=3,
     )
-    return CampaignRunner(
-        definition,
-        contract,
-        plan,
-        KubernetesBackend(
-            KubernetesProfile(
-                namespace="bizon",
-                network_isolation_mode="controlled-egress",
-                agent_image=plan.backend_image,
-                artifact_reader_image=plan.backend_image,
-                reference_claim_name="my-benchmark-reference",
-                storage_size="50Gi",
-                storage_class_name="sterling-storage-class",
-                image_pull_secrets=("registry-credentials",),
-                proxy_image=(
-                    "ubuntu/squid@sha256:"
-                    "0123456789abcdef0123456789abcdef"
-                    "0123456789abcdef0123456789abcdef"
-                ),
-                max_parallel=2,
-            )
+    return ClusterCampaign(
+        plan=plan,
+        backend=KubernetesProfile(
+            namespace="bizon",
+            network_isolation_mode="controlled-egress",
+            agent_image=plan.backend_image,
+            artifact_reader_image=(
+                "registry.example/my-benchmark-controller@sha256:"
+                "abcdef0123456789abcdef0123456789"
+                "abcdef0123456789abcdef0123456789"
+            ),
+            reference_claim_name="my-benchmark-reference",
+            storage_size="50Gi",
+            storage_class_name="sterling-storage-class",
+            image_pull_secrets=("registry-credentials",),
+            proxy_image=(
+                "ubuntu/squid@sha256:"
+                "0123456789abcdef0123456789abcdef"
+                "0123456789abcdef0123456789abcdef"
+            ),
+            max_parallel=2,
+        ),
+        controller=ControllerProfile(
+            namespace="bizon",
+            image=(
+                "registry.example/my-benchmark-controller@sha256:"
+                "abcdef0123456789abcdef0123456789"
+                "abcdef0123456789abcdef0123456789"
+            ),
+            control_storage_size="20Gi",
+            results_storage_size="500Gi",
+            storage_class_name="sterling-storage-class",
+            image_pull_secrets=("registry-credentials",),
+            reviewer_secret_environment={
+                "codex": {
+                    "OPENAI_API_KEY": (
+                        "codex-reviewer-credentials",
+                        "OPENAI_API_KEY",
+                    )
+                }
+            },
         ),
     )
 ```
@@ -659,6 +718,27 @@ trials=(
 )
 ```
 
+For a custom OpenAI-compatible Codex deployment, put the non-secret
+connection identity on the trial:
+
+```python
+CampaignTrial(
+    "azure-low",
+    "codex",
+    "DEPLOYMENT_NAME",
+    effort="low",
+    provider_id="azure",
+    provider_name="Example Azure OpenAI",
+    base_url="https://example.openai.azure.com/openai/v1/",
+    environment_key="AZURE_OPENAI_API_KEY",
+)
+```
+
+The named environment variable must still come from
+`CampaignPlan.provider_secret_environment`. Brunner persists and hashes the
+connection identity, but never stores the key value in campaign state or
+command arguments.
+
 Campaign state is append-only by trial ID. Repeating an existing ID with the
 same execution attributes is a no-op, whether it is pending, running, failed,
 or complete. Adding another ID creates another trial without invalidating
@@ -671,23 +751,44 @@ Python list does not delete or cancel its historical campaign entry.
 
 ```sh
 brunner --benchmark my_benchmark.definition \
-  campaign-init my_benchmark.campaign
+  campaign-submit my_benchmark.campaign
 brunner --benchmark my_benchmark.definition \
-  campaign-step my_benchmark.campaign
+  campaign-status my_benchmark.campaign
 brunner --benchmark my_benchmark.definition \
-  campaign-run my_benchmark.campaign --poll-seconds 10
+  campaign-monitor my_benchmark.campaign --local-port 8765
+brunner --benchmark my_benchmark.definition \
+  campaign-retrieve my_benchmark.campaign ./comparison-01-results
+brunner --benchmark my_benchmark.definition \
+  campaign-delete my_benchmark.campaign --delete-results
 ```
 
-`campaign-run` serves the campaign directory at
-`http://127.0.0.1:8765/` while reconciling and keeps that monitor available
-after the campaign becomes terminal. Use `--exit-after-terminal` for batch
-automation, or `--host` and `--port` to change the listener.
+`campaign-submit` creates the control/results PVCs, preparation Job, controller
+Deployment, RBAC, status ConfigMap, and monitor Service. `campaign-monitor`
+port-forwards that ClusterIP Service; closing the port-forward does not affect
+reconciliation. `campaign-retrieve` is resumable and verifies the finalized
+manifest and every downloaded file. `campaign-delete` preserves the results
+PVC unless `--delete-results` is explicit.
 
-Campaigns require `KubernetesBackend`. Brunner renders one durable Job with the
-agent as an init container and the trusted evaluator as the main container.
-Agent and artifact-reader images must contain Brunner; the agent image also
-needs the selected provider CLI. The evaluator image must contain Brunner and
-the benchmark evaluator package.
+The controller image must contain Brunner, `kubectl`, the benchmark definition
+and campaign modules, assessment materials, reviewer CLIs when configured, and
+the artifact-reader runtime. Agent images need Brunner and the selected
+candidate provider CLI. Evaluator images need Brunner, benchmark evaluator
+code, and evaluator dependencies.
+
+The controller image may embed the previous release's digest in the benchmark
+campaign module. `campaign-submit` records the submitted agent,
+artifact-reader, proxy, controller, and evaluator image identities in the
+trusted cluster workloads. Cluster-side imports replace only those image fields
+before campaign/definition validation, so the submitted digest is authoritative
+without requiring an impossible self-referential image build. Benchmarks must
+not set `BRUNNER_CAMPAIGN_IMAGE_OVERRIDES` or
+`BRUNNER_EVALUATION_IMAGE_OVERRIDE`; these are internal control-plane
+variables.
+
+`ControllerProfile.resource_cache_claim_name` may name an existing cache PVC.
+Only the preparation Job mounts it, at `/brunner/resource-cache`, and receives
+`BRUNNER_RESOURCE_CACHE`. Download, locking, checksum, extraction, conversion,
+and cache-validity semantics remain benchmark-owned.
 
 Production images must use `image@sha256:<digest>` references and must contain
 a compatible Brunner runtime protocol. Set
@@ -754,7 +855,7 @@ that call. `artifact_chunk_attempts` retries a failed path, offset, and byte
 count on the same mounted reader before Brunner replaces the reader pod;
 `artifact_chunk_retry_seconds` controls the delay between those retries.
 Smaller chunks are more resilient on slow or unstable links but increase
-command overhead. These values apply to the orchestrator-side transfer; the
+command overhead. These values apply to the controller-side transfer; the
 remote reader protocol accepts any positive chunk size.
 
 Files recorded in the Sterling evaluator's validated `submission.artifacts`
@@ -763,11 +864,17 @@ list are omitted from collection unless
 videos, and other evaluator-only data on the trial PVC. Even with explicit
 opt-in, `max_collection_bytes` rejects an oversized inventory before transfer.
 Brunner also compares the remote workspace to the per-file inventory recorded
-during staging. Unchanged challenge files are hard-linked from the local staged
-trial into the collected view instead of being downloaded from Sterling.
-Changed challenge files count against `max_collection_bytes`; if local
-hard-link reuse is unavailable, collection fails rather than silently copying
-a large immutable input.
+during staging. Unchanged challenge files are hard-linked from the staged trial
+into the collected view on the control PVC instead of being downloaded again.
+Changed challenge files count against `max_collection_bytes`.
+
+After assessment, Brunner publishes a separate bounded trial result to the
+results PVC. Publication omits unchanged challenge files and temporary
+assessment workspaces, so a large candidate-visible dataset is neither copied
+to the results PVC nor retrieved to the laptop. Changed/new artifacts, logs,
+evaluation output, assessment output, and reports remain eligible.
+`ControllerProfile.max_published_trial_bytes` provides a second independent
+ceiling for this final result.
 
 If evaluation never completed and the remaining inventory still exceeds
 `max_collection_bytes`, Brunner switches to
@@ -821,30 +928,28 @@ campaign state:
 - `proxy_cpu_request`, `proxy_cpu_limit`, `proxy_memory_request`, and
   `proxy_memory_limit` configure the shared proxy Deployment.
 
-Before staging, Brunner checks every selected Secret reference. An existing
-Secret containing the requested key is reused without requiring the
-corresponding laptop variable. If the Secret or key is missing, Brunner creates
-or completes it from the orchestrator environment variable with the same name
-as the agent environment variable. For example, a missing
-`OPENAI_API_KEY` binding is populated from the laptop's `OPENAI_API_KEY`.
-Missing or empty local variables fail submission immediately. Existing Secret
-values are never overwritten, and values are never written to campaign state,
-trial metadata, workload hashes, Pod manifests, command arguments, or
-client-side apply annotations.
+Every referenced Secret and key must already exist in the namespace. Brunner
+does not read Secret values and does not create, complete, or overwrite
+Secrets from laptop or controller environment variables. Kubernetes resolves
+`secretKeyRef` only for the target Pod; a missing reference becomes a terminal
+container-configuration infrastructure failure. Values are never written to
+campaign state, trial metadata, workload hashes, Pod manifests, command
+arguments, or client-side apply annotations.
 
 Only the agent init container receives these Secret references. The evaluator,
-staging helpers, and artifact readers receive neither provider mappings nor
-secret values.
+controller, preparation Job, staging helpers, artifact readers, and result
+retriever receive neither provider mappings nor secret values. Separate
+assessment Jobs receive only reviewer mappings configured in
+`ControllerProfile.reviewer_secret_environment`.
 
 Do not put secret values in non-secret environment mappings.
 
-`campaign-step` returns a persisted `paused_backend_connectivity` state when
-the backend cannot be reached. `campaign-run` keeps waiting and retries until
-connectivity returns or the process is interrupted; it does not alter remote
-workloads while disconnected.
+The cluster controller persists `paused_backend_connectivity` when the
+Kubernetes API cannot be reached and retries until connectivity returns. This
+is independent of laptop connectivity.
 
 Before launch, Brunner checks cluster access, required Job/PVC/Pod/Event/
-Secret/NetworkPolicy/ConfigMap/Service/Deployment RBAC, immutable images,
+NetworkPolicy/ConfigMap/Service/Deployment RBAC, immutable images,
 reference identity, managed-proxy rollout, and ResourceQuota capacity. Quota capacity
 includes object counts, PVC storage, CPU, memory,
 ephemeral storage, and extended resources, using Kubernetes' effective
@@ -858,6 +963,9 @@ during cleanup, the campaign remains in `cleanup_pending` and retries later.
 Other cleanup failures, including deletion timeouts and finalizers, also remain
 in `cleanup_pending` and retry after `cleanup_retry_seconds`. Cleanup failure
 does not replace an already established pipeline or benchmark result.
+Explicit campaign deletion stops controller Pods before deleting workload
+Jobs, then sweeps replacement Pods before deleting PVCs so a terminating
+controller cannot recreate work behind the cleanup pass.
 
 Artifact-transfer interruptions retain verified partial files and retry after
 `collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
@@ -889,12 +997,14 @@ Campaigns bound the states a stuck backend can hide in:
 | `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
 | `infrastructure_max_restarts` | Relaunches an interrupted backend workload against its existing persistent trial | 2 |
 | `cleanup_retry_seconds` | Delay before retrying failed backend cleanup | 60 seconds |
+| `publication_retry_seconds` | Delay before retrying a transient results-PVC publication failure | 60 seconds |
+| `publication_max_attempts` | Bounds transient result-publication retries | 3 |
 | `max_pause_seconds` | Optional limit before backend disconnection requires manual attention | Unlimited |
 | `evaluation_timeout_seconds` | Optional campaign cap on the Sterling evaluator container | Benchmark evaluation timeout |
 
-Kubernetes enforces evaluator timeout even while the orchestrator is asleep or
-disconnected. Set `evaluation_timeout_seconds` to cap a benchmark's configured
-evaluation timeout for a particular campaign.
+Kubernetes enforces evaluator timeout independently of the laptop and
+controller reconciliation loop. Set `evaluation_timeout_seconds` to cap a
+benchmark's configured evaluation timeout for a particular campaign.
 Exceeding `trial_timeout_seconds` marks the live trial as needing attention but
 keeps its lifecycle phase pending or running. Brunner continues inspecting it,
 resolves the attention marker when it terminates, and keeps its slot reserved
@@ -909,12 +1019,13 @@ contract-check       Validate contract and print digest
 contract-render      Render the generated output-requirements prompt section
 stage                Stage an isolated challenge
 trial-create         Create a durable trial
-trial-assess         Rerun configured assessments over existing evaluation
 reference-build      Build a reference manifest
 reference-validate   Verify a reference bundle
-campaign-init        Create campaign state and trials
-campaign-step        Reconcile one campaign iteration
-campaign-run         Reconcile and serve the monitor until interrupted
+campaign-submit      Create/update the Sterling campaign control plane
+campaign-status      Read controller availability and persisted summary
+campaign-monitor     Port-forward the cluster-resident monitor
+campaign-retrieve    Resume and verify final result retrieval
+campaign-delete      Retire controller/control resources; optionally results
 ```
 
 Kubernetes invokes `python -m brunner.agent_cli` inside the agent init
