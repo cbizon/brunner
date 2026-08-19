@@ -26,6 +26,7 @@ from brunner.backends.kubernetes import (
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
+    BackendConfigurationError,
     BackendConnectivityError,
     BackendRequestError,
     IntegrityError,
@@ -111,6 +112,7 @@ def test_kubernetes_resources_preserve_secret_boundary(
 
     assert pvc["spec"]["storageClassName"] == "fast"
     pod_spec = job["spec"]["template"]["spec"]
+    assert job["spec"]["backoffLimit"] == 0
     assert pod_spec["activeDeadlineSeconds"] == 62
     assert pod_spec["automountServiceAccountToken"] is False
     assert pod_spec["terminationGracePeriodSeconds"] == 30
@@ -231,7 +233,7 @@ def test_workload_secret_references_affect_identity_without_values(
     assert baseline.sha256 != credentialed.sha256
 
 
-def test_kubernetes_creates_missing_workload_secret_from_environment(
+def test_kubernetes_secret_references_do_not_read_laptop_or_cluster_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,37 +251,26 @@ def test_kubernetes_creates_missing_workload_secret_from_environment(
             "OPENAI_API_KEY": ("codex-credentials", "api-key")
         },
     )
-    commands: list[tuple[tuple[str, ...], str | None]] = []
     monkeypatch.setenv("OPENAI_API_KEY", "local-secret-value")
-    monkeypatch.setattr(backend, "_get", lambda *args, **kwargs: None)
-
-    def run(
-        *arguments: str,
-        input_value: str | None = None,
-        check: bool = True,
-    ) -> subprocess.CompletedProcess[str]:
-        commands.append((arguments, input_value))
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda *args, **kwargs: pytest.fail(
+            "controller must not read Kubernetes Secrets"
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_run",
+        lambda *args, **kwargs: pytest.fail(
+            "controller must not provision Kubernetes Secrets"
+        ),
+    )
 
     backend._ensure_workload_secrets(workload)
 
-    assert commands[0][0] == ("create", "-f", "-")
-    assert "local-secret-value" not in commands[0][0]
-    assert json.loads(commands[0][1] or "") == {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": "codex-credentials",
-            "namespace": "benchmarks",
-        },
-        "type": "Opaque",
-        "data": {"api-key": "bG9jYWwtc2VjcmV0LXZhbHVl"},
-    }
 
-
-def test_kubernetes_reuses_existing_secret_without_local_environment(
+def test_kubernetes_secret_reference_validation_needs_no_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -299,25 +290,12 @@ def test_kubernetes_reuses_existing_secret_without_local_environment(
         },
     )
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.setattr(
-        backend,
-        "_get",
-        lambda *args, **kwargs: {"data": {"oauth-token": "redacted"}},
-    )
-    monkeypatch.setattr(
-        backend,
-        "_run",
-        lambda *args, **kwargs: pytest.fail(
-            "existing Secret must be reused"
-        ),
-    )
 
     backend._ensure_workload_secrets(workload)
 
 
-def test_kubernetes_completes_missing_secret_key_without_overwrite(
+def test_kubernetes_rejects_ambiguous_secret_key_reuse(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trial = tmp_path / "trial"
     trial.mkdir()
@@ -330,76 +308,14 @@ def test_kubernetes_completes_missing_secret_key_without_overwrite(
         command=("brunner-worker",),
         timeout_seconds=60,
         secret_environment={
-            "OPENAI_API_KEY": ("provider-credentials", "openai")
+            "OPENAI_API_KEY": ("provider-credentials", "token"),
+            "AZURE_OPENAI_API_KEY": ("provider-credentials", "token"),
         },
     )
-    existing = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": "provider-credentials",
-            "namespace": "benchmarks",
-            "resourceVersion": "42",
-            "managedFields": [{"manager": "kubectl"}],
-        },
-        "type": "Opaque",
-        "data": {"claude": "ZXhpc3Rpbmc="},
-    }
-    commands: list[tuple[tuple[str, ...], str | None]] = []
-    monkeypatch.setenv("OPENAI_API_KEY", "new-value")
-    monkeypatch.setattr(
-        backend,
-        "_get",
-        lambda *args, **kwargs: existing,
-    )
-
-    def run(
-        *arguments: str,
-        input_value: str | None = None,
-        check: bool = True,
-    ) -> subprocess.CompletedProcess[str]:
-        commands.append((arguments, input_value))
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    monkeypatch.setattr(backend, "_run", run)
-
-    backend._ensure_workload_secrets(workload)
-
-    assert commands[0][0] == ("replace", "-f", "-")
-    resource = json.loads(commands[0][1] or "")
-    assert resource["data"] == {
-        "claude": "ZXhpc3Rpbmc=",
-        "openai": "bmV3LXZhbHVl",
-    }
-    assert "managedFields" not in resource["metadata"]
-    assert resource["metadata"]["resourceVersion"] == "42"
-
-
-def test_kubernetes_missing_secret_requires_orchestrator_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
-    backend = KubernetesBackend(KubernetesProfile())
-    workload = WorkloadSpec(
-        workload_id="claude",
-        trial=trial,
-        command=("brunner-worker",),
-        timeout_seconds=60,
-        secret_environment={
-            "CLAUDE_CODE_OAUTH_TOKEN": (
-                "claude-credentials",
-                "oauth-token",
-            )
-        },
-    )
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.setattr(backend, "_get", lambda *args, **kwargs: None)
 
     with pytest.raises(
-        BackendRequestError,
-        match="CLAUDE_CODE_OAUTH_TOKEN",
+        BackendConfigurationError,
+        match="cannot be provisioned unambiguously",
     ):
         backend._ensure_workload_secrets(workload)
 

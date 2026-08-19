@@ -4,10 +4,13 @@
 the reusable lifecycle:
 
 ```text
-Sterling agent init container -> Sterling evaluator container
-                              -> selective verified collection
-                              -> qualitative review / assessments
-                              -> campaign reporting
+laptop submit/observe/retrieve client
+              |
+              v
+Sterling campaign controller -> agent init container -> evaluator container
+                            -> cluster-local verified collection
+                            -> trusted assessment Jobs
+                            -> immutable result bundle
 ```
 
 Each benchmark imports Brunner and supplies only its challenge, canonical
@@ -22,7 +25,7 @@ fault-injection coverage.
 ## What Is Generic
 
 - Deterministic challenge staging and isolation checks
-- Optional orchestrator-side challenge resource materialization
+- Optional trusted cluster-side challenge resource materialization
 - Prompt/schema generation from one output contract
 - Codex and Claude provider adapters
 - Durable retries, session resume, finalization, and timeout handling
@@ -36,7 +39,10 @@ fault-injection coverage.
 - Evidence dossiers, timing facts, assessment provenance, and report links
 - Reference bundle manifests and integrity checks
 - Append-only campaign task lists with caller-owned trial IDs
-- ResourceQuota-aware campaign capacity, recovery, and persistent monitors
+- Cluster-resident reconciliation protected by a compare-and-swap ConfigMap lock
+- Dedicated control/results PVCs and a persistent cluster monitor
+- Resumable, checksum-verified final result retrieval
+- ResourceQuota-aware campaign capacity and recovery
 - Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
 - Default-deny Sterling egress through Brunner-managed provider-only Squid
 - Immutable image, runtime protocol, challenge, workload, and reference identity
@@ -72,9 +78,32 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
 
 Campaigns run only through the Kubernetes backend. The agent is an init
 container and the trusted evaluator is the main container in one durable Job,
-so neither phase depends on the orchestrating machine remaining awake or
-connected. Brunner does not provide host-process, local-container, or
-orchestrator-side evaluation campaigns.
+while a cluster-resident controller owns campaign reconciliation, collection,
+assessment Jobs, reporting, and cleanup. Laptop network loss or sleep therefore
+does not pause the campaign. Brunner does not provide a laptop-resident
+campaign runner, host-process campaigns, or local-container campaigns.
+
+A benchmark campaign module returns `ClusterCampaign`; see
+`examples/text_benchmark/campaign.py`. The normal lifecycle is:
+
+```sh
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-submit examples.text_benchmark.campaign
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-status examples.text_benchmark.campaign
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-monitor examples.text_benchmark.campaign
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-retrieve examples.text_benchmark.campaign ./results
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-delete examples.text_benchmark.campaign --delete-results
+```
+
+The controller image must contain Brunner, `kubectl`, and the benchmark
+definition/campaign/assessment code. Provider credentials must already exist
+as Kubernetes Secrets. Brunner passes Secret references only to agent or
+reviewer Pods; it neither reads Secret values nor creates Secrets from laptop
+environment variables.
 
 Production profiles require digest-pinned agent, evaluator, reader, and Squid
 images. Brunner installs the proxy and its deny-by-default provider allowlist,
@@ -103,10 +132,11 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
   stage ./materialized-workspace
 ```
 
-Materializers run on a temporary challenge copy on the orchestrator before
-hashing or backend submission. Their output is candidate-visible and included
-in `challenge_sha256`; evaluator/reference materials are not staged or passed
-through materializer-specific environment variables.
+Campaign materializers run in the trusted cluster preparation Job on a
+temporary challenge copy before hashing or backend submission. Their output is
+candidate-visible and included in `challenge_sha256`; evaluator/reference
+materials are not staged or passed through materializer-specific environment
+variables.
 
 ## Resource Accounting
 
@@ -153,12 +183,15 @@ from the exclusive wall-time partition. Use `external_wait` only for time when
 the agent is blocked waiting for an external process.
 
 Declared tool, wait, and background intervals are allowed to drain across the
-soft finalization boundary, up to the hard trial deadline. Undeclared orphan
-process groups are terminated before artifact collection begins. Successful
-provider events do not start exit grace until current structured output is
-valid, preventing premature termination while final artifacts are still being
-written without allowing a nonfinal event to consume the reserved finalization
-window.
+soft finalization boundary, up to the hard trial deadline. If the provider
+leader exits while a child command is still running, Brunner waits for every
+non-zombie process in that process group. Once no live member remains, Brunner
+reaps adopted zombies, allows a short stream-drain grace, and releases
+unmatched activity bookkeeping that has no live guard. The hard trial deadline
+still terminates a descendant that never exits. Successful provider events do
+not start exit grace until current structured output is valid, preventing
+premature termination while final artifacts are still being written without
+allowing a nonfinal event to consume the reserved finalization window.
 
 A declared interval only defers the deadline while it is credibly still open.
 Brunner releases an interval whose start belongs to an earlier attempt, whose
@@ -179,6 +212,9 @@ The repository includes:
 - `examples/text_benchmark`: minimal non-reference text benchmark
 - `examples/numeric_benchmark`: reference-backed benchmark with a
   contract-defined artifact JSON Schema
+- `examples/diffusion_benchmark`: complete two-provider Sterling campaign
+  with materialized cases, analytical numerical evaluation, qualitative code
+  review, reports, dashboard serving, and final retrieval
 
 See [architecture.md](docs/architecture.md) and
 [integration.md](docs/integration.md) for the full interfaces and execution

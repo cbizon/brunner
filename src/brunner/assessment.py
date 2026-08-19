@@ -9,11 +9,12 @@ import tempfile
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -621,7 +622,52 @@ def _merge_provider_schema(
 
 
 def _codex_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    unsupported = {"allOf", "else", "if", "not", "then"}
+    unsupported = {
+        "allOf",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "not",
+        "then",
+        "uniqueItems",
+    }
+
+    def inferred_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, list):
+            return "array"
+        return "object"
+
+    def close_schema(value: dict[str, Any]) -> dict[str, Any]:
+        if "type" not in value:
+            if "const" in value:
+                value["type"] = inferred_type(value["const"])
+            elif isinstance(value.get("enum"), list) and value["enum"]:
+                types = list(
+                    dict.fromkeys(inferred_type(item) for item in value["enum"])
+                )
+                if "number" in types and "integer" in types:
+                    types.remove("integer")
+                value["type"] = types[0] if len(types) == 1 else types
+            elif "properties" in value:
+                value["type"] = "object"
+            elif "items" in value:
+                value["type"] = "array"
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            value["required"] = list(properties)
+            value["additionalProperties"] = False
+        return value
 
     def local_reference(reference: str) -> Any:
         if reference == "#":
@@ -658,7 +704,7 @@ def _codex_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
         }
         branches = value.get("allOf")
         if not isinstance(branches, list):
-            return selected
+            return close_schema(selected)
         for branch in branches:
             expanded = branch
             if isinstance(branch, dict):
@@ -688,7 +734,7 @@ def _codex_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
             rewritten = rewrite(expanded, resolving)
             if isinstance(rewritten, dict):
                 selected = _merge_provider_schema(selected, rewritten)
-        return selected
+        return close_schema(selected)
 
     return rewrite(schema)
 
@@ -748,17 +794,34 @@ def _preflight_provider_schema(
         raise ProviderSchemaError(
             "Codex reviewer output schema root must have type 'object'"
         )
-    if schema.get("additionalProperties") is not False:
-        raise ProviderSchemaError(
-            "Codex reviewer output schema root must set "
-            "additionalProperties to false"
-        )
-    properties = schema.get("properties")
-    required = schema.get("required")
-    if not isinstance(properties, dict) or set(required or ()) != set(properties):
-        raise ProviderSchemaError(
-            "Codex reviewer output schema root must require every property"
-        )
+
+    def validate_objects(value: Any, path: str) -> None:
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                validate_objects(item, f"{path}/{index}")
+            return
+        if not isinstance(value, dict):
+            return
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            if value.get("additionalProperties") is not False:
+                raise ProviderSchemaError(
+                    f"Codex reviewer output schema object {path} must set "
+                    "additionalProperties to false"
+                )
+            required = value.get("required")
+            if (
+                not isinstance(required, list)
+                or set(required) != set(properties)
+            ):
+                raise ProviderSchemaError(
+                    f"Codex reviewer output schema object {path} must "
+                    "require every property"
+                )
+        for key, item in value.items():
+            validate_objects(item, f"{path}/{key}")
+
+    validate_objects(schema, "<root>")
     definitions = schema.get("$defs", {})
     if isinstance(definitions, dict):
         shape_keys = {
@@ -829,6 +892,24 @@ def _response_candidates(
     return candidates
 
 
+def _remove_reviewer_provider_home(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+@contextmanager
+def _reviewer_provider_home(work_root: Path) -> Iterator[Path]:
+    provider_home = work_root / ".reviewer-provider-home"
+    _remove_reviewer_provider_home(provider_home)
+    provider_home.mkdir()
+    try:
+        yield provider_home
+    finally:
+        _remove_reviewer_provider_home(provider_home)
+
+
 def _run_reviewer(
     assessment: AssessmentDefinition,
     *,
@@ -848,17 +929,18 @@ def _run_reviewer(
         else resolved_schema
     )
     _preflight_provider_schema(settings.provider, provider_schema)
-    with tempfile.TemporaryDirectory(
-        prefix=f"brunner-{assessment.assessment_id}-"
-    ) as temporary:
+    with (
+        _reviewer_provider_home(work_root) as provider_home,
+        tempfile.TemporaryDirectory(
+            prefix=f"brunner-{assessment.assessment_id}-"
+        ) as temporary,
+    ):
         isolated_root = Path(temporary)
         isolated_workspace = isolated_root / "workspace"
         shutil.copytree(workspace, isolated_workspace)
         transcript = isolated_root / "reviewer"
         attempts_root = transcript / "attempts"
-        provider_home = isolated_root / "provider-home"
         attempts_root.mkdir(parents=True)
-        provider_home.mkdir()
         combined_events = transcript / "events.jsonl"
         combined_stderr = transcript / "stderr.log"
         resolved_schema_path = (
@@ -913,7 +995,9 @@ def _run_reviewer(
                 resume_session=False,
                 session_id=None,
                 executable=assessment.reviewer_executable,
-                read_only=True,
+                # Sterling is the outer sandbox. Codex's nested sandbox uses
+                # user namespaces that are unavailable in the assessment pod.
+                read_only=False,
             )
             provider_command = adapter.build_command(settings, context)
             started_at = _now()

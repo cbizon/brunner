@@ -308,6 +308,72 @@ exit 1
     assert (trial / "workspace/.attempt-count").read_text() == "1"
 
 
+def test_codex_invalid_output_schema_failure_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "codex-schema-failure",
+            "codex",
+            "codex-test",
+            None,
+        ),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+from pathlib import Path
+
+count_file = Path(".attempt-count")
+count = int(count_file.read_text()) if count_file.exists() else 0
+count_file.write_text(str(count + 1))
+print(json.dumps({
+    "type": "turn.failed",
+    "error": {
+        "message": (
+            "Invalid schema for response_format 'codex_output_schema': "
+            "additionalProperties is required. code=invalid_json_schema"
+        )
+    },
+}), flush=True)
+raise SystemExit(1)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="codex",
+            model="codex-test",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            max_attempts=10,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "provider_error"
+    assert len(state["attempts"]) == 1
+    assert state["attempts"][0]["failure_reason"] == (
+        "harness_configuration_error"
+    )
+    assert (trial / "workspace/.attempt-count").read_text() == "1"
+
+
 def test_nonfinal_success_cannot_consume_finalization_window(
     tmp_path: Path,
 ) -> None:
@@ -1527,7 +1593,7 @@ emit("end")
     assert outcome["active_work_terminated"] is False
 
 
-def test_orphaned_process_group_is_reaped_before_return(
+def test_live_descendant_finishes_after_provider_leader_exits(
     tmp_path: Path,
 ) -> None:
     events = tmp_path / "events.jsonl"
@@ -1541,10 +1607,12 @@ import os
 import pathlib
 import subprocess
 import sys
+import json
 
 pathlib.Path(os.environ["PROCESS_GROUP_PATH"]).write_text(
     str(os.getpgrp())
 )
+print(json.dumps({"type": "turn.completed"}), flush=True)
 subprocess.Popen(
     [
         sys.executable,
@@ -1580,13 +1648,116 @@ subprocess.Popen(
     )
 
     process_group_id = int(process_group_path.read_text())
-    assert time.monotonic() - started < 1
-    assert outcome["return_code"] != 0
-    assert outcome["forced_termination_reason"] == "orphaned_process_group"
-    assert outcome["lingering_processes_terminated"] is True
+    assert 0.2 <= time.monotonic() - started < 1
+    assert outcome["return_code"] == 0
+    assert outcome["terminal_result_seen"] is True
+    assert outcome["forced_termination_reason"] is None
+    assert outcome["lingering_processes_terminated"] is False
     assert process_group_alive(process_group_id) is False
-    time.sleep(0.3)
-    assert not late_output_path.exists()
+    assert late_output_path.read_text() == "late"
+
+
+def test_empty_process_group_releases_unmatched_provider_activity(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    combined_events = tmp_path / "combined.jsonl"
+    combined_stderr = tmp_path / "combined.stderr.log"
+    process_group_path = tmp_path / "process-group"
+    script = r"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+pathlib.Path(os.environ["PROCESS_GROUP_PATH"]).write_text(
+    str(os.getpgrp())
+)
+item = {
+    "id": "tool-1",
+    "type": "command_execution",
+    "command": "python simulate.py",
+}
+print(json.dumps({"type": "item.started", "item": item}), flush=True)
+subprocess.Popen([sys.executable, "-c", "pass"])
+time.sleep(0.05)
+"""
+
+    started = time.monotonic()
+    outcome = run_attempt(
+        adapter=CodexAdapter(),
+        command=(sys.executable, "-c", script),
+        workspace=tmp_path,
+        environment={
+            **os.environ,
+            "PROCESS_GROUP_PATH": str(process_group_path),
+        },
+        prompt="",
+        attempt_events=events,
+        attempt_stderr=stderr,
+        combined_events=combined_events,
+        combined_stderr=combined_stderr,
+        deadline_epoch=time.time() + 2,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.05,
+    )
+
+    stale = outcome["stale_activity_intervals"]
+    assert time.monotonic() - started < 1
+    assert outcome["forced_termination_reason"] is None
+    assert outcome["terminal_result_seen"] is False
+    assert stale[0]["source"] == "provider"
+    assert stale[0]["activity_id"] == "tool-1"
+    assert "no live process remained" in stale[0]["reason"]
+    assert process_group_alive(int(process_group_path.read_text())) is False
+
+
+def test_live_descendant_is_stopped_by_hard_deadline(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    stderr = tmp_path / "stderr.log"
+    combined_events = tmp_path / "combined.jsonl"
+    combined_stderr = tmp_path / "combined.stderr.log"
+    process_group_path = tmp_path / "process-group"
+    script = r"""
+import os
+import pathlib
+import subprocess
+import sys
+
+pathlib.Path(os.environ["PROCESS_GROUP_PATH"]).write_text(
+    str(os.getpgrp())
+)
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+"""
+
+    started = time.monotonic()
+    outcome = run_attempt(
+        adapter=CodexAdapter(),
+        command=(sys.executable, "-c", script),
+        workspace=tmp_path,
+        environment={
+            **os.environ,
+            "PROCESS_GROUP_PATH": str(process_group_path),
+        },
+        prompt="",
+        attempt_events=events,
+        attempt_stderr=stderr,
+        combined_events=combined_events,
+        combined_stderr=combined_stderr,
+        deadline_epoch=time.time() + 0.2,
+        stop_requested=threading.Event(),
+        terminal_exit_grace_seconds=0.02,
+    )
+
+    assert 0.2 <= time.monotonic() - started < 2
+    assert outcome["forced_termination_reason"] == "hard_deadline"
+    assert outcome["active_work_terminated"] is True
+    assert process_group_alive(int(process_group_path.read_text())) is False
 
 
 def test_runner_restores_agent_control_plane_mutation(
@@ -2032,3 +2203,24 @@ def test_agent_cli_preserves_existing_attempts_on_harness_failure(
     assert state["status"] == "provider_error"
     assert state["attempts"] == existing["attempts"]
     assert state["harness_failure"]["reason"] == "AgentHarnessFailed"
+
+
+def test_agent_cli_accepts_custom_provider_connection() -> None:
+    args = agent_cli.build_parser().parse_args(
+        [
+            "/brunner/trial",
+            "--provider-id",
+            "azure",
+            "--provider-name",
+            "Example Azure OpenAI",
+            "--base-url",
+            "https://example.openai.azure.com/openai/v1/",
+            "--environment-key",
+            "AZURE_OPENAI_API_KEY",
+        ]
+    )
+
+    assert args.provider_id == "azure"
+    assert args.provider_name == "Example Azure OpenAI"
+    assert args.base_url == "https://example.openai.azure.com/openai/v1/"
+    assert args.environment_key == "AZURE_OPENAI_API_KEY"

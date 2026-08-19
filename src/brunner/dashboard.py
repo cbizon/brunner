@@ -47,6 +47,70 @@ def _relative_link(output: Path, value: str | None) -> str:
     return relative.as_posix()
 
 
+def _benchmark_reports(
+    trial: dict[str, Any],
+    evaluation: dict[str, Any],
+    output: Path,
+) -> list[dict[str, Any]]:
+    reports = evaluation.get("reports")
+    if not isinstance(reports, list) or not reports:
+        reports = []
+        collected_value = trial.get("collected_trial")
+        results_value = evaluation.get("results")
+        if isinstance(collected_value, str) and collected_value:
+            collected = Path(collected_value).resolve()
+            results_path = (
+                Path(results_value).resolve()
+                if isinstance(results_value, str) and results_value
+                else collected / "evaluation/results.json"
+            )
+            if (
+                results_path.is_relative_to(collected)
+                and results_path.is_file()
+            ):
+                try:
+                    results = json.loads(results_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    results = {}
+                loaded = results.get("reports", [])
+                if isinstance(loaded, list):
+                    reports = loaded
+
+    collected_value = trial.get("collected_trial")
+    if not isinstance(collected_value, str) or not collected_value:
+        return []
+    collected = Path(collected_value).resolve()
+    resolved = []
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        path_value = report.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            continue
+        relative = Path(path_value)
+        report_path = (collected / relative).resolve()
+        if (
+            relative.is_absolute()
+            or not report_path.is_relative_to(collected)
+            or not report_path.is_file()
+        ):
+            continue
+        href = _relative_link(output, str(report_path))
+        if not href:
+            continue
+        resolved.append(
+            {
+                "href": href,
+                "media_type": str(
+                    report.get("media_type") or "application/octet-stream"
+                ),
+                "primary": report.get("primary") is True,
+                "title": str(report.get("title") or relative.name),
+            }
+        )
+    return resolved
+
+
 def _seconds(value: object) -> str:
     if not isinstance(value, (int, float)):
         return ""
@@ -159,16 +223,46 @@ def write_campaign_dashboard(
         for name, count in sorted(phases.items())
     )
     rows = []
+    embedded_reports = []
     for trial in trials:
         evaluation = trial.get("evaluation", {})
         pipeline = trial.get("pipeline", {})
         benchmark = trial.get("benchmark", {})
-        report = _relative_link(output, evaluation.get("report"))
-        report_cell = (
-            f'<a href="{html.escape(report)}">report</a>'
-            if report
-            else ""
+        run_report = _relative_link(output, evaluation.get("report"))
+        benchmark_reports = _benchmark_reports(
+            trial,
+            evaluation,
+            output,
         )
+        primary_report = next(
+            (
+                report
+                for report in benchmark_reports
+                if report["primary"]
+            ),
+            benchmark_reports[0] if benchmark_reports else None,
+        )
+        report_links = [
+            f'<a href="{html.escape(report["href"])}">'
+            f'{html.escape(report["title"])}</a>'
+            for report in benchmark_reports
+        ]
+        if run_report:
+            report_links.append(
+                f'<a href="{html.escape(run_report)}">run details</a>'
+            )
+        report_cell = " · ".join(report_links)
+        if (
+            primary_report is not None
+            and primary_report["media_type"] == "text/html"
+        ):
+            embedded_reports.append(
+                {
+                    "href": primary_report["href"],
+                    "test_id": str(trial.get("test_id", "")),
+                    "title": primary_report["title"],
+                }
+            )
         assessment_links = []
         for assessment in evaluation.get("assessments", []):
             if not isinstance(assessment, dict):
@@ -236,6 +330,36 @@ def write_campaign_dashboard(
             f"<td>{html.escape(str(warning))}</td>"
             "</tr>"
         )
+    embedded_report_panels = "".join(
+        (
+            "<details class='embedded-report'"
+            + (" open" if index == 0 else "")
+            + ">"
+            "<summary>"
+            f"<strong>{html.escape(report['test_id'])}</strong>"
+            f" · {html.escape(report['title'])}"
+            "</summary>"
+            "<div class='embedded-report-link'>"
+            f"<a href='{html.escape(report['href'])}'>open standalone</a>"
+            "</div>"
+            "<iframe "
+            f"src='{html.escape(report['href'])}' "
+            f"title='{html.escape(report['test_id'])}: "
+            f"{html.escape(report['title'])}' "
+            "loading='lazy' sandbox></iframe>"
+            "</details>"
+        )
+        for index, report in enumerate(embedded_reports)
+    )
+    embedded_report_section = (
+        "<section class='embedded-reports'>"
+        "<h2>Benchmark reports</h2>"
+        "<p>Primary benchmark diagnostics are available inline for each "
+        "completed trial.</p>"
+        f"{embedded_report_panels}</section>"
+        if embedded_report_panels
+        else ""
+    )
     events = "\n".join(
         (
             f"{event.get('time', '')} "
@@ -275,6 +399,14 @@ th,td {{ padding:9px; border-bottom:1px solid var(--line);
 td:last-child {{ white-space:normal; min-width:240px; }}
 pre {{ padding:18px; background:#1e261f; color:#f5f0df; overflow:auto; }}
 a {{ color:var(--green); font-weight:bold; }}
+.embedded-reports {{ margin-top:32px; }}
+.embedded-report {{ margin:12px 0; background:var(--panel);
+  border:1px solid var(--line); }}
+.embedded-report summary {{ cursor:pointer; padding:14px 16px;
+  font-family:"Courier New",monospace; }}
+.embedded-report-link {{ padding:0 16px 12px; }}
+.embedded-report iframe {{ display:block; width:100%; min-height:900px;
+  border:0; border-top:1px solid var(--line); background:white; }}
 </style>
 </head>
 <body><main>
@@ -295,6 +427,7 @@ outcomes {html.escape(json.dumps(outcomes))}</p>
 <th>Report</th><th>Assessment reports</th><th>Issue</th>
 </tr></thead><tbody>{''.join(rows)}</tbody>
 </table></div>
+{embedded_report_section}
 <h2>Recent events</h2>
 <pre>{html.escape(events)}</pre>
 </main></body></html>

@@ -186,6 +186,18 @@ def read_timing_events(*paths: Path) -> list[dict[str, Any]]:
 
 
 def pid_alive(pid: int) -> bool:
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.is_file():
+        try:
+            value = proc_stat.read_text()
+        except OSError:
+            pass
+        else:
+            close_paren = value.rfind(")")
+            if close_paren >= 0:
+                fields = value[close_paren + 2 :].split()
+                if fields and fields[0] in {"Z", "X", "x"}:
+                    return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -340,6 +352,27 @@ class ActivityTracker:
             )
         return None
 
+    def _record_stale(
+        self,
+        item: OpenActivity,
+        *,
+        current: float,
+        reason: str,
+    ) -> None:
+        key = item.key
+        self._stale.setdefault(
+            (key, item.epoch_seconds),
+            {
+                "source": key[0],
+                "category": key[1],
+                "activity_id": key[2],
+                "label": item.label,
+                "started_at": epoch_to_iso(item.epoch_seconds),
+                "released_at": epoch_to_iso(current),
+                "reason": reason,
+            },
+        )
+
     def active(self, *, now: float | None = None) -> set[tuple[str, str, str]]:
         self.refresh()
         current = time.time() if now is None else now
@@ -354,23 +387,46 @@ class ActivityTracker:
                     continue
                 # Drop it rather than leaving it in the queue, where a later
                 # end event for a reused ID could pair with it.
-                self._stale.setdefault(
-                    (key, item.epoch_seconds),
-                    {
-                        "source": key[0],
-                        "category": key[1],
-                        "activity_id": key[2],
-                        "label": item.label,
-                        "started_at": epoch_to_iso(item.epoch_seconds),
-                        "released_at": epoch_to_iso(current),
-                        "reason": reason,
-                    },
+                self._record_stale(
+                    item,
+                    current=current,
+                    reason=reason,
                 )
             if remaining:
                 self._open[key] = remaining
             else:
                 del self._open[key]
         return live
+
+    def release_unmatched(
+        self,
+        reason: str,
+        *,
+        now: float | None = None,
+        preserve_live_guards: bool = True,
+    ) -> None:
+        """Release open bookkeeping that no longer has credible live work."""
+        self.refresh()
+        current = time.time() if now is None else now
+        for key in list(self._open):
+            remaining = []
+            for item in self._open[key]:
+                if (
+                    preserve_live_guards
+                    and item.guard_pid is not None
+                    and pid_alive(item.guard_pid)
+                ):
+                    remaining.append(item)
+                    continue
+                self._record_stale(
+                    item,
+                    current=current,
+                    reason=reason,
+                )
+            if remaining:
+                self._open[key] = remaining
+            else:
+                del self._open[key]
 
     def stale_intervals(self) -> list[dict[str, Any]]:
         return list(self._stale.values())

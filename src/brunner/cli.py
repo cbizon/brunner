@@ -3,14 +3,19 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import sys
-import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from brunner.cluster import (
+    ClusterCampaign,
+    ClusterCampaignClient,
+    apply_campaign_image_overrides,
+    apply_definition_image_override,
+    finalize_cluster_trial,
+    prepare_cluster_campaign,
+    run_cluster_controller,
+)
 from brunner.contract import load_output_contract, render_output_requirements
-from brunner.campaign import CampaignRunner
 from brunner.definition import BenchmarkDefinition
 from brunner.reference import (
     build_reference_manifest,
@@ -42,24 +47,27 @@ def load_definition(value: str) -> BenchmarkDefinition:
         raise TypeError(
             f"{value} did not provide a BenchmarkDefinition"
         )
+    definition = apply_definition_image_override(definition)
     definition.validate()
     return definition
 
 
-def load_campaign_runner(
+def load_cluster_campaign(
     value: str,
     definition: BenchmarkDefinition,
     contract: Any,
-) -> CampaignRunner:
+) -> ClusterCampaign:
     module_name, separator, attribute_name = value.partition(":")
     if not separator:
         attribute_name = "build_campaign"
     module = importlib.import_module(module_name)
     selected = getattr(module, attribute_name)
-    runner = selected(definition, contract)
-    if not isinstance(runner, CampaignRunner):
-        raise TypeError(f"{value} did not provide a CampaignRunner")
-    return runner
+    campaign = selected(definition, contract)
+    if not isinstance(campaign, ClusterCampaign):
+        raise TypeError(f"{value} did not provide a ClusterCampaign")
+    campaign = apply_campaign_image_overrides(campaign)
+    campaign.validate()
+    return campaign
 
 
 def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
@@ -83,28 +91,39 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     _add_provider_arguments(create)
     create.add_argument("--test-id")
 
-    assessment = subparsers.add_parser("trial-assess")
-    assessment.add_argument("trial", type=_path)
-
     reference = subparsers.add_parser("reference-build")
     reference.add_argument("--output", type=_path)
 
     subparsers.add_parser("reference-validate")
 
-    campaign_init = subparsers.add_parser("campaign-init")
-    campaign_init.add_argument("campaign")
-    campaign_step = subparsers.add_parser("campaign-step")
-    campaign_step.add_argument("campaign")
-    campaign_run = subparsers.add_parser("campaign-run")
-    campaign_run.add_argument("campaign")
-    campaign_run.add_argument("--poll-seconds", type=float, default=5)
-    campaign_run.add_argument("--host", default="127.0.0.1")
-    campaign_run.add_argument("--port", type=int, default=8765)
-    campaign_run.add_argument(
-        "--exit-after-terminal",
+    campaign_submit = subparsers.add_parser("campaign-submit")
+    campaign_submit.add_argument("campaign")
+    campaign_status = subparsers.add_parser("campaign-status")
+    campaign_status.add_argument("campaign")
+    campaign_monitor = subparsers.add_parser("campaign-monitor")
+    campaign_monitor.add_argument("campaign")
+    campaign_monitor.add_argument("--local-port", type=int, default=8765)
+    campaign_retrieve = subparsers.add_parser("campaign-retrieve")
+    campaign_retrieve.add_argument("campaign")
+    campaign_retrieve.add_argument("destination", type=_path)
+    campaign_delete = subparsers.add_parser("campaign-delete")
+    campaign_delete.add_argument("campaign")
+    campaign_delete.add_argument(
+        "--delete-results",
         action="store_true",
-        help="stop the monitor and exit when the campaign is terminal",
+        help="also delete the finalized results PVC",
     )
+
+    for name in (
+        "controller-prepare",
+        "controller-run",
+        "controller-finalize",
+    ):
+        internal = subparsers.add_parser(name)
+        internal.add_argument("campaign")
+        internal.add_argument("--campaign-sha256", required=True)
+        if name == "controller-finalize":
+            internal.add_argument("--trial-relative", required=True)
     return parser
 
 
@@ -148,41 +167,6 @@ def execute(
                 identity,
             )
         }
-    if args.command == "trial-assess":
-        from brunner.assessment import run_assessments
-        from brunner.io import load_json_object, write_json_atomic
-        from brunner.report import write_run_report
-
-        results_path = (
-            args.trial / definition.evaluation.results_path
-        )
-        if not results_path.is_file():
-            raise FileNotFoundError(
-                "deterministic evaluation result does not exist: "
-                f"{results_path}"
-            )
-        evaluation_result = load_json_object(results_path)
-        assessment_index = run_assessments(
-            definition,
-            contract,
-            args.trial,
-            evaluation_result,
-        )
-        evaluation_result["assessment_status"] = assessment_index[
-            "status"
-        ]
-        evaluation_result["required_assessments_complete"] = (
-            assessment_index["required_assessments_complete"]
-        )
-        evaluation_result["assessments"] = assessment_index[
-            "assessments"
-        ]
-        write_json_atomic(results_path, evaluation_result)
-        write_run_report(
-            args.trial,
-            results_path.with_name("run-report.html"),
-        )
-        return assessment_index
     if args.command == "reference-build":
         if definition.reference is None:
             raise ValueError("benchmark does not define a reference bundle")
@@ -207,53 +191,61 @@ def execute(
             definition.reference.root
             / definition.reference.manifest_path,
         )
-    if args.command in {
-        "campaign-init",
-        "campaign-step",
-        "campaign-run",
-    }:
-        runner = load_campaign_runner(
+    if args.command.startswith("campaign-") or args.command.startswith(
+        "controller-"
+    ):
+        benchmark_ref = getattr(args, "benchmark", None)
+        if not benchmark_ref:
+            raise ValueError(
+                "cluster campaign commands require --benchmark so the "
+                "controller image can load the same definition"
+            )
+        campaign = load_cluster_campaign(
             args.campaign,
             definition,
             contract,
         )
-        if args.command == "campaign-init":
-            return runner.initialize()
-        if args.command == "campaign-step":
-            return runner.advance()
-        from brunner.dashboard import start_campaign_server
-
-        server, url = start_campaign_server(
-            runner.root,
-            host=args.host,
-            port=args.port,
-        )
-        thread = threading.Thread(
-            target=server.serve_forever,
-            name="brunner-campaign-monitor",
-            daemon=True,
-        )
-        thread.start()
-        print(f"Campaign monitor: {url}", file=sys.stderr, flush=True)
-        try:
-            state = runner.run(poll_seconds=args.poll_seconds)
-            if args.exit_after_terminal:
-                return state
-            print(
-                "Campaign reached terminal state "
-                f"{state['status']}; monitor remains available at {url}. "
-                "Press Ctrl-C to stop.",
-                file=sys.stderr,
-                flush=True,
+        if args.command == "controller-prepare":
+            return prepare_cluster_campaign(
+                definition,
+                contract,
+                campaign,
+                expected_sha256=args.campaign_sha256,
             )
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            return state if "state" in locals() else runner.initialize()
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
+        if args.command == "controller-run":
+            run_cluster_controller(
+                definition,
+                contract,
+                campaign,
+                benchmark_ref=benchmark_ref,
+                campaign_ref=args.campaign,
+                expected_sha256=args.campaign_sha256,
+            )
+            return None
+        if args.command == "controller-finalize":
+            return finalize_cluster_trial(
+                definition,
+                contract,
+                campaign,
+                expected_sha256=args.campaign_sha256,
+                trial_relative=args.trial_relative,
+            )
+        client = ClusterCampaignClient(
+            definition,
+            campaign,
+            benchmark_ref=benchmark_ref,
+            campaign_ref=args.campaign,
+        )
+        if args.command == "campaign-submit":
+            return client.submit()
+        if args.command == "campaign-status":
+            return client.status()
+        if args.command == "campaign-monitor":
+            return {"return_code": client.monitor(local_port=args.local_port)}
+        if args.command == "campaign-retrieve":
+            return client.retrieve(args.destination)
+        if args.command == "campaign-delete":
+            return client.delete(delete_results=args.delete_results)
     raise AssertionError(args.command)
 
 

@@ -14,6 +14,7 @@ from brunner.timing import (
     _pair_activity_events,
     build_time_accounting,
     epoch_to_iso,
+    pid_alive,
     record_activity,
 )
 
@@ -334,6 +335,74 @@ def test_activity_tracker_keeps_interval_with_live_guard(
     tracker = ActivityTracker(log)
 
     assert tracker.active(now=110.0)
+
+
+def test_activity_tracker_releases_only_unmatched_unguarded_intervals(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "activity.jsonl"
+    log.write_text(
+        _activity_line("start", 100.0)
+        + _activity_line(
+            "start",
+            101.0,
+            activity_id="guarded",
+            guard_pid=os.getpid(),
+        )
+    )
+    tracker = ActivityTracker(log)
+    assert len(tracker.active(now=110.0)) == 2
+
+    tracker.release_unmatched("provider process group is empty", now=120.0)
+
+    assert tracker.active(now=120.0) == {
+        ("benchmark", "background_job", "guarded")
+    }
+    assert tracker.stale_intervals() == [
+        {
+            "source": "benchmark",
+            "category": "background_job",
+            "activity_id": "sim-1",
+            "label": None,
+            "started_at": epoch_to_iso(100.0),
+            "released_at": epoch_to_iso(120.0),
+            "reason": "provider process group is empty",
+        }
+    ]
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/stat").is_file(),
+    reason="Linux /proc process states are required",
+)
+def test_pid_alive_treats_zombie_as_dead(tmp_path: Path) -> None:
+    child_path = tmp_path / "child-pid"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,time;"
+                "child=os.fork();"
+                "os._exit(0) if child == 0 else "
+                "pathlib.Path(os.environ['CHILD_PATH']).write_text(str(child));"
+                "time.sleep(60)"
+            ),
+        ],
+        env={**os.environ, "CHILD_PATH": str(child_path)},
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not child_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(child_path.read_text())
+        while pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert pid_alive(child_pid) is False
+    finally:
+        process.terminate()
+        process.wait(timeout=2)
 
 
 def test_activity_tracker_releases_interval_past_maximum(

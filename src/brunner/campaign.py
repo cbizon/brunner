@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
-import os
 import re
-import socket
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator, TextIO
+from typing import Any, Callable
 
 from brunner.backends import (
     BackendHandle,
@@ -42,6 +38,7 @@ from brunner.failure import (
 )
 from brunner.io import write_json_atomic
 from brunner.pipeline import summarize_pipeline_state
+from brunner.providers import ProviderSettings, get_provider
 from brunner.trial import TrialIdentity, create_trial, load_trial_identity
 
 
@@ -55,6 +52,8 @@ WorkloadFactory = Callable[
     ],
     WorkloadSpec,
 ]
+EvaluationFinalizer = Callable[[Path], dict[str, Any]]
+ResultPublisher = Callable[[Path, dict[str, Any]], Path | None]
 
 TRIAL_PHASES = frozenset(
     {
@@ -69,6 +68,8 @@ TRIAL_PHASES = frozenset(
         "evaluation_pending",
         "infrastructure_retrying",
         "pending",
+        "publication_pending",
+        "publishing",
         "running",
         "submission_retry_wait",
         "submitted",
@@ -84,6 +85,16 @@ def _now() -> str:
 def _slug(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return normalized or "trial"
+
+
+def campaign_resource_name(
+    benchmark_id: str,
+    campaign_id: str,
+) -> str:
+    identity = f"{benchmark_id}\0{campaign_id}".encode()
+    digest = hashlib.sha256(identity).hexdigest()[:10]
+    prefix = _slug(campaign_id)[:30].rstrip("-")
+    return f"brunner-{prefix}-{digest}"
 
 
 def _load_optional_object(path: Path) -> dict[str, Any] | None:
@@ -116,6 +127,22 @@ class CampaignTrial:
     provider: str
     model: str
     effort: str | None = None
+    provider_id: str | None = None
+    provider_name: str = "OpenAI-compatible provider"
+    base_url: str | None = None
+    environment_key: str = "OPENAI_API_KEY"
+
+    @property
+    def provider_settings(self) -> ProviderSettings:
+        return ProviderSettings(
+            provider=self.provider,
+            model=self.model,
+            effort=self.effort,
+            provider_id=self.provider_id,
+            provider_name=self.provider_name,
+            base_url=self.base_url,
+            environment_key=self.environment_key,
+        )
 
     def validate(self) -> None:
         if not self.test_id.strip():
@@ -133,20 +160,41 @@ class CampaignTrial:
             raise ValueError("campaign trial provider cannot be empty")
         if not self.model.strip():
             raise ValueError("campaign trial model cannot be empty")
+        if not self.provider_name.strip():
+            raise ValueError("campaign trial provider_name cannot be empty")
+        if not self.environment_key.strip():
+            raise ValueError("campaign trial environment_key cannot be empty")
+        if self.provider_id is None and (
+            self.base_url is not None
+            or self.provider_name != "OpenAI-compatible provider"
+            or self.environment_key != "OPENAI_API_KEY"
+        ):
+            raise ValueError(
+                "campaign trial custom provider connection settings require "
+                "provider_id"
+            )
+        get_provider(self.provider).validate_settings(self.provider_settings)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "test_id": self.test_id,
             "provider": self.provider,
             "model": self.model,
             "effort": self.effort,
         }
+        if self.provider_id is not None:
+            value["provider_connection"] = {
+                "provider_id": self.provider_id,
+                "provider_name": self.provider_name,
+                "base_url": self.base_url,
+                "environment_key": self.environment_key,
+            }
+        return value
 
 
 @dataclass(frozen=True)
 class CampaignPlan:
     campaign_id: str
-    root: Path
     trials: tuple[CampaignTrial, ...]
     max_parallel: int = 1
     backend_image: str | None = None
@@ -167,6 +215,8 @@ class CampaignPlan:
     collection_retry_seconds: float = 60.0
     collection_max_attempts: int = 3
     cleanup_retry_seconds: float = 60.0
+    publication_retry_seconds: float = 60.0
+    publication_max_attempts: int = 3
     infrastructure_max_restarts: int = 2
     trial_timeout_seconds: float | None = None
     trial_timeout_margin_seconds: float = 5 * 60
@@ -221,6 +271,14 @@ class CampaignPlan:
             raise ValueError(
                 "campaign cleanup_retry_seconds must not be negative"
             )
+        if self.publication_retry_seconds < 0:
+            raise ValueError(
+                "campaign publication_retry_seconds must not be negative"
+            )
+        if self.publication_max_attempts < 1:
+            raise ValueError(
+                "campaign publication_max_attempts must be positive"
+            )
         if self.infrastructure_max_restarts < 0:
             raise ValueError(
                 "campaign infrastructure_max_restarts cannot be negative"
@@ -259,10 +317,15 @@ class CampaignPlan:
                 )
 
     def to_dict(self) -> dict[str, Any]:
+        trials = {
+            trial.test_id: trial.to_dict()
+            for trial in self.trials
+        }
         return {
             "campaign_id": self.campaign_id,
-            "root": str(self.root.resolve()),
-            "trials": [trial.to_dict() for trial in self.trials],
+            "trials": [
+                trials[test_id] for test_id in sorted(trials)
+            ],
             "max_parallel": self.max_parallel,
             "backend_image": self.backend_image,
             "provider_executable": self.provider_executable,
@@ -289,6 +352,8 @@ class CampaignPlan:
             "collection_retry_seconds": self.collection_retry_seconds,
             "collection_max_attempts": self.collection_max_attempts,
             "cleanup_retry_seconds": self.cleanup_retry_seconds,
+            "publication_retry_seconds": self.publication_retry_seconds,
+            "publication_max_attempts": self.publication_max_attempts,
             "infrastructure_max_restarts": (
                 self.infrastructure_max_restarts
             ),
@@ -322,6 +387,19 @@ def default_workload_factory(
         command.extend(
             ("--provider-executable", plan.provider_executable)
         )
+    if campaign_trial.provider_id is not None:
+        command.extend(
+            (
+                "--provider-id",
+                campaign_trial.provider_id,
+                "--provider-name",
+                campaign_trial.provider_name,
+                "--environment-key",
+                campaign_trial.environment_key,
+            )
+        )
+        if campaign_trial.base_url is not None:
+            command.extend(("--base-url", campaign_trial.base_url))
     trusted_evaluation = _campaign_evaluation_spec(
         definition,
         contract,
@@ -349,7 +427,12 @@ def default_workload_factory(
             )
         ),
         evaluation=trusted_evaluation,
-        labels={"dev.brunner/campaign": _slug(plan.campaign_id)[:63]},
+        labels={
+            "dev.brunner/campaign": campaign_resource_name(
+                definition.benchmark_id,
+                plan.campaign_id,
+            )
+        },
     )
 
 
@@ -380,7 +463,9 @@ def _handle_from_dict(value: dict[str, Any]) -> BackendHandle:
     )
 
 
-class CampaignRunner:
+class CampaignEngine:
+    """Internal reconciliation engine used by the cluster controller."""
+
     def __init__(
         self,
         definition: BenchmarkDefinition,
@@ -388,7 +473,11 @@ class CampaignRunner:
         plan: CampaignPlan,
         backend: ExecutionBackend,
         *,
+        control_root: Path,
+        results_root: Path,
         workload_factory: WorkloadFactory = default_workload_factory,
+        evaluation_finalizer: EvaluationFinalizer | None = None,
+        result_publisher: ResultPublisher | None = None,
     ) -> None:
         if getattr(backend, "agent_isolation", None) != CONTAINER_ISOLATION:
             raise ValueError(
@@ -407,13 +496,21 @@ class CampaignRunner:
         self.plan = plan
         self.backend = backend
         self.workload_factory = workload_factory
-        self.root = plan.root.resolve()
-        self.state_path = self.root / "campaign.json"
-        self.state_backup_path = self.root / "campaign.json.bak"
-        self.dashboard_path = self.root / "index.html"
-        self.lock_path = self.root / "campaign.lock"
-        self._lock_depth = 0
-        self._lock_stream: TextIO | None = None
+        self.control_root = control_root.resolve()
+        self.results_root = results_root.resolve()
+        self.state_path = self.control_root / "campaign.json"
+        self.state_backup_path = self.control_root / "campaign.json.bak"
+        self.dashboard_path = self.results_root / "index.html"
+        self.evaluation_finalizer = (
+            evaluation_finalizer
+            if evaluation_finalizer is not None
+            else lambda trial: finalize_evaluation(
+                self.definition,
+                self.contract,
+                trial,
+            )
+        )
+        self.result_publisher = result_publisher
 
     def _configured_workload(
         self,
@@ -469,56 +566,12 @@ class CampaignRunner:
             )
         return workload
 
-    @contextmanager
-    def _campaign_lock(self) -> Iterator[None]:
-        if self._lock_depth:
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-            return
-
-        self.root.mkdir(parents=True, exist_ok=True)
-        stream = self.lock_path.open("a+")
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            stream.seek(0)
-            owner = stream.read().strip() or "owner information unavailable"
-            stream.close()
-            raise RuntimeError(
-                f"another orchestrator is using campaign "
-                f"{self.plan.campaign_id}: {owner}"
-            ) from error
-
-        owner = {
-            "pid": os.getpid(),
-            "hostname": socket.gethostname(),
-            "campaign_id": self.plan.campaign_id,
-            "state_path": str(self.state_path),
-            "acquired_at": _now(),
-        }
-        stream.seek(0)
-        stream.truncate()
-        stream.write(json.dumps(owner, sort_keys=True) + "\n")
-        stream.flush()
-        self._lock_stream = stream
-        self._lock_depth = 1
-        try:
-            yield
-        finally:
-            self._lock_depth = 0
-            self._lock_stream = None
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            stream.close()
-
     def initialize(self) -> dict[str, Any]:
-        with self._campaign_lock():
-            return self._initialize()
+        return self._initialize()
 
     def _initialize(self) -> dict[str, Any]:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.control_root.mkdir(parents=True, exist_ok=True)
+        self.results_root.mkdir(parents=True, exist_ok=True)
         if self.state_path.is_file():
             recovered_from_backup = False
             try:
@@ -684,6 +737,11 @@ class CampaignRunner:
                 entry["evaluation_error"] = (
                     "evaluation was interrupted before completion"
                 )
+            elif phase == "publishing":
+                entry["phase"] = "publication_pending"
+                entry["publication_error"] = (
+                    "result publication was interrupted before completion"
+                )
             else:
                 continue
             self._event(
@@ -701,7 +759,7 @@ class CampaignRunner:
             for entry in state.get("trials", [])
             if isinstance(entry, dict) and "test_id" in entry
         }
-        tests_root = self.root / "trials"
+        tests_root = self.control_root / "trials"
         tests_root.mkdir(parents=True, exist_ok=True)
         added = 0
         seen = set()
@@ -710,21 +768,16 @@ class CampaignRunner:
                 continue
             seen.add(campaign_trial.test_id)
             existing = entries.get(campaign_trial.test_id)
-            expected = {
-                "provider": campaign_trial.provider,
-                "model": campaign_trial.model,
-                "effort": campaign_trial.effort,
-            }
+            expected = campaign_trial.to_dict()
             if existing is not None:
                 attempts = existing.setdefault("attempts", {})
                 attempts.setdefault("submission", 0)
                 attempts.setdefault("collection", 0)
                 attempts.setdefault("cleanup", 0)
+                attempts.setdefault("publication", 0)
                 attempts.setdefault("infrastructure", 0)
                 actual = {
-                    "provider": existing.get("provider"),
-                    "model": existing.get("model"),
-                    "effort": existing.get("effort"),
+                    key: existing.get(key) for key in expected
                 }
                 mismatches = {
                     key: {
@@ -825,7 +878,6 @@ class CampaignRunner:
                     ),
                 )
             entry = {
-                "test_id": campaign_trial.test_id,
                 "trial": str(trial),
                 **expected,
                 "phase": "pending",
@@ -834,6 +886,7 @@ class CampaignRunner:
                     "submission": 0,
                     "collection": 0,
                     "cleanup": 0,
+                    "publication": 0,
                     "infrastructure": 0,
                 },
             }
@@ -1034,11 +1087,25 @@ class CampaignRunner:
         self,
         entry: dict[str, Any],
     ) -> CampaignTrial:
+        connection = entry.get("provider_connection")
+        if not isinstance(connection, dict):
+            connection = {}
         return CampaignTrial(
             test_id=str(entry["test_id"]),
             provider=str(entry["provider"]),
             model=str(entry["model"]),
             effort=entry.get("effort"),
+            provider_id=connection.get("provider_id"),
+            provider_name=str(
+                connection.get(
+                    "provider_name",
+                    "OpenAI-compatible provider",
+                )
+            ),
+            base_url=connection.get("base_url"),
+            environment_key=str(
+                connection.get("environment_key", "OPENAI_API_KEY")
+            ),
         )
 
     def _submit_entry(
@@ -1464,7 +1531,7 @@ class CampaignRunner:
         handle: BackendHandle,
         backend_phase: str,
     ) -> None:
-        destination = self.root / "collected" / entry["test_id"]
+        destination = self.control_root / "collected" / entry["test_id"]
         entry["backend_phase"] = backend_phase
         if entry["phase"] != "evaluation_pending":
             attempt_number = self._begin_collection_attempt(state, entry)
@@ -1692,16 +1759,19 @@ class CampaignRunner:
                 ),
                 test_id=entry["test_id"],
             )
-            self._cleanup_entry(state, entry, handle)
+            self._publish_and_cleanup(state, entry, handle, destination)
             return
         entry["phase"] = "evaluating"
         self._save(state)
         try:
-            evaluation = finalize_evaluation(
-                self.definition,
-                self.contract,
-                destination,
+            evaluation = self.evaluation_finalizer(destination)
+        except BackendConnectivityError:
+            entry["phase"] = "evaluation_pending"
+            entry["evaluation_error"] = (
+                "cluster connectivity was interrupted during assessment"
             )
+            self._save(state)
+            raise
         except Exception as error:
             entry["phase"] = "attention_required"
             entry["evaluation_error"] = str(error)
@@ -1733,6 +1803,11 @@ class CampaignRunner:
                 "required_assessments_complete"
             ],
             "assessments": evaluation["assessments"],
+            "reports": [
+                dict(report)
+                for report in evaluation.get("reports", [])
+                if isinstance(report, dict)
+            ],
             "results": str(
                 destination / self.definition.evaluation.results_path
             ),
@@ -1832,11 +1907,108 @@ class CampaignRunner:
         else:
             if outcome_failure is not None:
                 attach_failure(entry, outcome_failure)
+        self._publish_and_cleanup(state, entry, handle, destination)
+
+    def _publish_and_cleanup(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+        handle: BackendHandle,
+        source: Path,
+    ) -> None:
+        if self.result_publisher is not None:
+            entry["phase"] = "publishing"
+            self._save(state)
+            try:
+                published = self.result_publisher(source, entry)
+            except Exception as error:
+                attempts = int(
+                    entry["attempts"].get("publication", 0)
+                ) + 1
+                entry["attempts"]["publication"] = attempts
+                retryable = (
+                    isinstance(error, OSError)
+                    and attempts < self.plan.publication_max_attempts
+                )
+                entry["phase"] = (
+                    "publication_pending"
+                    if retryable
+                    else "attention_required"
+                )
+                entry["publication_error"] = str(error)
+                if retryable:
+                    entry["next_publication_attempt_at"] = (
+                        datetime.now(UTC)
+                        + timedelta(
+                            seconds=self.plan.publication_retry_seconds
+                        )
+                    ).isoformat()
+                attach_failure(
+                    entry,
+                    failure_from_exception(
+                        error,
+                        operation="result_publication",
+                        domain="orchestrator",
+                        reason=(
+                            "ResultPublicationRetry"
+                            if retryable
+                            else "ResultPublicationFailed"
+                        ),
+                        disposition=(
+                            "retry" if retryable else "attention"
+                        ),
+                        retryable=retryable,
+                        cleanup_required=True,
+                        resource="results_pvc",
+                    ),
+                )
+                self._event(
+                    state,
+                    (
+                        "result_publication_retry_scheduled"
+                        if retryable
+                        else "result_publication_failed"
+                    ),
+                    (
+                        f"result publication attempt {attempts} failed; "
+                        f"retrying at "
+                        f"{entry['next_publication_attempt_at']}: {error}"
+                        if retryable
+                        else str(error)
+                    ),
+                    test_id=entry["test_id"],
+                )
+                self._save(state)
+                return
+            if published is not None:
+                entry["source_collected_trial"] = str(source)
+                entry["collected_trial"] = str(published)
+                evaluation = entry.get("evaluation")
+                if isinstance(evaluation, dict):
+                    results = evaluation.get("results")
+                    report = evaluation.get("report")
+                    if isinstance(results, str):
+                        evaluation["results"] = str(
+                            published
+                            / Path(results).relative_to(source)
+                        )
+                    if isinstance(report, str):
+                        evaluation["report"] = str(
+                            published
+                            / Path(report).relative_to(source)
+                        )
+            entry.pop("publication_error", None)
+            entry.pop("next_publication_attempt_at", None)
+            self._event(
+                state,
+                "result_published",
+                "published bounded trial results to the results volume",
+                test_id=entry["test_id"],
+            )
         self._cleanup_entry(state, entry, handle)
 
     def advance(self) -> dict[str, Any]:
-        with self._campaign_lock():
-            return self._advance()
+        return self._advance()
 
     def _advance(self) -> dict[str, Any]:
         state = self._initialize()
@@ -1901,6 +2073,7 @@ class CampaignRunner:
                 "collection_pending",
                 "collection_retry_wait",
                 "evaluation_pending",
+                "publication_pending",
                 "cleanup_pending",
             }:
                 continue
@@ -1977,6 +2150,32 @@ class CampaignRunner:
                     )
                 except BackendConnectivityError as error:
                     return self._pause_connectivity(state, error)
+                continue
+            if entry["phase"] == "publication_pending":
+                retry_at = entry.get("next_publication_attempt_at")
+                if retry_at:
+                    try:
+                        retry_time = datetime.fromisoformat(str(retry_at))
+                    except ValueError:
+                        retry_time = datetime.now(UTC)
+                    if retry_time.tzinfo is None:
+                        retry_time = retry_time.replace(tzinfo=UTC)
+                    if retry_time > datetime.now(UTC):
+                        continue
+                source = Path(
+                    entry.get("source_collected_trial")
+                    or (
+                        self.control_root
+                        / "collected"
+                        / entry["test_id"]
+                    )
+                )
+                self._publish_and_cleanup(
+                    state,
+                    entry,
+                    handle,
+                    source,
+                )
                 continue
             try:
                 snapshot = self.backend.inspect(handle)
@@ -2187,6 +2386,8 @@ class CampaignRunner:
                         "collection_retry_wait",
                         "collecting",
                         "evaluating",
+                        "publication_pending",
+                        "publishing",
                         "cleanup_pending",
                     }
                     or bool(entry.get("backend_workload_live"))
@@ -2342,6 +2543,8 @@ class CampaignRunner:
             "collecting",
             "evaluation_pending",
             "evaluating",
+            "publication_pending",
+            "publishing",
             "cleanup_pending",
         }:
             state["status"] = "running"
@@ -2388,12 +2591,11 @@ class CampaignRunner:
     ) -> dict[str, Any]:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
-        with self._campaign_lock():
-            while True:
-                state = self._advance()
-                if state["status"] not in {
-                    "running",
-                    "paused_backend_connectivity",
-                }:
-                    return state
-                time.sleep(poll_seconds)
+        while True:
+            state = self._advance()
+            if state["status"] not in {
+                "running",
+                "paused_backend_connectivity",
+            }:
+                return state
+            time.sleep(poll_seconds)

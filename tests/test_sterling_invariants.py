@@ -8,6 +8,7 @@ import threading
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,7 +38,11 @@ from brunner.backends.squid import (
     proxy_url_from_service,
     render_managed_proxy_resources,
 )
-from brunner.campaign import CampaignPlan, CampaignRunner, CampaignTrial
+from brunner.campaign import (
+    CampaignEngine,
+    CampaignPlan as EngineCampaignPlan,
+    CampaignTrial,
+)
 from brunner.contract import load_output_contract
 from brunner.dashboard import start_campaign_server
 from brunner.definition import ArtifactPolicy
@@ -50,6 +55,35 @@ from examples.text_benchmark.definition import build_definition
 ROOT = Path(__file__).parents[1]
 DIGEST = "sha256:" + "1" * 64
 IMAGE = f"registry.example/brunner@{DIGEST}"
+
+
+class CampaignPlan:
+    """Test-only adapter for the internal cluster reconciliation engine."""
+
+    def __init__(self, *, root: Path, **values: Any) -> None:
+        self.root = root
+        self.engine_plan = EngineCampaignPlan(**values)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.engine_plan, name)
+
+
+def CampaignRunner(
+    definition: Any,
+    contract: Any,
+    plan: CampaignPlan,
+    backend: Any,
+    **kwargs: Any,
+) -> CampaignEngine:
+    return CampaignEngine(
+        definition,
+        contract,
+        plan.engine_plan,
+        backend,
+        control_root=plan.root / "control",
+        results_root=plan.root,
+        **kwargs,
+    )
 
 
 def _trial(tmp_path: Path, test_id: str = "trial") -> Path:
@@ -150,7 +184,7 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
     assert job["metadata"]["annotations"][
         NETWORK_ISOLATION_MODE_ANNOTATION
     ] == "strict"
-    assert job["spec"]["backoffLimit"] == 6
+    assert job["spec"]["backoffLimit"] == 0
 
 
 def test_managed_proxy_owns_provider_allowlist_and_dns() -> None:
