@@ -438,6 +438,13 @@ class ExecutionBackend(Protocol):
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot: ...
 
+    def terminate(
+        self,
+        handle: BackendHandle,
+        *,
+        reason: str,
+    ) -> BackendSnapshot: ...
+
     def logs(self, handle: BackendHandle) -> str: ...
 
     def collect(

@@ -20,12 +20,14 @@ from brunner.backends.kubernetes import (
     KubernetesBackend,
     KubernetesProfile as ProductionKubernetesProfile,
     ReaderMountError,
+    render_collection_job,
     render_helper_pod,
     render_job,
     render_pvc,
 )
 from brunner.definition import ArtifactPolicy
 from brunner.errors import (
+    ArtifactTransferPending,
     BackendConfigurationError,
     BackendConnectivityError,
     BackendRequestError,
@@ -240,7 +242,12 @@ def test_kubernetes_secret_references_do_not_read_laptop_or_cluster_secrets(
     trial = tmp_path / "trial"
     trial.mkdir()
     backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     workload = WorkloadSpec(
         workload_id="codex",
@@ -300,7 +307,12 @@ def test_kubernetes_rejects_ambiguous_secret_key_reuse(
     trial = tmp_path / "trial"
     trial.mkdir()
     backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     workload = WorkloadSpec(
         workload_id="codex",
@@ -1179,12 +1191,16 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
         image="agent:latest",
     )
     backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     job_name = native_resource_name("case-1", trial)
     claim_name = native_resource_name("case-1", trial, suffix="-data")
     remote: dict[str, dict[str, object]] = {}
-    staging_calls = 0
     job_apply_calls = 0
 
     def get_resource(
@@ -1211,30 +1227,8 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
                     "connection dropped after Job creation"
                 )
 
-    def stage_trial(*args: object, **kwargs: object) -> None:
-        nonlocal staging_calls
-        staging_calls += 1
-
-    def run_command(
-        *arguments: str,
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        assert arguments[:3] == ("annotate", "pvc", claim_name)
-        pvc = remote[f"pvc/{claim_name}"]
-        metadata = pvc["metadata"]
-        assert isinstance(metadata, dict)
-        annotations = metadata.setdefault("annotations", {})
-        assert isinstance(annotations, dict)
-        for argument in arguments:
-            if argument.startswith("dev.brunner/") and "=" in argument:
-                key, value = argument.split("=", 1)
-                annotations[key] = value
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
     monkeypatch.setattr(backend, "_get", get_resource)
     monkeypatch.setattr(backend, "_apply", apply_resource)
-    monkeypatch.setattr(backend, "_stage_trial", stage_trial)
-    monkeypatch.setattr(backend, "_run", run_command)
 
     with pytest.raises(BackendConnectivityError):
         backend.submit(workload)
@@ -1242,24 +1236,26 @@ def test_kubernetes_submission_adopts_job_after_ambiguous_apply(
 
     assert handle.native_id == job_name
     assert handle.metadata["claim_name"] == claim_name
-    assert staging_calls == 1
     assert job_apply_calls == 1
+    stager = remote[f"job/{job_name}"]["spec"]["template"]["spec"][
+        "initContainers"
+    ][0]
+    assert stager["name"] == "stager"
+    assert stager["volumeMounts"][0]["readOnly"] is True
     assert (trial / "backend/kubernetes.json").is_file()
 
 
 @pytest.mark.parametrize(
-    ("fault_boundary", "expected_staging_calls"),
+    "fault_boundary",
     [
-        ("pvc_created", 1),
-        ("trial_staged", 2),
-        ("pvc_annotated", 1),
+        "pvc_created",
+        "job_created",
     ],
 )
 def test_kubernetes_submission_recovers_each_pre_job_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fault_boundary: str,
-    expected_staging_calls: int,
 ) -> None:
     trial = tmp_path / "trial"
     (trial / "workspace").mkdir(parents=True)
@@ -1272,12 +1268,16 @@ def test_kubernetes_submission_recovers_each_pre_job_boundary(
         image="agent:latest",
     )
     backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     job_name = native_resource_name("case-1", trial)
     claim_name = native_resource_name("case-1", trial, suffix="-data")
     remote: dict[str, dict[str, object]] = {}
-    staging_calls = 0
     fault_injected = False
 
     def inject_once(boundary: str) -> None:
@@ -1306,33 +1306,11 @@ def test_kubernetes_submission_recovers_each_pre_job_boundary(
         remote[f"{kind}/{name}"] = resource
         if kind == "pvc":
             inject_once("pvc_created")
-
-    def stage_trial(*args: object, **kwargs: object) -> None:
-        nonlocal staging_calls
-        staging_calls += 1
-        inject_once("trial_staged")
-
-    def run_command(
-        *arguments: str,
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        assert arguments[:3] == ("annotate", "pvc", claim_name)
-        pvc = remote[f"pvc/{claim_name}"]
-        metadata = pvc["metadata"]
-        assert isinstance(metadata, dict)
-        annotations = metadata.setdefault("annotations", {})
-        assert isinstance(annotations, dict)
-        for argument in arguments:
-            if argument.startswith("dev.brunner/") and "=" in argument:
-                key, value = argument.split("=", 1)
-                annotations[key] = value
-        inject_once("pvc_annotated")
-        return subprocess.CompletedProcess(arguments, 0, "", "")
+        if kind == "job":
+            inject_once("job_created")
 
     monkeypatch.setattr(backend, "_get", get_resource)
     monkeypatch.setattr(backend, "_apply", apply_resource)
-    monkeypatch.setattr(backend, "_stage_trial", stage_trial)
-    monkeypatch.setattr(backend, "_run", run_command)
 
     with pytest.raises(BackendConnectivityError):
         backend.submit(workload)
@@ -1340,7 +1318,6 @@ def test_kubernetes_submission_recovers_each_pre_job_boundary(
 
     assert handle.native_id == job_name
     assert remote[f"job/{job_name}"]["kind"] == "Job"
-    assert staging_calls == expected_staging_calls
     assert (trial / "backend/kubernetes.json").is_file()
 
 
@@ -1424,6 +1401,88 @@ def test_kubernetes_snapshot_classifies_infrastructure_restart(
 
     assert snapshot.phase == "failed"
     assert snapshot.details["retryable_infrastructure"] is expected
+
+
+def test_kubernetes_termination_preserves_events_before_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "backend").mkdir(parents=True)
+    backend = KubernetesBackend(
+        KubernetesProfile(namespace="benchmarks")
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="trial",
+        native_id="trial-job",
+        trial=trial,
+        metadata={"claim_name": "trial-data"},
+    )
+    observed = BackendSnapshot(
+        phase="running",
+        details={"retryable_infrastructure": False},
+    )
+    job = {"metadata": {"name": "trial-job", "uid": "job-uid"}}
+    pod = {"metadata": {"name": "trial-pod", "uid": "pod-uid"}}
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(backend, "inspect", lambda unused: observed)
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, name=None, **kwargs: job,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_pods_for_handle",
+        lambda unused: (pod,),
+    )
+
+    def events(
+        name: str,
+        uid: str | None,
+        **kwargs: object,
+    ) -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "involved_name": name,
+                "message": f"event for {uid}",
+            },
+        )
+
+    monkeypatch.setattr(backend, "_events", events)
+    monkeypatch.setattr(
+        backend,
+        "_delete_and_wait",
+        lambda kind, name: calls.append((kind, name)),
+    )
+
+    snapshot = backend.terminate(
+        handle,
+        reason="TrialDeadlineExceeded",
+    )
+
+    assert calls == [("job", "trial-job")]
+    assert snapshot.details["termination_events"] == [
+        {
+            "involved_name": "trial-job",
+            "message": "event for job-uid",
+        },
+        {
+            "involved_name": "trial-pod",
+            "message": "event for pod-uid",
+        },
+    ]
+    persisted = json.loads(
+        (trial / "backend/kubernetes.json").read_text()
+    )
+    assert (
+        persisted["termination_snapshot"]["details"][
+            "termination_events"
+        ]
+        == snapshot.details["termination_events"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1783,7 +1842,7 @@ def test_kubernetes_missing_job_with_pvc_is_retryable_failure(
     assert snapshot.details["retryable_infrastructure"] is True
 
 
-def test_kubernetes_restart_reuses_pvc_without_restaging(
+def test_kubernetes_restart_reuses_staged_pvc_without_overwriting_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1798,7 +1857,12 @@ def test_kubernetes_restart_reuses_pvc_without_restaging(
         image="agent:latest",
     )
     backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     workload_name = native_resource_name("case-1", trial)
     claim_name = native_resource_name("case-1", trial, suffix="-data")
@@ -1840,17 +1904,12 @@ def test_kubernetes_restart_reuses_pvc_without_restaging(
         lambda kind, name: deleted.append((kind, name)),
     )
     monkeypatch.setattr(backend, "_apply", applied.append)
-    monkeypatch.setattr(
-        backend,
-        "_stage_trial",
-        lambda *args, **kwargs: pytest.fail("restart must not restage trial"),
-    )
-
     restarted = backend.restart(previous, workload, 1)
 
     assert deleted == [("job", workload_name)]
     assert len(applied) == 1
     assert applied[0]["kind"] == "Job"
+    assert "initContainers" not in applied[0]["spec"]["template"]["spec"]
     assert restarted.native_id.endswith("-r1")
     assert restarted.metadata["claim_name"] == claim_name
     assert restarted.metadata["restart_generation"] == 1
@@ -2201,9 +2260,8 @@ def test_kubernetes_deletes_stale_helpers_by_labels_and_waits(
     assert deleted == [("pod", "stale-reader")]
 
 
-def test_kubernetes_stage_labels_and_waits_for_helper_cleanup(
+def test_kubernetes_stage_runs_as_job_init_container_without_api_copy(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trial = tmp_path / "trial"
     trial.mkdir()
@@ -2215,81 +2273,78 @@ def test_kubernetes_stage_labels_and_waits_for_helper_cleanup(
         timeout_seconds=60,
         image="agent:latest",
     )
-    backend = KubernetesBackend(
-        KubernetesProfile(namespace="benchmarks")
-    )
-    workload_name = native_resource_name("case-1", trial)
     claim_name = native_resource_name("case-1", trial, suffix="-data")
-    cleaned = []
-    resources = []
-    deleted = []
-    monkeypatch.setattr(
-        backend,
-        "_delete_helper_pods",
-        lambda names, role: cleaned.append((names, role)),
-    )
-    monkeypatch.setattr(backend, "_apply", resources.append)
-    monkeypatch.setattr(
-        backend,
-        "_wait_for_pod",
-        lambda name, timeout: None,
-    )
-    monkeypatch.setattr(
-        backend,
-        "_remote_protocol",
-        lambda name: {"protocol": "1.0", "version": "test"},
-    )
-    monkeypatch.setattr(
-        backend,
-        "_run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args,
-            0,
-            "",
-            "",
-        ),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_delete_and_wait",
-        lambda kind, name: deleted.append((kind, name)),
-    )
-
-    backend._stage_trial(
-        workload,
+    job = render_job(
+        "case-1-job",
         claim_name,
-        "agent:latest",
+        workload,
+        KubernetesProfile(namespace="benchmarks"),
         {
             "app.kubernetes.io/name": "brunner",
-            "dev.brunner/workload": workload_name,
+            "dev.brunner/workload": "case-1-job",
         },
+        stage_source_claim="campaign-control",
+        stage_source_sub_path="trial",
+        stage_report={
+            "challenge_sha256": "a" * 64,
+            "file_inventory": {},
+            "benchmark_id": "test",
+            "benchmark_version": "1.0",
+            "contract_sha256": "b" * 64,
+        },
+        stager_image="reader:latest",
     )
 
-    assert cleaned == [((workload_name,), "trial-stager")]
-    assert resources[0]["metadata"]["labels"]["dev.brunner/role"] == (
-        "trial-stager"
+    stager = job["spec"]["template"]["spec"]["initContainers"][0]
+    assert stager["name"] == "stager"
+    assert stager["command"][2] == "brunner.backends.remote"
+    assert stager["command"][3] == "stage-copy"
+    assert stager["volumeMounts"][0] == {
+        "name": "stage-source",
+        "mountPath": "/brunner/source",
+        "readOnly": True,
+        "subPath": "trial",
+    }
+    agent = job["spec"]["template"]["spec"]["containers"][0]
+    assert all(
+        mount["name"] != "stage-source"
+        for mount in agent["volumeMounts"]
     )
-    assert deleted == [
-        (
-            "pod",
-            native_resource_name(
-                "case-1",
-                trial,
-                suffix="-stage",
-            ),
-        ),
-        (
-            "pod",
-            native_resource_name(
-                "case-1",
-                trial,
-                suffix="-stage",
-            ),
-        ),
-    ]
 
 
-def test_kubernetes_collect_surfaces_reader_cleanup_disconnect(
+def test_collection_job_mounts_control_claim_once() -> None:
+    job = render_collection_job(
+        "case-1-collect",
+        trial_claim_name="case-1-data",
+        control_claim_name="campaign-control",
+        baseline_sub_path="trials/case-1",
+        destination_relative="collected/case-1",
+        image="reader:latest",
+        profile=KubernetesProfile(namespace="benchmarks"),
+        labels={"dev.brunner/role": "artifact-reader"},
+        encoded_policy="policy",
+        evaluation_results_path="evaluation/results.json",
+    )
+
+    pod_spec = job["spec"]["template"]["spec"]
+    collector = pod_spec["containers"][0]
+    assert collector["command"][5] == (
+        "/brunner/control/trials/case-1"
+    )
+    assert [
+        volume["name"] for volume in pod_spec["volumes"]
+    ].count("control") == 1
+    assert all(
+        volume["name"] != "baseline"
+        for volume in pod_spec["volumes"]
+    )
+    assert all(
+        mount["name"] != "baseline"
+        for mount in collector["volumeMounts"]
+    )
+
+
+def test_kubernetes_collect_surfaces_collection_job_cleanup_disconnect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2299,8 +2354,9 @@ def test_kubernetes_collect_surfaces_reader_cleanup_disconnect(
         KubernetesProfile(
             namespace="benchmarks",
             artifact_reader_image="reader:latest",
-            reader_attempts=1,
-        )
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     handle = BackendHandle(
         backend="kubernetes",
@@ -2309,20 +2365,28 @@ def test_kubernetes_collect_surfaces_reader_cleanup_disconnect(
         trial=trial,
         metadata={"claim_name": "case-1-data"},
     )
+    destination = tmp_path / "collected"
+
+    def completed_job(
+        kind: str,
+        name: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        destination.mkdir(exist_ok=True)
+        destination.with_name("collected-inventory.json").write_text("{}")
+        destination.with_name("collected-collection.json").write_text(
+            json.dumps({"files": 0})
+        )
+        return {
+            "status": {
+                "conditions": [{"type": "Complete", "status": "True"}]
+            }
+        }
+
     monkeypatch.setattr(
         backend,
-        "_delete_helper_pods",
-        lambda names, role: None,
-    )
-    monkeypatch.setattr(
-        backend,
-        "_reader",
-        lambda *args, **kwargs: ("reader-pod", "node-a"),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_collect_from_reader",
-        lambda *args, **kwargs: {"files": []},
+        "_get",
+        completed_job,
     )
     monkeypatch.setattr(
         backend,
@@ -2338,12 +2402,12 @@ def test_kubernetes_collect_surfaces_reader_cleanup_disconnect(
     ):
         backend.collect(
             handle,
-            tmp_path / "collected",
+            destination,
             policy=ArtifactPolicy(),
         )
 
 
-def test_kubernetes_collection_does_not_retry_integrity_failure(
+def test_kubernetes_collection_rejects_completed_job_without_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2353,8 +2417,9 @@ def test_kubernetes_collection_does_not_retry_integrity_failure(
         KubernetesProfile(
             namespace="benchmarks",
             artifact_reader_image="reader:latest",
-            reader_attempts=3,
-        )
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     handle = BackendHandle(
         backend="kubernetes",
@@ -2363,40 +2428,92 @@ def test_kubernetes_collection_does_not_retry_integrity_failure(
         trial=trial,
         metadata={"claim_name": "case-1-data"},
     )
-    reader_calls = 0
+    get_calls = 0
 
-    def reader(*args: object, **kwargs: object) -> tuple[str, str]:
-        nonlocal reader_calls
-        reader_calls += 1
-        return f"reader-{reader_calls}", "node-a"
+    def get_job(
+        kind: str,
+        name: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal get_calls
+        get_calls += 1
+        return {
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Complete",
+                        "status": "True",
+                        "lastTransitionTime": "2000-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        }
 
     monkeypatch.setattr(
         backend,
-        "_delete_helper_pods",
-        lambda names, role: None,
-    )
-    monkeypatch.setattr(backend, "_reader", reader)
-    monkeypatch.setattr(
-        backend,
-        "_collect_from_reader",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            IntegrityError("artifact checksum mismatch")
-        ),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_delete_and_wait",
-        lambda kind, name: None,
+        "_get",
+        get_job,
     )
 
-    with pytest.raises(IntegrityError, match="checksum mismatch"):
+    with pytest.raises(
+        IntegrityError,
+        match="completed without a verified collection",
+    ):
         backend.collect(
             handle,
             tmp_path / "collected",
             policy=ArtifactPolicy(),
         )
 
-    assert reader_calls == 1
+    assert get_calls == 1
+
+
+def test_kubernetes_collection_waits_for_completed_job_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    backend = KubernetesBackend(
+        KubernetesProfile(
+            namespace="benchmarks",
+            artifact_reader_image="reader:latest",
+        ),
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
+    )
+    handle = BackendHandle(
+        backend="kubernetes",
+        workload_id="case-1",
+        native_id="case-1-job",
+        trial=trial,
+        metadata={"claim_name": "case-1-data"},
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get",
+        lambda kind, name, **kwargs: {
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Complete",
+                        "status": "True",
+                        "lastTransitionTime": "2999-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        },
+    )
+
+    with pytest.raises(
+        ArtifactTransferPending,
+        match="waiting for the collection",
+    ):
+        backend.collect(
+            handle,
+            tmp_path / "collected",
+            policy=ArtifactPolicy(),
+        )
 
 
 def test_kubernetes_remote_inventory_rejects_malformed_json(
@@ -2451,6 +2568,16 @@ def test_kubernetes_cleanup_waits_for_helpers_job_and_pvc(
     monkeypatch.setattr(
         backend,
         "_delete_helper_pods",
+        lambda names, role: None,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_delete_helper_pods",
+        lambda names, role: None,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_delete_helper_pods",
         lambda names, role: helper_cleanup.append((names, role)),
     )
     monkeypatch.setattr(
@@ -2463,16 +2590,15 @@ def test_kubernetes_cleanup_waits_for_helpers_job_and_pvc(
 
     stable_name = native_resource_name("case-1", trial)
     assert helper_cleanup == [
-        ((stable_name, "case-1-r1"), "trial-stager"),
         ((stable_name, "case-1-r1"), "artifact-reader"),
     ]
     assert deleted == [
         (
-            "pod",
+            "job",
             native_resource_name(
                 "case-1",
                 trial,
-                suffix="-stage",
+                suffix="-collect",
             ),
         ),
         ("job", "case-1-r1"),
@@ -2500,6 +2626,11 @@ def test_kubernetes_cleanup_surfaces_helper_disconnect(
         backend,
         "inspect",
         lambda value: BackendSnapshot(phase="succeeded"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_delete_helper_pods",
+        lambda names, role: None,
     )
     monkeypatch.setattr(
         backend,

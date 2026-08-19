@@ -19,7 +19,7 @@ from examples.diffusion_benchmark.images import (
 def build_campaign(definition, contract) -> ClusterCampaign:
     del definition, contract
     plan = CampaignPlan(
-        campaign_id="diffusion-equation-example",
+        campaign_id="diffusion-equation-example-p1-20260819-r6",
         trials=(
             CampaignTrial(
                 "luna-low",
@@ -45,7 +45,7 @@ def build_campaign(definition, contract) -> ClusterCampaign:
         memory_request="2Gi",
         memory_limit="8Gi",
         ephemeral_storage_request="512Mi",
-        ephemeral_storage_limit="2Gi",
+        ephemeral_storage_limit="1Gi",
         provider_secret_environment={
             "codex": {
                 "AZURE_OPENAI_API_KEY": (

@@ -95,10 +95,34 @@ def test_codex_adapter_resume_omits_initial_only_options(
     assert command[:3] == ("codex", "exec", "resume")
     assert command[-2:] == ("--last", "-")
     assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
     assert "--cd" not in command
     assert "--output-schema" in command
     assert "--output-last-message" in command
     assert "--json" in command
+
+
+def test_codex_adapter_read_only_resume_omits_write_bypass(
+    tmp_path: Path,
+) -> None:
+    selected = context(tmp_path)
+    selected = ProviderRunContext(
+        **{
+            **selected.__dict__,
+            "persist_session": True,
+            "resume_session": True,
+            "read_only": True,
+        }
+    )
+
+    command = CodexAdapter().build_command(
+        ProviderSettings(provider="codex", model="test-model"),
+        selected,
+    ).command
+
+    assert command[:3] == ("codex", "exec", "resume")
+    assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
 def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
@@ -288,6 +312,50 @@ def test_codex_invalid_output_schema_is_terminal() -> None:
     assert failure is not None
     assert failure.terminal is True
     assert failure.reason == "harness_configuration_error"
+
+
+def test_codex_textual_http_404_is_terminal() -> None:
+    failure = CodexAdapter().classify_failure(
+        [
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": (
+                        "unexpected status 404 Not Found: The API deployment "
+                        "for this resource does not exist., url: "
+                        "https://example.openai.azure.com/openai/v1/responses"
+                    )
+                },
+            }
+        ],
+        "",
+    )
+
+    assert failure is not None
+    assert failure.terminal is True
+    assert failure.api_status == 404
+    assert failure.reason == "http_404"
+
+
+def test_codex_textual_http_429_and_500_are_retryable() -> None:
+    adapter = CodexAdapter()
+
+    for status in (429, 500):
+        failure = adapter.classify_failure(
+            [
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": f"unexpected status {status} provider error"
+                    },
+                }
+            ],
+            "",
+        )
+
+        assert failure is not None
+        assert failure.terminal is False
+        assert failure.api_status == status
 
 
 def test_codex_temporary_home_rejection_is_terminal() -> None:

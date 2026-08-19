@@ -1,10 +1,14 @@
 AGENT_IMAGE = (
     "ghcr.io/cbizon/brunner-diffusion-agent@sha256:"
-    "efab18827d8dd6e0f5ec729a57bbacb31b3b4fc8444760f5e52147c67a8d3a6a"
+    "a975f1653ad7a79eb2c2c71704492968d7c05ceffa582a86560b0613e003e61c"
+)
+EVALUATOR_IMAGE = (
+    "ghcr.io/cbizon/brunner-diffusion-controller@sha256:"
+    "7f9aa12763d20b0e51ae9c5d393333be95b420c09a445112d39579ddca2500c7"
 )
 CONTROLLER_IMAGE = (
     "ghcr.io/cbizon/brunner-diffusion-controller@sha256:"
-    "31738ae0ae71eac8483634d1653cc57d27416f3ccf46414e9fb448d0bbd33871"
+    "7f9aa12763d20b0e51ae9c5d393333be95b420c09a445112d39579ddca2500c7"
 )
 SQUID_IMAGE = (
     "ubuntu/squid@sha256:"

@@ -1209,6 +1209,7 @@ def _prepare_workspace(
     contract: OutputContract,
     assessment: AssessmentDefinition,
     trial: Path,
+    output_trial: Path,
     evaluation: dict[str, Any],
 ) -> tuple[
     Path,
@@ -1216,7 +1217,7 @@ def _prepare_workspace(
     dict[str, Any],
     dict[str, Any],
 ]:
-    work_root = trial / "assessments" / assessment.assessment_id
+    work_root = output_trial / "assessments" / assessment.assessment_id
     workspace = work_root / "workspace"
     if workspace.exists():
         shutil.rmtree(workspace)
@@ -1368,6 +1369,7 @@ def _prepare_workspace(
 def _assessment_environment(
     *,
     trial: Path,
+    output_trial: Path,
     assessment: AssessmentDefinition,
     workspace: Path,
     input_path: Path,
@@ -1379,6 +1381,7 @@ def _assessment_environment(
     environment.update(
         {
             "BRUNNER_TRIAL_ROOT": str(trial),
+            "BRUNNER_ASSESSMENT_OUTPUT_ROOT": str(output_trial),
             "BRUNNER_ASSESSMENT_ID": assessment.assessment_id,
             "BRUNNER_ASSESSMENT_WORKSPACE": str(workspace),
             "BRUNNER_ASSESSMENT_INPUT": str(input_path),
@@ -1408,9 +1411,16 @@ def run_assessment(
     trial: Path,
     evaluation: dict[str, Any],
     *,
+    output_trial: Path | None = None,
     deadline_epoch: float | None = None,
 ) -> dict[str, Any]:
     trial = trial.resolve()
+    output_trial = (
+        output_trial.resolve()
+        if output_trial is not None
+        else trial
+    )
+    output_trial.mkdir(parents=True, exist_ok=True)
 
     def assessment_timeout() -> float:
         # Share one budget with the rest of evaluation so a chain of
@@ -1422,7 +1432,7 @@ def run_assessment(
             max(0.0, deadline_epoch - time.time()),
         )
 
-    work_root = trial / "assessments" / assessment.assessment_id
+    work_root = output_trial / "assessments" / assessment.assessment_id
     work_root.mkdir(parents=True, exist_ok=True)
     result_path = work_root / "result.json"
     started_at = _now()
@@ -1463,17 +1473,22 @@ def run_assessment(
                 contract,
                 assessment,
                 trial,
+                output_trial,
                 evaluation,
             )
         )
         input_path = _safe_trial_path(
-            trial,
+            output_trial,
             assessment.resolved_input_path,
         )
-        output_path = _safe_trial_path(trial, assessment.output_path)
+        output_path = _safe_trial_path(
+            output_trial,
+            assessment.output_path,
+        )
         benchmark_input_path = work_root / "benchmark-input.json"
         environment = _assessment_environment(
             trial=trial,
+            output_trial=output_trial,
             assessment=assessment,
             workspace=workspace,
             input_path=input_path,
@@ -1484,7 +1499,7 @@ def run_assessment(
         write_json_atomic(input_path, dossier)
         benchmark_input = _run_prepare_command(
             assessment,
-            trial=trial,
+            trial=output_trial,
             work_root=work_root,
             input_path=input_path,
             benchmark_input_path=benchmark_input_path,
@@ -1496,7 +1511,7 @@ def run_assessment(
             write_json_atomic(input_path, dossier)
         shutil.copy2(input_path, workspace / "review-input.json")
         input_record = {
-            "path": str(input_path.relative_to(trial)),
+            "path": str(input_path.relative_to(output_trial)),
             "sha256": sha256_file(input_path),
         }
         schema = json.loads(
@@ -1566,7 +1581,7 @@ def run_assessment(
         reports = []
         for report in assessment.reports:
             _safe_trial_path(
-                trial,
+                output_trial,
                 report.path,
                 require_file=True,
             )
@@ -1575,7 +1590,7 @@ def run_assessment(
         if not reports:
             reports.append(
                 {
-                    "path": str(output_path.relative_to(trial)),
+                    "path": str(output_path.relative_to(output_trial)),
                     "media_type": "application/json",
                     "title": f"{assessment.assessment_id} assessment",
                 }
@@ -1589,7 +1604,7 @@ def run_assessment(
             "contract": contract_manifest,
             "input": input_record,
             "output": {
-                "path": str(output_path.relative_to(trial)),
+                "path": str(output_path.relative_to(output_trial)),
                 "sha256": sha256_file(output_path),
             },
             "reports": reports,
@@ -1630,7 +1645,7 @@ def run_assessment(
             "error": {
                 "type": type(error).__name__,
                 "message": str(error),
-                "traceback": str(traceback_path.relative_to(trial)),
+                "traceback": str(traceback_path.relative_to(output_trial)),
             },
             "failure": failure_from_exception(
                 error,
@@ -1656,8 +1671,15 @@ def run_assessments(
     trial: Path,
     evaluation: dict[str, Any],
     *,
+    output_trial: Path | None = None,
     deadline_epoch: float | None = None,
 ) -> dict[str, Any]:
+    trial = trial.resolve()
+    output_trial = (
+        output_trial.resolve()
+        if output_trial is not None
+        else trial
+    )
     results = [
         run_assessment(
             definition,
@@ -1665,6 +1687,7 @@ def run_assessments(
             assessment,
             trial,
             evaluation,
+            output_trial=output_trial,
             deadline_epoch=deadline_epoch,
         )
         for assessment in definition.resolved_assessments()
@@ -1703,5 +1726,5 @@ def run_assessments(
     if required_failure is not None:
         index["failure"] = required_failure
     if results:
-        write_json_atomic(trial / "assessments/index.json", index)
+        write_json_atomic(output_trial / "assessments/index.json", index)
     return index

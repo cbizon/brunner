@@ -120,8 +120,9 @@ For every assessment Brunner:
 9. records attempts, usage, hashes, blinding limitations, and failure details.
 
 Model reviewers run without session persistence. The assessment Job is the
-outer sandbox: it mounts only the selected collected trial subdirectory, has no
-service-account token, and receives provider-only egress. Codex therefore
+outer sandbox: it mounts the selected collected trial subdirectory read-only,
+a separate output subdirectory read/write, has no service-account token, and
+receives provider-only egress. Codex therefore
 bypasses its unsupported nested user-namespace sandbox; Claude exposes and
 explicitly authorizes only read, glob, and grep tools while denying interactive
 permission requests. Reviewers execute in a temporary workspace with
@@ -201,8 +202,10 @@ read-only so collection cannot alter remote results. Agent and artifact-reader
 images must support this non-root contract. Service-link environment injection
 is disabled.
 
-Brunner installs a namespace-scoped Squid Deployment, ConfigMap, Service, and
-NetworkPolicy before staging. Squid permits HTTPS `CONNECT` only to
+Brunner installs a campaign-scoped Squid Deployment, ConfigMap, Service, and
+NetworkPolicy before staging. Its labels and ingress selectors include the
+campaign identity, so one campaign cannot use or mutate another campaign's
+proxy. Squid permits HTTPS `CONNECT` only to
 `.openai.com`, `.openai.azure.com`, `.anthropic.com`, and `.claude.ai`;
 everything else is denied. Squid alone may query the selected cluster DNS Pods
 and open outbound TCP 443 connections.
@@ -217,8 +220,8 @@ recorded in the Job and persisted backend handle; resume and restart reject
 identity drift.
 
 Because Kubernetes policies are additive, Brunner lists existing namespace
-NetworkPolicies before creating the staging helper and again immediately
-before Job creation. The default `strict` isolation mode refuses to launch
+NetworkPolicies immediately before Job creation. The default `strict`
+isolation mode refuses to launch
 when another policy with nonempty ingress or egress rules selects any Brunner
 workload Pod. `controlled-egress` mode is available for an administrator-owned
 personal namespace whose baseline policy permits ingress: it tolerates
@@ -404,19 +407,21 @@ submit -> inspect -> logs -> collect -> cleanup
 ```
 
 Campaign backends must declare container agent isolation and Kubernetes trusted
-evaluation. `KubernetesBackend` creates a PVC, stages the trial through a
-helper pod, creates the durable agent-then-evaluator Job, and recovers selected
-files through reader pods. Helper pods explicitly
-use `/tmp` as their working directory so an image working directory beneath
-`/brunner/trial` cannot create unwritable paths when the trial PVC is mounted.
-Submission is idempotent across ambiguous backend responses. Before copying,
-the stager clears an incomplete PVC, then verifies the complete remote
-workspace inventory and challenge digest. Only verified PVCs receive staged,
-challenge, workload, and runtime-protocol annotations. A retry adopts an
-existing Job or PVC only when those identities match exactly. Backend objects
-do not keep process-local handle
-registries; persisted trial/backend state and remote labels are the recovery
-sources of truth after an orchestrator restart.
+evaluation. `KubernetesBackend` creates a trial PVC and an agent/evaluator Job
+whose first init container copies the prepared trial directly from the control
+PVC. The stager resumes or discards only its own `.brunner-part` files,
+verifies every size and SHA-256 from the stage report, and atomically publishes
+each completed file. It refuses to overwrite changed or unexpected destination
+content, so ambiguous recovery cannot destroy candidate work. It never streams
+trial bytes through `kubectl` or the controller process. A fully staged PVC is
+reused on agent restart.
+
+Only verified PVCs receive staged, challenge, workload, and runtime-protocol
+annotations. Submission is idempotent across ambiguous responses, and a retry
+adopts an existing Job or PVC only when those identities match exactly.
+Backend objects do not keep process-local handle registries; persisted
+trial/backend state and remote labels are the recovery sources of truth after
+an orchestrator restart.
 
 The backend workload deadline includes the agent hard deadline,
 `backend_shutdown_grace_seconds`, and the evaluator timeout. The outer Job
@@ -463,19 +468,21 @@ start a replacement after classifying the previous result. Inspection still
 evaluates all Pods in creation order when adopting legacy or externally
 modified Jobs. Missing Jobs with intact PVCs are retryable infrastructure
 failures; missing Jobs and PVCs are terminal storage loss. Brunner reports
-pending PVCs, preserves logs from every Job Pod, and
-captures terminal Job and Pod events before cleanup when available. Event
-RBAC, expiry, or transient failures become warnings and never block artifact
-recovery. It also includes Kubernetes
-warning events for pending storage and failed artifact readers. It retries
-artifact readers,
-excludes failed reader nodes when rescheduling, resumes partial files by byte
-offset, and verifies every SHA-256. Before helper creation and final cleanup,
-Brunner finds stale stager and reader pods by workload/role labels and waits
-for their deletion. Final cleanup likewise waits for Job and eligible PVC
-deletion; connectivity loss leaves campaign cleanup pending rather than
-silently leaking resources. A failed workload's PVC is retained until artifact
-collection succeeds.
+pending PVCs, preserves logs from every Job Pod, and captures Job and Pod
+events before terminal cleanup or orchestrator-forced termination when
+available. Event RBAC, expiry, or transient failures become warnings and never
+block artifact recovery.
+
+Artifact collection runs as a separate durable Kubernetes Job that mounts the
+trial PVC read-only and the control PVC once, read/write. The prepared baseline
+and collection destination are separate directories on that control mount; the
+same PVC is not mounted a second time. It resumes partial files,
+verifies every SHA-256, and hard-links unchanged staged files from the prepared
+trial instead of copying them again. The controller only submits and observes
+this Job; Kubernetes API connectivity loss cannot interrupt the data transfer.
+Final cleanup waits for collection Jobs, workload Jobs, and eligible PVCs to
+be deleted. A failed workload's PVC is retained until artifact collection
+succeeds.
 
 Failed Kubernetes Jobs whose agent process was interrupted by a signal,
 eviction, node loss, OOM termination, or another retryable infrastructure event
@@ -508,11 +515,14 @@ status ConfigMap
 ClusterIP monitor Service
 ```
 
-The preparation Job has no service-account token. It loads the benchmark and
-campaign modules from the immutable controller image, materializes and stages
-the challenge, creates durable trials on the control PVC, and writes a
-campaign-digest marker. The controller does not start reconciliation until
-that marker exists.
+The preparation Job has no service-account token. It has explicit CPU and
+memory requests and limits, loads the benchmark and campaign modules from the
+immutable controller image, materializes and stages the challenge, creates
+durable trials on the control PVC, and writes a campaign-digest marker. The
+controller directly observes the marker, a durable failure record, and the
+preparation Job's terminal condition. A failed or timed-out preparation
+therefore becomes visible campaign attention instead of an indefinite init
+wait.
 
 The submitted control-plane manifests carry the exact agent, artifact-reader,
 proxy, controller, and evaluator image identities as trusted environment
@@ -529,10 +539,13 @@ A dedicated ConfigMap lock, renewed by pod UID through Kubernetes
 `resourceVersion` compare-and-swap, prevents two live controller processes from
 reconciling the same campaign. A replacement may take the lock only after the
 recorded renewal duration expires. Malformed lock state is an integrity failure,
-not an implicit takeover. If the controller Pod is evicted, restarted, or moved
-to another node, it reloads `campaign.json` and its atomic backup from the
-control PVC and adopts existing Jobs and PVCs from persisted handles. Laptop
-sleep or network loss has no effect on this loop.
+not an implicit takeover. Every Kubernetes mutation, state write, result copy,
+and dashboard write is fenced before and after the side effect; loss of the
+lock terminates reconciliation rather than allowing a stale controller to keep
+writing. If the controller Pod is evicted, restarted, or moved to another node,
+it reloads `campaign.json` and its atomic backup from the control PVC and adopts
+existing Jobs and PVCs from persisted handles. Laptop sleep or network loss has
+no effect on this loop.
 
 The controller writes:
 
@@ -565,17 +578,21 @@ collection and evaluation, bounds infrastructure restarts, respects
 ResourceQuota capacity, captures terminal Pod/Job Events before cleanup, and
 keeps integrity/configuration failures as explicit attention states.
 
-Collection is resumable and checksum verified, but its destination is the
-results PVC rather than a laptop directory. Trial PVCs are deleted only after
-collection, assessment, and reporting have produced durable results.
+Collection is a resumable, checksum-verified PVC-to-PVC Kubernetes Job whose
+destination is the campaign control PVC rather than a laptop directory. Trial
+PVCs are deleted only after collection, assessment, and reporting have
+produced durable results.
 
-Qualitative and domain assessments run in separate trusted Jobs that mount only
-the selected collected trial subdirectory from the control PVC plus an empty
-`/tmp`; they cannot traverse into another trial or campaign-control state. Only
-model-review Jobs receive reviewer Secret references and managed-proxy
+Qualitative and domain assessments run in separate trusted Jobs. They mount the
+selected collected trial subdirectory read-only, a separate writable
+assessment-output subdirectory, and an empty `/tmp`; they cannot modify
+authoritative evaluator evidence or traverse into another trial or
+campaign-control state. The controller validates assessment output and merges
+it into the collected trial only after the Job succeeds. Only model-review Jobs
+receive reviewer Secret references and the campaign's managed-proxy
 environment; the controller receives neither provider nor reviewer
 credentials. Assessment Pods have no service-account token and their
-NetworkPolicy permits egress only to Brunner's numeric Squid ClusterIP.
+NetworkPolicy permits egress only to that campaign's numeric Squid ClusterIP.
 
 At terminal campaign state, the controller copies authoritative state to the
 results PVC and creates `result-manifest.json` with every result file's path,

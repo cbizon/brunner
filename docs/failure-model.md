@@ -71,10 +71,10 @@ state publication must be atomic so they cannot expose partial state.
 | Challenge staging | Symlink, forbidden name, render/schema/hash failure, source mutation, disk/inodes | Staging or trial creation | Terminal `integrity`/`configuration`; never publish partial workspace |
 | Trial construction | Filesystem failure or interruption | Trial creation | Atomic publish; incomplete temporary trial must not occupy the requested ID |
 | State persistence | Control-PVC disk/inodes, permission, serialization, Pod/node loss | Controller | Preserve previous valid state; stop new side effects if authoritative state cannot be written |
-| Campaign lock | Concurrent controller, API loss, renewal timeout, stale holder, malformed lock state | ConfigMap with `resourceVersion` compare-and-swap | Only the current holder may reconcile; stop after the lock cannot be renewed within its duration; reject malformed state |
+| Campaign lock | Concurrent controller, API loss, renewal timeout, stale holder, malformed lock state | ConfigMap with `resourceVersion` compare-and-swap plus side-effect fences | Only the current holder may reconcile; fence before and after external mutations; stop after the lock cannot be renewed within its duration; reject malformed state |
 | Capacity/preflight | API loss, RBAC, quota, no nodes, mutable/incompatible images, bad reference claim | Scheduler/backend | Connectivity pause, terminal configuration, or visible quota `wait`; never an invisible running state |
 | Credential reference | Absent Secret/key or malformed `secretKeyRef` | Kubernetes pod startup | Terminal container-configuration infrastructure failure; Brunner never reads or provisions Secret values |
-| Submission | Partial NetworkPolicy/PVC/helper/Job, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation | Adopt only matching digests after ambiguity; possible side effects require cleanup |
+| Submission | Partial NetworkPolicy/PVC/Job, interrupted PVC-to-PVC stage, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation and stager init container | Resume partial staging; adopt only matching digests after ambiguity; possible side effects require cleanup |
 | Scheduling/startup | Unschedulable, image pull, mount, secret, GPU/storage unavailable | Backend inspection | Typed backend failure; retry only transient infrastructure |
 | Agent startup | Missing executable/config, corrupt trial state, permission/disk failure | Agent CLI and backend | Durable nonzero infrastructure result with diagnostics |
 | Provider execution | Auth, subscription/rate limit, model substitution, tool/sandbox denial, network, malformed terminal event | Runner/provider adapter | Provider-specific retry or terminal result; preserve requested/observed identity |
@@ -85,9 +85,9 @@ state publication must be atomic so they cannot expose partial state.
 | Submission validation | Missing/invalid manifest, schema/path/size violation | Evaluator | `candidate_failed`; this is a valid benchmark result |
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
 | Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
-| Artifact collection | Transfer loss, helper failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, control-PVC exhaustion | Backend and controller | Reuse unchanged staged files on the control PVC, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry transport only |
+| Artifact collection | Transfer Job failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, control-PVC exhaustion | PVC-to-PVC collection Job and controller | Adopt or poll the durable Job after controller/API interruption, reuse unchanged staged files on the control PVC, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry terminal transport failure only |
 | Result publication | Results-PVC exhaustion, oversized result, interruption, checksum/path violation | Controller | Omit unchanged challenge and assessment working copies; publish atomically; do not clean trial storage until complete |
-| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure | Trusted assessment Job and controller | `assessment`; required-review failure makes result indeterminate |
+| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure, output merge failure | Trusted assessment Job and controller | Mount evidence read-only, write separately, validate before merge; `assessment`; required-review failure makes result indeterminate |
 | Final retrieval | Reader startup, laptop disconnect, partial file, manifest/file checksum mismatch, local disk | Retrieval client | Preserve `.part` files, resume by offset, publish only verified files, never delete results automatically |
 | Reporting | Serialization, template error, disk full | Evaluation or campaign save | Record `reporting`; never block cleanup or replace the authoritative result |
 | Cleanup | API loss, controller shutdown race, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Stop controller Pods before deleting Jobs, sweep replacement Pods, persist `cleanup_pending`, and retry; result remains authoritative |
@@ -132,6 +132,8 @@ and event evidence before attributing exhaustion to either phase.
   benchmark result carries failure while the Kubernetes pipeline completes.
 - Kubernetes Job backoff is zero. Brunner is the only component allowed to
   repeat a classified workload generation.
+- Exceeding the campaign trial deadline terminates the live Job and becomes a
+  retryable infrastructure result; it is never only an advisory marker.
 - A failed old Pod cannot override an active replacement or a successful Job.
 - Missing Events never prevent collection or cleanup.
 - A campaign may wait indefinitely for connectivity by policy, but the wait
@@ -148,10 +150,12 @@ and event evidence before attributing exhaustion to either phase.
 The fault-injection suite covers atomic JSON replacement, interrupted trial
 construction, source symlink rejection, partial and rejected submission,
 primary-state corruption and backup recovery, malformed and unknown
-campaign/backend states, ConfigMap lock exclusion, zero backend capacity, cleanup retry, collection
-integrity, malformed remote inventories, evaluator versus candidate
+campaign/backend states, ConfigMap lock exclusion and fencing, terminal
+preparation failure, zero backend capacity, cleanup retry, durable collection
+submission, collection integrity, malformed remote inventories, evaluator versus candidate
 attribution, required assessment failure, non-gating report/dashboard failure,
-NetworkPolicy rendering/order, remote stage verification, runtime identity,
+campaign-scoped NetworkPolicy rendering/order, resumable remote stage
+verification, read-only assessment evidence, runtime identity,
 immutable images, multi-Pod retries, missing Jobs, reference identity,
 ResourceQuota capacity, diagnostic collection, bounded result publication,
 resumable verified retrieval, and persistent cluster monitoring.

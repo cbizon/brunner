@@ -47,6 +47,14 @@ Resolve the pushed image digests and replace the zero digests in `images.py`.
 Also replace the Squid placeholder with the approved digest-pinned Squid image.
 Brunner injects the submitted image identities into cluster-side campaign
 loads, avoiding a self-referential controller-image digest.
+Keep `EVALUATOR_IMAGE` pinned while appending trials to an existing campaign.
+The controller image may change to carry the amended campaign definition, but
+changing the trusted evaluator image intentionally changes campaign identity
+and is rejected for previously created trials.
+If the agent runtime changes, pin existing trial definitions with
+`CampaignTrial.backend_image` and use the new digest as the campaign default
+for newly appended trials. Brunner rejects an image change for an existing
+trial ID but permits a new ID to use the upgraded runner.
 The agent image intentionally excludes `examples/`, so candidate processes do
 not receive evaluator or analytical-solution code. The controller image
 contains the benchmark, evaluator, qualitative-review runtime, and `kubectl`.

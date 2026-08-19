@@ -140,6 +140,18 @@ class ImmediateBackend:
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:
         return BackendSnapshot(phase="succeeded", exit_code=0)
 
+    def terminate(
+        self,
+        handle: BackendHandle,
+        *,
+        reason: str,
+    ) -> BackendSnapshot:
+        return BackendSnapshot(
+            phase="failed",
+            reason=reason,
+            details={"retryable_infrastructure": True},
+        )
+
     def logs(self, handle: BackendHandle) -> str:
         return "fake workload complete\n"
 
@@ -253,7 +265,7 @@ class AmbiguousSubmissionBackend(ImmediateBackend):
                 workload_id=workload.workload_id,
                 native_id=f"remote-{workload.workload_id}",
                 trial=workload.trial,
-                metadata={"submitted_at": "2026-08-04T12:00:00+00:00"},
+                metadata={"submitted_at": datetime.now(UTC).isoformat()},
             )
             raise BackendConnectivityError(
                 "connection dropped after remote submission"
@@ -508,6 +520,7 @@ def _workload(
         trial=trial,
         command=("unused",),
         timeout_seconds=10,
+        image=campaign_trial.backend_image or plan.backend_image,
         evaluation=trusted_evaluation,
     )
 
@@ -883,9 +896,7 @@ def test_campaign_recovers_ambiguous_submission_by_adopting_workload(
     assert resumed["status"] == "running"
     assert resumed["trials"][0]["phase"] == "running"
     assert resumed["trials"][0]["handle"]["native_id"] == "remote-run-a"
-    assert resumed["trials"][0]["submitted_at"] == (
-        "2026-08-04T12:00:00+00:00"
-    )
+    assert resumed["trials"][0]["submitted_at"]
     assert backend.submit_calls == 2
 
 
@@ -1606,6 +1617,7 @@ def test_campaign_appends_new_ids_without_invalidating_completed_work(
             campaign_id="flexible",
             root=root,
             trials=(first,),
+            backend_image="example.invalid/agent@sha256:old",
         ),
         backend,
         workload_factory=_workload,
@@ -1627,9 +1639,15 @@ def test_campaign_appends_new_ids_without_invalidating_completed_work(
                     "same-model",
                     effort="high",
                 ),
-                first,
+                replace(
+                    first,
+                    backend_image=(
+                        "example.invalid/agent@sha256:old"
+                    ),
+                ),
             ),
             max_parallel=2,
+            backend_image="example.invalid/agent@sha256:new",
         ),
         backend,
         workload_factory=_workload,
@@ -1643,6 +1661,9 @@ def test_campaign_appends_new_ids_without_invalidating_completed_work(
     assert "plan_sha256" not in reconciled
     assert by_id["chosen-id"]["phase"] == "complete"
     assert by_id["chosen-id"]["completed_at"] == first_completed_at
+    assert by_id["chosen-id"]["backend_image"] == (
+        "example.invalid/agent@sha256:old"
+    )
     assert by_id["whatever-id-i-want"]["phase"] == "pending"
 
     second_runner.advance()
@@ -1771,7 +1792,7 @@ def test_zero_backend_capacity_is_visible_in_campaign_state(
     state = runner.advance()
 
     assert state["status"] == "running"
-    assert state["has_attention"] is True
+    assert state["has_attention"] is False
     assert state["scheduler_wait"]["kind"] == "backend_capacity"
     assert state["backend_capacity"]["available"] == 0
     assert backend.handles == {}
@@ -2148,6 +2169,32 @@ def test_default_workload_factory_preserves_burst_resources(
     assert workload.ephemeral_storage_limit == "3Gi"
 
 
+def test_default_workload_factory_prefers_trial_backend_image(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    trial = CampaignTrial(
+        "image-override",
+        "codex",
+        "model-a",
+        backend_image="example.invalid/agent@sha256:trial",
+    )
+    workload = default_workload_factory(
+        tmp_path,
+        trial,
+        CampaignPlan(
+            campaign_id="image-override",
+            root=tmp_path / "campaign",
+            trials=(trial,),
+            backend_image="example.invalid/agent@sha256:campaign",
+        ),
+        definition,
+        "kubernetes",
+    )
+
+    assert workload.image == "example.invalid/agent@sha256:trial"
+
+
 def test_campaign_recovers_interrupted_collection(
     tmp_path: Path,
 ) -> None:
@@ -2340,7 +2387,7 @@ class StuckBackend(ImmediateBackend):
         return BackendSnapshot(phase="running")
 
 
-def test_campaign_flags_trial_that_never_leaves_running(
+def test_campaign_terminates_trial_that_never_leaves_running(
     tmp_path: Path,
 ) -> None:
     definition = build_definition()
@@ -2353,6 +2400,7 @@ def test_campaign_flags_trial_that_never_leaves_running(
             root=tmp_path / "campaign",
             trials=(CampaignTrial("stuck-a", "codex", "model-a"),),
             trial_timeout_seconds=0.05,
+            infrastructure_max_restarts=0,
         ),
         StuckBackend(),
         workload_factory=_workload,
@@ -2363,16 +2411,14 @@ def test_campaign_flags_trial_that_never_leaves_running(
 
     time.sleep(0.1)
     state = runner.advance()
-    repeated = runner.advance()
-
-    assert state["trials"][0]["phase"] == "running"
-    assert "still reports running" in state["trials"][0]["error"]
-    assert state["trials"][0]["attention"]["active"] is True
+    assert state["trials"][0]["phase"] == "collection_pending"
+    assert "exceeded its" in state["trials"][0]["error"]
+    assert state["trials"][0]["attention"]["active"] is False
     assert state["status"] == "running"
-    assert state["has_attention"] is True
-    assert repeated["trials"][0]["phase"] == "running"
+    assert state["has_attention"] is False
     assert sum(
-        event["type"] == "trial_overdue" for event in repeated["events"]
+        event["type"] == "trial_deadline_exceeded"
+        for event in state["events"]
     ) == 1
 
 
@@ -2612,7 +2658,7 @@ def test_campaign_pause_clock_resets_after_connectivity_returns(
     assert "paused_since" not in state
 
 
-def test_overdue_trial_keeps_reconciling_and_holds_its_backend_slot(
+def test_overdue_trial_is_terminated_and_releases_backend_slot(
     tmp_path: Path,
 ) -> None:
     definition = build_definition()
@@ -2630,6 +2676,7 @@ def test_overdue_trial_keeps_reconciling_and_holds_its_backend_slot(
             ),
             max_parallel=1,
             trial_timeout_seconds=0.05,
+            infrastructure_max_restarts=0,
         ),
         backend,
         workload_factory=_workload,
@@ -2640,28 +2687,26 @@ def test_overdue_trial_keeps_reconciling_and_holds_its_backend_slot(
     overdue = runner.advance()
     by_id = {entry["test_id"]: entry for entry in overdue["trials"]}
 
-    # The overdue workload is still running on the backend, so the second
-    # trial must not be submitted on top of it.
-    assert by_id["stuck-a"]["phase"] == "running"
-    assert by_id["stuck-a"]["attention"]["kind"] == "trial_overdue"
-    assert by_id["stuck-a"]["attention"]["active"] is True
-    assert by_id["next-run"]["phase"] == "pending"
-    assert len(backend.handles) == 1
+    assert by_id["stuck-a"]["phase"] == "collection_pending"
+    assert (
+        by_id["stuck-a"]["attention"]["kind"]
+        == "trial_deadline_exceeded"
+    )
+    assert by_id["stuck-a"]["attention"]["active"] is False
+    assert by_id["next-run"]["phase"] == "submitted"
+    assert len(backend.handles) == 2
     assert overdue["status"] == "running"
-    assert overdue["has_attention"] is True
+    assert overdue["has_attention"] is False
 
     resumed = runner.advance()
     by_id = {entry["test_id"]: entry for entry in resumed["trials"]}
 
-    assert by_id["stuck-a"]["phase"] == "complete"
-    assert by_id["stuck-a"]["attention"]["active"] is False
-    assert by_id["stuck-a"]["attention"]["resolved_at"]
-    assert by_id["next-run"]["phase"] == "submitted"
+    assert by_id["stuck-a"]["phase"] in {
+        "cleanup_pending",
+        "complete",
+    }
     assert len(backend.handles) == 2
     assert sum(
-        event["type"] == "trial_overdue" for event in resumed["events"]
-    ) == 1
-    assert any(
-        event["type"] == "trial_overdue_resolved"
+        event["type"] == "trial_deadline_exceeded"
         for event in resumed["events"]
-    )
+    ) == 1

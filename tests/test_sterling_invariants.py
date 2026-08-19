@@ -34,6 +34,7 @@ from brunner.backends.squid import (
     MANAGED_PROXY_NAME,
     PROVIDER_DOMAINS,
     SQUID_CONFIG,
+    managed_proxy_labels,
     managed_proxy_sha256,
     proxy_url_from_service,
     render_managed_proxy_resources,
@@ -132,6 +133,7 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
         workload,
         profile,
         labels,
+        proxy_labels=managed_proxy_labels("campaign-proxy"),
     )
     job = render_job(
         "trial-job",
@@ -158,7 +160,7 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
         pipeline["spec"]["egress"][0]["to"][0]["podSelector"][
             "matchLabels"
         ]
-        == MANAGED_PROXY_LABELS
+        == managed_proxy_labels("campaign-proxy")
     )
     assert '"port": 53' not in json.dumps(pipeline)
     assert helpers["spec"]["policyTypes"] == ["Ingress", "Egress"]
@@ -188,7 +190,9 @@ def test_network_policy_allows_only_managed_proxy_without_dns(
 
 
 def test_managed_proxy_owns_provider_allowlist_and_dns() -> None:
+    campaign_labels = {"dev.brunner/campaign": "campaign-a"}
     resources = render_managed_proxy_resources(
+        name="campaign-proxy",
         namespace="benchmarks",
         image=IMAGE,
         image_pull_secrets=("registry",),
@@ -198,6 +202,7 @@ def test_managed_proxy_owns_provider_allowlist_and_dns() -> None:
         cpu_limit="1",
         memory_request="256Mi",
         memory_limit="1Gi",
+        campaign_labels=campaign_labels,
     )
     by_kind = {resource["kind"]: resource for resource in resources}
 
@@ -218,8 +223,21 @@ def test_managed_proxy_owns_provider_allowlist_and_dns() -> None:
         "matchLabels"
     ] == {
         "app.kubernetes.io/name": "brunner",
+        **campaign_labels,
         "dev.brunner/role": "pipeline",
     }
+    assert policy["ingress"][0]["from"][1]["podSelector"][
+        "matchLabels"
+    ] == {
+        "app.kubernetes.io/name": "brunner",
+        **campaign_labels,
+        "dev.brunner/role": "assessment",
+    }
+    assert all(
+        resource["metadata"]["labels"]["dev.brunner/campaign"]
+        == "campaign-a"
+        for resource in resources
+    )
     assert policy["egress"][0]["ports"] == [
         {"protocol": "UDP", "port": 53},
         {"protocol": "TCP", "port": 53},
@@ -255,7 +273,8 @@ def test_backend_installs_proxy_and_uses_service_cluster_ip(
             namespace="benchmarks",
             proxy_image=IMAGE,
             preflight_enabled=False,
-        )
+        ),
+        managed_proxy_name="campaign-proxy",
     )
     applied: list[str] = []
     calls: list[tuple[str, ...]] = []
@@ -282,7 +301,7 @@ def test_backend_installs_proxy_and_uses_service_cluster_ip(
                     "ports": [{"port": 3128, "protocol": "TCP"}],
                 }
             }
-            if (kind, name) == ("service", MANAGED_PROXY_NAME)
+            if (kind, name) == ("service", "campaign-proxy")
             else None
         ),
     )
@@ -300,7 +319,7 @@ def test_backend_installs_proxy_and_uses_service_cluster_ip(
         (
             "rollout",
             "status",
-            f"deployment/{MANAGED_PROXY_NAME}",
+            "deployment/campaign-proxy",
             "-n",
             "benchmarks",
             "--timeout=120s",
@@ -317,7 +336,8 @@ def test_proxy_rollout_failure_aborts_with_diagnostics(
             namespace="benchmarks",
             proxy_image=IMAGE,
             preflight_enabled=False,
-        )
+        ),
+        managed_proxy_name="campaign-proxy",
     )
     monkeypatch.setattr(backend, "_apply", lambda resource: None)
     monkeypatch.setattr(
@@ -333,7 +353,7 @@ def test_proxy_rollout_failure_aborts_with_diagnostics(
 
     with pytest.raises(
         BackendRequestError,
-        match="rollout status deployment/brunner-egress-proxy",
+        match="rollout status deployment/campaign-proxy",
     ):
         backend._ensure_managed_proxy()
 
@@ -411,11 +431,11 @@ def test_additive_network_policy_matching_workload_is_rejected(
         backend._validate_exclusive_workload_networking(workload, labels)
 
     policies["items"][0] = {
-        "metadata": {"name": "stager-egress"},
+        "metadata": {"name": "pipeline-egress"},
         "spec": {
             "podSelector": {
                 "matchLabels": {
-                    "dev.brunner/role": "trial-stager",
+                    "dev.brunner/role": "pipeline",
                 }
             },
             "policyTypes": ["Egress"],
@@ -424,7 +444,7 @@ def test_additive_network_policy_matching_workload_is_rejected(
     }
     with pytest.raises(
         BackendRequestError,
-        match=r"stager-egress \(egress: trial-stager\)",
+        match=r"pipeline-egress \(egress: pipeline\)",
     ):
         backend._validate_exclusive_workload_networking(workload, labels)
 
@@ -513,8 +533,9 @@ def test_remote_submission_identity_includes_network_isolation_mode() -> None:
     job = {
         "metadata": {
             "labels": {"dev.brunner/workload": "trial-job"},
-            "annotations": {
-                "dev.brunner/workload-sha256": "workload",
+                "annotations": {
+                    "dev.brunner/workload-sha256": "workload",
+                    "dev.brunner/challenge-sha256": "challenge",
                 "dev.brunner/runtime-protocol": BRUNNER_RUNTIME_PROTOCOL,
                 NETWORK_ISOLATION_MODE_ANNOTATION: "strict",
             },
@@ -587,7 +608,10 @@ def test_network_policy_is_applied_before_staging_or_job(
             proxy_image="proxy:test",
             preflight_enabled=False,
             require_image_digests=False,
-        )
+        ),
+        managed_proxy_name="campaign-proxy",
+        source_claim_name="campaign-control",
+        source_root=tmp_path,
     )
     lifecycle: list[str] = []
     monkeypatch.setattr(
@@ -609,11 +633,6 @@ def test_network_policy_is_applied_before_staging_or_job(
     )
     monkeypatch.setattr(
         backend,
-        "_stage_trial",
-        lambda *args, **kwargs: lifecycle.append("stage"),
-    )
-    monkeypatch.setattr(
-        backend,
         "_run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args,
@@ -629,7 +648,6 @@ def test_network_policy_is_applied_before_staging_or_job(
         "NetworkPolicy",
         "NetworkPolicy",
         "PersistentVolumeClaim",
-        "stage",
         "Job",
     ]
 
@@ -862,6 +880,198 @@ def test_remote_stage_verification_rejects_mutation_and_symlink(
     )
     assert symlink.returncode != 0
     assert "symlink" in symlink.stderr
+
+
+def test_remote_stage_copy_is_resumable_and_preserves_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    workspace = source / "workspace"
+    workspace.mkdir(parents=True)
+    resource = workspace / "resource.bin"
+    resource.write_bytes(b"candidate-visible-resource")
+    metadata = artifact_metadata(resource)
+    assert metadata is not None
+    expected = {
+        "benchmark_id": "benchmark",
+        "benchmark_version": "1.0",
+        "contract_sha256": "c" * 64,
+        "challenge_sha256": "d" * 64,
+        "file_inventory": {"resource.bin": metadata.to_dict()},
+    }
+    marker = workspace / ".brunner-challenge.json"
+    marker.write_text(json.dumps({"schema_version": "1.0", **expected}))
+    source_before = {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    destination = tmp_path / "destination"
+    (destination / "workspace").mkdir(parents=True)
+    partial = (
+        destination
+        / "workspace"
+        / "resource.bin.brunner-part"
+    )
+    partial.write_bytes(resource.read_bytes()[:7])
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(expected).encode()
+    ).decode()
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "brunner.backends.remote",
+            "stage-copy",
+            str(source),
+            str(destination),
+            encoded,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (destination / "workspace/resource.bin").read_bytes() == (
+        resource.read_bytes()
+    )
+    assert not partial.exists()
+    assert source_before == {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_remote_stage_copy_preserves_unexpected_destination_content(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    workspace = source / "workspace"
+    workspace.mkdir(parents=True)
+    marker = workspace / ".brunner-challenge.json"
+    expected = {
+        "benchmark_id": "benchmark",
+        "benchmark_version": "1.0",
+        "contract_sha256": "c" * 64,
+        "challenge_sha256": "d" * 64,
+        "file_inventory": {},
+    }
+    marker.write_text(json.dumps({"schema_version": "1.0", **expected}))
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    candidate_output = destination / "candidate-output.txt"
+    candidate_output.write_text("preserve me")
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(expected).encode()
+    ).decode()
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "brunner.backends.remote",
+            "stage-copy",
+            str(source),
+            str(destination),
+            encoded,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "refuses to remove unexpected" in completed.stderr
+    assert candidate_output.read_text() == "preserve me"
+
+
+def test_remote_collection_reuses_unchanged_staged_files(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline"
+    baseline_workspace = baseline / "workspace"
+    baseline_workspace.mkdir(parents=True)
+    baseline_resource = baseline_workspace / "resource.bin"
+    baseline_resource.write_bytes(b"large-candidate-visible-resource")
+    metadata = artifact_metadata(baseline_resource)
+    assert metadata is not None
+    (baseline_workspace / ".brunner-challenge.json").write_text(
+        json.dumps(
+            {
+                "file_inventory": {
+                    "resource.bin": metadata.to_dict(),
+                }
+            }
+        )
+    )
+    source = tmp_path / "remote"
+    source_workspace = source / "workspace"
+    source_workspace.mkdir(parents=True)
+    (source_workspace / "resource.bin").write_bytes(
+        baseline_resource.read_bytes()
+    )
+    (source_workspace / ".brunner-challenge.json").write_text(
+        (baseline_workspace / ".brunner-challenge.json").read_text()
+    )
+    (source / "status.json").write_text('{"status":"complete"}')
+    (source / "evaluation").mkdir()
+    (source / "evaluation/results.json").write_text(
+        '{"status":"complete","reports":[]}'
+    )
+    policy = ArtifactPolicy()
+    encoded_policy = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "excluded_globs": list(policy.excluded_globs),
+                "groups": {
+                    name: list(patterns)
+                    for name, patterns in policy.groups.items()
+                },
+                "allow_symlinks": policy.allow_symlinks,
+                "collect_evaluated_artifacts": (
+                    policy.collect_evaluated_artifacts
+                ),
+                "max_collection_bytes": policy.max_collection_bytes,
+                "failure_diagnostic_globs": list(
+                    policy.failure_diagnostic_globs
+                ),
+                "max_diagnostic_collection_bytes": (
+                    policy.max_diagnostic_collection_bytes
+                ),
+                "included_groups": [],
+            }
+        ).encode()
+    ).decode()
+    destination = tmp_path / "collected"
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "brunner.backends.remote",
+            "collect-copy",
+            str(source),
+            str(baseline),
+            str(destination),
+            encoded_policy,
+            "evaluation/results.json",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    collected_resource = destination / "workspace/resource.bin"
+    assert collected_resource.stat().st_ino == baseline_resource.stat().st_ino
+    summary = json.loads(
+        destination.with_name("collected-collection.json").read_text()
+    )
+    assert summary["reused_staged_files"] == 1
+    assert (destination / "status.json").is_file()
 
 
 def test_trial_resource_and_workload_identity_survive_move(

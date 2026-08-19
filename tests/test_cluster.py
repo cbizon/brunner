@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 import brunner
+import brunner.cluster as cluster_module
 from brunner.backends import KubernetesProfile
 from brunner.campaign import CampaignPlan, CampaignTrial
 from brunner.cluster import (
@@ -33,7 +34,11 @@ from brunner.cluster import (
     publish_trial_results,
     render_cluster_resources,
 )
-from brunner.errors import IntegrityError
+from brunner.errors import (
+    BackendRequestError,
+    EvaluationPending,
+    IntegrityError,
+)
 from examples.text_benchmark.definition import build_definition
 
 
@@ -188,10 +193,15 @@ def test_rendered_control_plane_enforces_cluster_ownership() -> None:
     }
     assert CAMPAIGN_IMAGE_OVERRIDES_ENV in preparation_environment
     assert EVALUATION_IMAGE_OVERRIDE_ENV in preparation_environment
+    assert preparation["containers"][0]["resources"] == {
+        "requests": {"cpu": "250m", "memory": "512Mi"},
+        "limits": {"cpu": "2", "memory": "4Gi"},
+    }
 
     controller = by_kind["Deployment"][0]["spec"]["template"]["spec"]
     assert controller["serviceAccountName"] == resources.service_account
     assert controller["automountServiceAccountToken"] is True
+    assert "initContainers" not in controller
     controller_environment = {
         entry["name"]: entry["value"]
         for entry in controller["containers"][0]["env"]
@@ -231,6 +241,7 @@ def test_assessment_job_receives_submitted_image_identity() -> None:
         benchmark_ref="examples.text_benchmark.definition",
         campaign_ref="my_benchmark.campaign",
         proxy_url=None,
+        proxy_labels={},
     )
 
     job = finalizer._job(
@@ -242,12 +253,20 @@ def test_assessment_job_receives_submitted_image_identity() -> None:
         for entry in job["spec"]["template"]["spec"]["containers"][0]["env"]
         if "value" in entry
     }
-    control_mount = next(
+    input_mount = next(
         mount
         for mount in job["spec"]["template"]["spec"]["containers"][0][
             "volumeMounts"
         ]
-        if mount["name"] == "control"
+        if mount.get("readOnly")
+    )
+    output_mount = next(
+        mount
+        for mount in job["spec"]["template"]["spec"]["containers"][0][
+            "volumeMounts"
+        ]
+        if mount.get("subPath")
+        == "assessment-output/assessment-run-a"
     )
 
     assert (
@@ -262,11 +281,199 @@ def test_assessment_job_receives_submitted_image_identity() -> None:
             EVALUATION_IMAGE_OVERRIDE_ENV
         ]
     )
-    assert control_mount == {
+    assert input_mount == {
         "name": "control",
         "mountPath": "/brunner/control/collected/run-a",
         "subPath": "collected/run-a",
+        "readOnly": True,
     }
+    assert output_mount == {
+        "name": "control",
+        "mountPath": "/brunner/control/assessment-output/assessment-run-a",
+        "subPath": "assessment-output/assessment-run-a",
+    }
+    control_volumes = [
+        volume
+        for volume in job["spec"]["template"]["spec"]["volumes"]
+        if volume["name"] == "control"
+    ]
+    assert control_volumes == [
+        {
+            "name": "control",
+            "persistentVolumeClaim": {
+                "claimName": resources.control_claim,
+            },
+        }
+    ]
+
+
+class PendingAssessmentClient:
+    def __init__(self) -> None:
+        self.applied: list[dict[str, Any]] = []
+
+    def apply(self, resource: dict[str, Any]) -> None:
+        self.applied.append(resource)
+
+    def get(
+        self,
+        kind: str,
+        name: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        return None
+
+
+def test_assessment_submission_is_nonblocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    trial = control / "collected/run-a"
+    trial.mkdir(parents=True)
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", control)
+    definition = build_definition()
+    campaign = _campaign()
+    resources = campaign_resources(definition, campaign)
+    client = PendingAssessmentClient()
+    finalizer = KubernetesEvaluationFinalizer(
+        definition=definition,
+        campaign=campaign,
+        resources=resources,
+        client=client,  # type: ignore[arg-type]
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+        proxy_url=None,
+        proxy_labels={},
+    )
+
+    with pytest.raises(EvaluationPending, match="submitted"):
+        finalizer(trial)
+
+    assert [item["kind"] for item in client.applied] == [
+        "NetworkPolicy",
+        "Job",
+    ]
+    assert (
+        control
+        / "assessment-output"
+        / finalizer._job_name(trial)
+    ).is_dir()
+
+
+class FailedPreparationClient:
+    def __init__(self) -> None:
+        self.applied: list[dict[str, Any]] = []
+
+    def get(
+        self,
+        kind: str,
+        name: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        assert kind == "job"
+        return {
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Failed",
+                        "status": "True",
+                        "reason": "BackoffLimitExceeded",
+                        "message": "materializer exited 17",
+                    }
+                ]
+            }
+        }
+
+    def apply(self, resource: dict[str, Any]) -> None:
+        self.applied.append(resource)
+
+
+class CompletedPreparationClient(FailedPreparationClient):
+    def get(
+        self,
+        kind: str,
+        name: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        assert kind == "job"
+        return {
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Complete",
+                        "status": "True",
+                    }
+                ]
+            }
+        }
+
+
+def test_controller_reports_terminal_preparation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    control.mkdir()
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", control)
+    campaign = _campaign()
+    resources = campaign_resources(build_definition(), campaign)
+    client = FailedPreparationClient()
+
+    with pytest.raises(
+        BackendRequestError,
+        match="materializer exited 17",
+    ):
+        cluster_module._wait_for_preparation(
+            campaign,
+            resources,
+            client,  # type: ignore[arg-type]
+        )
+
+    status = json.loads(
+        client.applied[-1]["data"]["status.json"]
+    )
+    assert status["status"] == "attention_required"
+    assert status["preparation_status"] == "failed"
+    assert status["preparation_error"] == "materializer exited 17"
+
+
+def test_controller_rejects_completed_preparation_without_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    control.mkdir()
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", control)
+    campaign = _campaign()
+    resources = campaign_resources(build_definition(), campaign)
+    client = CompletedPreparationClient()
+    monotonic_values = iter((0.0, 0.0, 0.0, 0.0, 11.0, 11.0))
+    monkeypatch.setattr(
+        cluster_module.time,
+        "monotonic",
+        lambda: next(monotonic_values, 11.0),
+    )
+    monkeypatch.setattr(
+        cluster_module.time,
+        "sleep",
+        lambda seconds: None,
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="completed without publishing",
+    ):
+        cluster_module._wait_for_preparation(
+            campaign,
+            resources,
+            client,  # type: ignore[arg-type]
+        )
+
+    status = json.loads(
+        client.applied[-1]["data"]["status.json"]
+    )
+    assert status["preparation_status"] == "failed"
+    assert "prepared-" in status["preparation_error"]
 
 
 class FakeConfigMapLockClient:
@@ -419,7 +626,7 @@ def test_publication_omits_unchanged_challenge_and_assessment_workspace(
     marker = workspace / ".brunner-challenge.json"
     marker.write_text(
         json.dumps(
-            {"file_inventory": {"workspace/large-input.bin": input_metadata}}
+            {"file_inventory": {"large-input.bin": input_metadata}}
         )
     )
     (source / "evaluation").mkdir()

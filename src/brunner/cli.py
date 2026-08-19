@@ -124,6 +124,7 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
         internal.add_argument("--campaign-sha256", required=True)
         if name == "controller-finalize":
             internal.add_argument("--trial-relative", required=True)
+            internal.add_argument("--output-relative", required=True)
     return parser
 
 
@@ -229,6 +230,7 @@ def execute(
                 campaign,
                 expected_sha256=args.campaign_sha256,
                 trial_relative=args.trial_relative,
+                output_relative=args.output_relative,
             )
         client = ClusterCampaignClient(
             definition,

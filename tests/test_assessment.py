@@ -216,8 +216,8 @@ write_assessment_output(assessment_input, result)
 import os
 from pathlib import Path
 
-trial = Path(os.environ["BRUNNER_TRIAL_ROOT"])
-(trial / "evaluation/qualitative-review.html").write_text(
+output_root = Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT_ROOT"])
+(output_root / "evaluation/qualitative-review.html").write_text(
     "<html><body>qualitative review</body></html>"
 )
 """
@@ -293,6 +293,23 @@ trial = Path(os.environ["BRUNNER_TRIAL_ROOT"])
     assert rerun["status"] == "complete"
     assert "assessments" not in rerun_dossier["deterministic_evaluation"]
     assert "assessments" not in copied_evaluation
+
+    source_index = trial / "assessments/index.json"
+    source_index.unlink()
+    output_trial = tmp_path / "assessment-output"
+    separated = run_assessments(
+        definition,
+        contract,
+        trial,
+        result,
+        output_trial=output_trial,
+    )
+    assert separated["status"] == "complete", json.dumps(
+        separated,
+        indent=2,
+    )
+    assert (output_trial / "assessments/index.json").is_file()
+    assert not source_index.exists()
 
 
 def test_optional_assessment_failure_does_not_replace_evaluation_status(

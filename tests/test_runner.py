@@ -374,6 +374,72 @@ raise SystemExit(1)
     assert (trial / "workspace/.attempt-count").read_text() == "1"
 
 
+def test_codex_textual_http_404_failure_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "codex-missing-deployment",
+            "codex",
+            "missing-deployment",
+            None,
+        ),
+    )
+    binary = tmp_path / "codex"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+from pathlib import Path
+
+count_file = Path(".attempt-count")
+count = int(count_file.read_text()) if count_file.exists() else 0
+count_file.write_text(str(count + 1))
+print(json.dumps({
+    "type": "turn.failed",
+    "error": {
+        "message": (
+            "unexpected status 404 Not Found: The API deployment for this "
+            "resource does not exist., url: "
+            "https://example.openai.azure.com/openai/v1/responses"
+        )
+    },
+}), flush=True)
+raise SystemExit(1)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="codex",
+            model="missing-deployment",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            max_attempts=10,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "provider_error"
+    assert len(state["attempts"]) == 1
+    assert state["attempts"][0]["api_status"] == 404
+    assert state["attempts"][0]["failure_reason"] == "http_404"
+    assert (trial / "workspace/.attempt-count").read_text() == "1"
+
+
 def test_nonfinal_success_cannot_consume_finalization_window(
     tmp_path: Path,
 ) -> None:
@@ -1109,6 +1175,9 @@ arguments = sys.argv[1:]
 resume = "resume" in arguments
 if resume and "--sandbox" in arguments:
     print("error: unexpected argument '--sandbox'", file=sys.stderr)
+    raise SystemExit(2)
+if resume and "--dangerously-bypass-approvals-and-sandbox" not in arguments:
+    print("error: resumed workspace is not writable", file=sys.stderr)
     raise SystemExit(2)
 with pathlib.Path(".modes").open("a") as stream:
     stream.write(("resume" if resume else "initial") + "\n")

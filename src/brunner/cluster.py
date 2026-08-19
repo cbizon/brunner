@@ -10,14 +10,18 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from brunner.backends import KubernetesBackend, KubernetesProfile
 from brunner.artifacts import artifact_metadata
-from brunner.backends.squid import MANAGED_PROXY_LABELS, MANAGED_PROXY_PORT
+from brunner.backends.squid import (
+    MANAGED_PROXY_PORT,
+    managed_proxy_labels,
+)
 from brunner.campaign import (
     CampaignEngine,
     CampaignPlan,
@@ -28,6 +32,7 @@ from brunner.definition import BenchmarkDefinition
 from brunner.errors import (
     BackendConnectivityError,
     BackendRequestError,
+    EvaluationPending,
     IntegrityError,
 )
 from brunner.hashing import sha256_file
@@ -41,6 +46,7 @@ RESULT_MANIFEST_SHA256_ANNOTATION = (
     "dev.brunner/result-manifest-sha256"
 )
 RESULT_MANIFEST_SIZE_ANNOTATION = "dev.brunner/result-manifest-size"
+PREPARATION_MARKER_GRACE_SECONDS = 10
 CAMPAIGN_SHA256_ANNOTATION = "dev.brunner/campaign-sha256"
 CAMPAIGN_IMAGE_OVERRIDES_ENV = "BRUNNER_CAMPAIGN_IMAGE_OVERRIDES"
 EVALUATION_IMAGE_OVERRIDE_ENV = "BRUNNER_EVALUATION_IMAGE_OVERRIDE"
@@ -56,6 +62,10 @@ TERMINAL_CONTAINER_REASONS = frozenset(
         "StartError",
     }
 )
+
+
+class ControllerLockLost(BaseException):
+    """The active controller may no longer mutate campaign resources."""
 
 
 def _now() -> str:
@@ -113,6 +123,10 @@ class ControllerProfile:
     controller_cpu_limit: str = "2"
     controller_memory_request: str = "512Mi"
     controller_memory_limit: str = "4Gi"
+    preparation_cpu_request: str = "250m"
+    preparation_cpu_limit: str = "2"
+    preparation_memory_request: str = "512Mi"
+    preparation_memory_limit: str = "4Gi"
     assessment_cpu_request: str = "1"
     assessment_cpu_limit: str = "4"
     assessment_memory_request: str = "2Gi"
@@ -166,6 +180,14 @@ class ControllerProfile:
             raise ValueError(
                 "controller max_published_trial_bytes must be positive or None"
             )
+        for name, value in (
+            ("preparation_cpu_request", self.preparation_cpu_request),
+            ("preparation_cpu_limit", self.preparation_cpu_limit),
+            ("preparation_memory_request", self.preparation_memory_request),
+            ("preparation_memory_limit", self.preparation_memory_limit),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"controller {name} cannot be empty")
         for provider, environment in (
             self.reviewer_secret_environment.items()
         ):
@@ -383,6 +405,10 @@ class CampaignResources:
     @property
     def assessment_policy(self) -> str:
         return f"{self.base}-assessment"
+
+    @property
+    def proxy(self) -> str:
+        return f"{self.base}-proxy"
 
 
 def campaign_resources(
@@ -770,6 +796,16 @@ def render_cluster_resources(
                 ),
                 "workingDir": "/tmp",
                 "env": prepare_environment,
+                "resources": {
+                    "requests": {
+                        "cpu": profile.preparation_cpu_request,
+                        "memory": profile.preparation_memory_request,
+                    },
+                    "limits": {
+                        "cpu": profile.preparation_cpu_limit,
+                        "memory": profile.preparation_memory_limit,
+                    },
+                },
                 "securityContext": _security_context(),
                 "volumeMounts": prepare_mounts,
             }
@@ -833,28 +869,6 @@ def render_cluster_resources(
         "serviceAccountName": resources.service_account,
         "securityContext": _pod_security_context(),
         "terminationGracePeriodSeconds": 30,
-        "initContainers": [
-            {
-                "name": "wait-for-preparation",
-                "image": profile.image,
-                "command": [
-                    "sh",
-                    "-c",
-                    (
-                        "deadline=$(("
-                        f"$(date +%s)+{math.ceil(profile.preparation_timeout_seconds)}"
-                        ")); "
-                        "until test -f "
-                        f"{CONTROL_ROOT}/prepared-{campaign.sha256}.json; "
-                        "do test $(date +%s) -lt $deadline || exit 1; "
-                        "sleep 2; done"
-                    ),
-                ],
-                "workingDir": "/tmp",
-                "securityContext": _security_context(),
-                "volumeMounts": mounts,
-            }
-        ],
         "containers": [controller_container],
         "volumes": volumes,
     }
@@ -1171,7 +1185,7 @@ class ConfigMapLock:
 
     def assert_held(self) -> None:
         if self._lost.is_set():
-            raise RuntimeError(
+            raise ControllerLockLost(
                 "controller lost its Kubernetes ConfigMap lock"
                 + (f": {self.last_error}" if self.last_error else "")
             )
@@ -1229,9 +1243,14 @@ def _campaign_status(
     }
 
 
-def _result_inventory(results_root: Path) -> list[dict[str, Any]]:
+def _result_inventory(
+    results_root: Path,
+    *,
+    fence: Callable[[], None],
+) -> list[dict[str, Any]]:
     files = []
     for path in sorted(results_root.rglob("*")):
+        fence()
         if path.is_symlink():
             raise IntegrityError(
                 f"result bundle contains a symlink: {path}"
@@ -1241,11 +1260,14 @@ def _result_inventory(results_root: Path) -> list[dict[str, Any]]:
         relative = path.relative_to(results_root).as_posix()
         if relative == RESULT_MANIFEST:
             continue
+        size = path.stat().st_size
+        digest = sha256_file(path)
+        fence()
         files.append(
             {
                 "path": relative,
-                "size": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "size": size,
+                "sha256": digest,
             }
         )
     return files
@@ -1256,7 +1278,10 @@ def publish_trial_results(
     destination: Path,
     *,
     max_bytes: int | None,
+    fence: Callable[[], None] | None = None,
 ) -> Path:
+    fence = fence or (lambda: None)
+    fence()
     source = source.resolve()
     destination = destination.resolve()
     if not source.is_dir() or source.is_symlink():
@@ -1274,10 +1299,14 @@ def publish_trial_results(
     if marker.is_file() and not marker.is_symlink():
         value = json.loads(marker.read_text())
         if isinstance(value.get("file_inventory"), dict):
-            baseline = value["file_inventory"]
+            baseline = {
+                f"workspace/{relative}": metadata
+                for relative, metadata in value["file_inventory"].items()
+            }
 
     selected: dict[str, dict[str, Any]] = {}
     for path in sorted(source.rglob("*")):
+        fence()
         if path.is_symlink():
             raise IntegrityError(
                 f"published result contains a symlink: {path}"
@@ -1313,8 +1342,11 @@ def publish_trial_results(
         )
 
     partial = destination.with_name(destination.name + ".partial")
+    fence()
     partial.mkdir(parents=True, exist_ok=True)
+    fence()
     for relative, expected in selected.items():
+        fence()
         source_path = source / relative
         target = partial / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1331,6 +1363,7 @@ def publish_trial_results(
         ) as output_stream:
             input_stream.seek(offset)
             while offset < expected_size:
+                fence()
                 data = input_stream.read(
                     min(4 * 1024 * 1024, expected_size - offset)
                 )
@@ -1348,6 +1381,7 @@ def publish_trial_results(
                 f"published result checksum mismatch: {relative}"
             )
     for path in sorted(partial.rglob("*"), reverse=True):
+        fence()
         if not path.is_file():
             continue
         relative = path.relative_to(partial).as_posix()
@@ -1355,6 +1389,7 @@ def publish_trial_results(
             continue
         if relative not in selected:
             path.unlink()
+    fence()
     write_json_atomic(
         partial / "publication.json",
         {
@@ -1364,9 +1399,14 @@ def publish_trial_results(
             "published_at": _now(),
         },
     )
+    fence()
     if destination.exists():
+        fence()
         shutil.rmtree(destination)
+        fence()
+    fence()
     partial.replace(destination)
+    fence()
     return destination
 
 
@@ -1374,22 +1414,33 @@ def finalize_result_bundle(
     results_root: Path,
     state: dict[str, Any],
     campaign: ClusterCampaign,
+    *,
+    fence: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    fence = fence or (lambda: None)
+    fence()
     results_root.mkdir(parents=True, exist_ok=True)
+    fence()
     write_json_atomic(results_root / "campaign.json", state)
+    fence()
     manifest = {
         "schema_version": "1.0",
         "campaign_id": campaign.plan.campaign_id,
         "campaign_sha256": campaign.sha256,
         "created_at": _now(),
-        "files": _result_inventory(results_root),
+        "files": _result_inventory(results_root, fence=fence),
     }
     manifest_path = results_root / RESULT_MANIFEST
+    fence()
     write_json_atomic(manifest_path, manifest)
+    fence()
+    digest = sha256_file(manifest_path)
+    size = manifest_path.stat().st_size
+    fence()
     return {
         "manifest": manifest,
-        "sha256": sha256_file(manifest_path),
-        "size": manifest_path.stat().st_size,
+        "sha256": digest,
+        "size": size,
     }
 
 
@@ -1403,6 +1454,54 @@ def _assessment_providers(
     )
 
 
+def _merge_assessment_output(
+    source: Path,
+    destination: Path,
+    *,
+    fence: Callable[[], None],
+) -> None:
+    source = source.resolve()
+    destination = destination.resolve()
+    if not source.is_dir() or source.is_symlink():
+        raise IntegrityError(f"assessment output root is unsafe: {source}")
+    if not destination.is_dir() or destination.is_symlink():
+        raise IntegrityError(
+            f"collected trial root is unsafe: {destination}"
+        )
+    for path in sorted(source.rglob("*")):
+        fence()
+        if path.is_symlink():
+            raise IntegrityError(
+                f"assessment output contains a symlink: {path}"
+            )
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            fence()
+            continue
+        if not path.is_file():
+            raise IntegrityError(
+                f"assessment output contains an unsupported entry: {path}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".assessment-part")
+        shutil.copy2(path, temporary)
+        expected = artifact_metadata(path)
+        observed = artifact_metadata(temporary)
+        if (
+            expected is None
+            or observed is None
+            or observed.to_dict() != expected.to_dict()
+        ):
+            temporary.unlink(missing_ok=True)
+            raise IntegrityError(
+                f"assessment output copy failed integrity check: {relative}"
+            )
+        temporary.replace(target)
+        fence()
+
+
 class KubernetesEvaluationFinalizer:
     def __init__(
         self,
@@ -1414,6 +1513,8 @@ class KubernetesEvaluationFinalizer:
         benchmark_ref: str,
         campaign_ref: str,
         proxy_url: str | None,
+        proxy_labels: dict[str, str],
+        fence: Callable[[], None] | None = None,
     ) -> None:
         self.definition = definition
         self.campaign = campaign
@@ -1422,6 +1523,8 @@ class KubernetesEvaluationFinalizer:
         self.benchmark_ref = benchmark_ref
         self.campaign_ref = campaign_ref
         self.proxy_url = proxy_url
+        self.proxy_labels = dict(proxy_labels)
+        self.fence = fence or (lambda: None)
 
     def _job_name(self, trial: Path) -> str:
         identity = (
@@ -1447,7 +1550,7 @@ class KubernetesEvaluationFinalizer:
                     "to": [
                         {
                             "podSelector": {
-                                "matchLabels": dict(MANAGED_PROXY_LABELS)
+                                "matchLabels": dict(self.proxy_labels)
                             }
                         }
                     ],
@@ -1474,6 +1577,9 @@ class KubernetesEvaluationFinalizer:
                 "egress": egress,
             },
         }
+
+    def _output_relative(self, job_name: str) -> str:
+        return f"assessment-output/{job_name}"
 
     def _job(self, trial: Path, job_name: str) -> dict[str, Any]:
         providers = _assessment_providers(self.definition)
@@ -1528,6 +1634,7 @@ class KubernetesEvaluationFinalizer:
                 for name, reference in sorted(mappings.items())
             )
         relative = trial.relative_to(CONTROL_ROOT).as_posix()
+        output_relative = self._output_relative(job_name)
         timeout = max(
             300,
             math.ceil(
@@ -1557,6 +1664,8 @@ class KubernetesEvaluationFinalizer:
                         self.campaign.sha256,
                         "--trial-relative",
                         relative,
+                        "--output-relative",
+                        output_relative,
                     ],
                     "workingDir": "/tmp",
                     "env": environment,
@@ -1588,6 +1697,14 @@ class KubernetesEvaluationFinalizer:
                             "name": "control",
                             "mountPath": str(trial),
                             "subPath": relative,
+                            "readOnly": True,
+                        },
+                        {
+                            "name": "control",
+                            "mountPath": str(
+                                CONTROL_ROOT / output_relative
+                            ),
+                            "subPath": output_relative,
                         },
                         {"name": "tmp", "mountPath": "/tmp"},
                     ],
@@ -1622,33 +1739,50 @@ class KubernetesEvaluationFinalizer:
             },
         }
 
-    def _wait(self, job_name: str) -> None:
-        deadline = time.monotonic() + sum(
-            assessment.timeout_seconds
-            for assessment in self.definition.resolved_assessments()
-        ) + 600
-        while time.monotonic() < deadline:
-            job = self.client.get("job", job_name)
-            if job is None:
-                raise BackendRequestError(
-                    f"assessment Job disappeared: {job_name}"
+    def __call__(self, trial: Path) -> dict[str, Any]:
+        from brunner.evaluation import _validate_evaluation_result
+        from brunner.report import write_run_report
+
+        job_name = self._job_name(trial)
+        job = self._job(trial, job_name)
+        labels = dict(job["metadata"]["labels"])
+        self.fence()
+        self.client.apply(self._network_policy(job_name, labels))
+        self.fence()
+        existing = self.client.get("job", job_name)
+        self.fence()
+        if existing is None:
+            output_root = CONTROL_ROOT / self._output_relative(job_name)
+            if output_root.exists():
+                shutil.rmtree(output_root)
+            output_root.mkdir(parents=True)
+            self.fence()
+            self.client.apply(job)
+            self.fence()
+            raise EvaluationPending(
+                f"assessment Job submitted: {job_name}"
+            )
+        conditions = {
+            item.get("type"): item
+            for item in existing.get("status", {}).get("conditions", ())
+            if isinstance(item, dict)
+        }
+        if conditions.get("Failed", {}).get("status") == "True":
+            failed = conditions["Failed"]
+            raise BackendRequestError(
+                "assessment Job failed: "
+                + str(
+                    failed.get("message")
+                    or failed.get("reason")
+                    or job_name
                 )
-            conditions = {
-                item.get("type"): item
-                for item in job.get("status", {}).get("conditions", ())
-                if isinstance(item, dict)
-            }
-            if conditions.get("Complete", {}).get("status") == "True":
-                return
-            if conditions.get("Failed", {}).get("status") == "True":
-                raise BackendRequestError(
-                    "assessment Job failed: "
-                    + str(conditions["Failed"].get("message") or job_name)
-                )
+            )
+        if conditions.get("Complete", {}).get("status") != "True":
             pods = self.client.get(
                 "pods",
                 labels=f"job-name={job_name}",
             ) or {"items": []}
+            self.fence()
             for pod in pods.get("items", ()):
                 for status in pod.get("status", {}).get(
                     "containerStatuses",
@@ -1661,20 +1795,26 @@ class KubernetesEvaluationFinalizer:
                             f"assessment container cannot start: {reason}: "
                             f"{waiting.get('message') or ''}"
                         )
-            time.sleep(self.campaign.controller.poll_seconds)
-        raise TimeoutError(f"assessment Job timed out: {job_name}")
-
-    def __call__(self, trial: Path) -> dict[str, Any]:
-        from brunner.evaluation import _validate_evaluation_result
-
-        job_name = self._job_name(trial)
-        job = self._job(trial, job_name)
-        labels = dict(job["metadata"]["labels"])
-        self.client.apply(self._network_policy(job_name, labels))
-        existing = self.client.get("job", job_name)
-        if existing is None:
-            self.client.apply(job)
-        self._wait(job_name)
+            raise EvaluationPending(
+                f"assessment Job is still running: {job_name}"
+            )
+        output_root = CONTROL_ROOT / self._output_relative(job_name)
+        output_results = (
+            output_root / self.definition.evaluation.results_path
+        )
+        if not output_results.is_file():
+            raise IntegrityError(
+                "assessment Job completed without output results: "
+                f"{output_results}"
+            )
+        _validate_evaluation_result(json.loads(output_results.read_text()))
+        self.fence()
+        _merge_assessment_output(
+            output_root,
+            trial,
+            fence=self.fence,
+        )
+        self.fence()
         results_path = trial / self.definition.evaluation.results_path
         if not results_path.is_file():
             raise IntegrityError(
@@ -1684,8 +1824,25 @@ class KubernetesEvaluationFinalizer:
         result = _validate_evaluation_result(
             json.loads(results_path.read_text())
         )
+        self.fence()
+        report_path = write_run_report(
+            trial,
+            results_path.with_name("run-report.html"),
+        )
+        self.fence()
+        result["report"] = {
+            "status": "complete",
+            "path": str(report_path.relative_to(trial)),
+        }
+        self.fence()
+        write_json_atomic(results_path, result)
+        self.fence()
         self.client.delete("job", job_name)
+        self.fence()
         self.client.delete("networkpolicy", job_name)
+        self.fence()
+        shutil.rmtree(output_root)
+        self.fence()
         return result
 
 
@@ -1707,34 +1864,63 @@ def prepare_cluster_campaign(
     *,
     expected_sha256: str,
 ) -> dict[str, Any]:
-    verify_campaign_sha256(campaign, expected_sha256)
-    result_manifest = RESULTS_ROOT / RESULT_MANIFEST
-    if result_manifest.is_file():
-        existing = json.loads(result_manifest.read_text())
-        if existing.get("campaign_sha256") != campaign.sha256:
-            result_manifest.unlink()
-            (RESULTS_ROOT / "campaign.json").unlink(missing_ok=True)
-    backend = KubernetesBackend(campaign.backend)
-    engine = CampaignEngine(
-        definition,
-        contract,
-        campaign.plan,
-        backend,
-        control_root=CONTROL_ROOT,
-        results_root=RESULTS_ROOT,
-    )
-    state = engine.initialize()
     marker = CONTROL_ROOT / f"prepared-{campaign.sha256}.json"
-    write_json_atomic(
-        marker,
-        {
-            "schema_version": "1.0",
-            "campaign_id": campaign.plan.campaign_id,
-            "campaign_sha256": campaign.sha256,
-            "prepared_at": _now(),
-        },
+    failure_marker = (
+        CONTROL_ROOT / f"preparation-{campaign.sha256}.failed.json"
     )
-    return state
+    try:
+        verify_campaign_sha256(campaign, expected_sha256)
+        result_manifest = RESULTS_ROOT / RESULT_MANIFEST
+        if result_manifest.is_file():
+            existing = json.loads(result_manifest.read_text())
+            if existing.get("campaign_sha256") != campaign.sha256:
+                result_manifest.unlink()
+                (RESULTS_ROOT / "campaign.json").unlink(missing_ok=True)
+        resources = campaign_resources(definition, campaign)
+        backend = KubernetesBackend(
+            campaign.backend,
+            managed_proxy_name=resources.proxy,
+            managed_proxy_campaign_labels=_labels(resources),
+            source_claim_name=resources.control_claim,
+            source_root=CONTROL_ROOT,
+        )
+        engine = CampaignEngine(
+            definition,
+            contract,
+            campaign.plan,
+            backend,
+            control_root=CONTROL_ROOT,
+            results_root=RESULTS_ROOT,
+        )
+        state = engine.initialize()
+        failure_marker.unlink(missing_ok=True)
+        write_json_atomic(
+            marker,
+            {
+                "schema_version": "1.0",
+                "campaign_id": campaign.plan.campaign_id,
+                "campaign_sha256": campaign.sha256,
+                "prepared_at": _now(),
+            },
+        )
+        return state
+    except Exception as error:
+        marker.unlink(missing_ok=True)
+        write_json_atomic(
+            failure_marker,
+            {
+                "schema_version": "1.0",
+                "campaign_id": campaign.plan.campaign_id,
+                "campaign_sha256": campaign.sha256,
+                "failed_at": _now(),
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                },
+            },
+        )
+        raise
 
 
 def finalize_cluster_trial(
@@ -1744,6 +1930,7 @@ def finalize_cluster_trial(
     *,
     expected_sha256: str,
     trial_relative: str,
+    output_relative: str,
 ) -> dict[str, Any]:
     from brunner.evaluation import finalize_evaluation
 
@@ -1758,7 +1945,128 @@ def finalize_cluster_trial(
     trial = (CONTROL_ROOT / relative).resolve()
     if not trial.is_relative_to(CONTROL_ROOT.resolve()) or not trial.is_dir():
         raise ValueError(f"collected trial does not exist: {trial}")
-    return finalize_evaluation(definition, contract, trial)
+    output_path = Path(output_relative)
+    if (
+        output_path.is_absolute()
+        or ".." in output_path.parts
+        or output_path.parts[:1] != ("assessment-output",)
+    ):
+        raise ValueError(
+            "output-relative must identify an assessment-output directory"
+        )
+    output_trial = (CONTROL_ROOT / output_path).resolve()
+    if (
+        not output_trial.is_relative_to(CONTROL_ROOT.resolve())
+        or not output_trial.is_dir()
+    ):
+        raise ValueError(
+            f"assessment output directory does not exist: {output_trial}"
+        )
+    return finalize_evaluation(
+        definition,
+        contract,
+        trial,
+        output_trial=output_trial,
+    )
+
+
+def _wait_for_preparation(
+    campaign: ClusterCampaign,
+    resources: CampaignResources,
+    client: Kubectl,
+) -> None:
+    marker = CONTROL_ROOT / f"prepared-{campaign.sha256}.json"
+    failure_marker = (
+        CONTROL_ROOT / f"preparation-{campaign.sha256}.failed.json"
+    )
+    deadline = (
+        time.monotonic()
+        + campaign.controller.preparation_timeout_seconds
+        + 30
+    )
+    completed_without_marker_since: float | None = None
+    while True:
+        if marker.is_file():
+            return
+        failure: str | None = None
+        if failure_marker.is_file():
+            try:
+                value = json.loads(failure_marker.read_text())
+                error = value.get("error", {})
+                failure = str(
+                    error.get("message")
+                    if isinstance(error, dict)
+                    else error
+                )
+            except (json.JSONDecodeError, OSError):
+                failure = failure_marker.read_text(errors="replace")
+        job = client.get("job", resources.preparation_job)
+        if job is not None:
+            conditions = {
+                item.get("type"): item
+                for item in job.get("status", {}).get("conditions", ())
+                if isinstance(item, dict)
+            }
+            failed = conditions.get("Failed", {})
+            if failed.get("status") == "True":
+                failure = str(
+                    failed.get("message")
+                    or failed.get("reason")
+                    or "preparation Job failed"
+                )
+            completed = conditions.get("Complete", {})
+            if completed.get("status") == "True":
+                now = time.monotonic()
+                if completed_without_marker_since is None:
+                    completed_without_marker_since = now
+                elif (
+                    now - completed_without_marker_since
+                    >= PREPARATION_MARKER_GRACE_SECONDS
+                    and failure is None
+                ):
+                    failure = (
+                        "preparation Job completed without publishing "
+                        f"{marker.name}"
+                    )
+            else:
+                completed_without_marker_since = None
+        if time.monotonic() >= deadline and failure is None:
+            failure = (
+                "preparation did not complete within "
+                f"{campaign.controller.preparation_timeout_seconds} seconds"
+            )
+        if failure is not None:
+            status = {
+                "schema_version": "1.0",
+                "campaign_id": campaign.plan.campaign_id,
+                "campaign_sha256": campaign.sha256,
+                "status": "attention_required",
+                "has_attention": True,
+                "preparation_status": "failed",
+                "preparation_error": failure,
+                "result_ready": False,
+                "updated_at": _now(),
+            }
+            client.apply(_status_resource(resources, status))
+            raise BackendRequestError(
+                f"campaign preparation failed: {failure}"
+            )
+        client.apply(
+            _status_resource(
+                resources,
+                {
+                    "schema_version": "1.0",
+                    "campaign_id": campaign.plan.campaign_id,
+                    "campaign_sha256": campaign.sha256,
+                    "status": "preparing",
+                    "has_attention": False,
+                    "preparation_status": "running",
+                    "result_ready": False,
+                    "updated_at": _now(),
+                },
+            )
+        )
+        time.sleep(campaign.controller.poll_seconds)
 
 
 def run_cluster_controller(
@@ -1778,6 +2086,7 @@ def run_cluster_controller(
         resources.namespace,
         timeout_seconds=campaign.controller.command_timeout_seconds,
     )
+    _wait_for_preparation(campaign, resources, client)
     pod_name = os.environ.get("BRUNNER_CONTROLLER_POD_NAME", "unknown")
     pod_uid = os.environ.get("BRUNNER_CONTROLLER_POD_UID", "unknown")
     lock = ConfigMapLock(
@@ -1787,7 +2096,14 @@ def run_cluster_controller(
         duration_seconds=campaign.controller.lock_duration_seconds,
     )
     lock.acquire()
-    backend = KubernetesBackend(campaign.backend)
+    backend = KubernetesBackend(
+        campaign.backend,
+        managed_proxy_name=resources.proxy,
+        managed_proxy_campaign_labels=_labels(resources),
+        source_claim_name=resources.control_claim,
+        source_root=CONTROL_ROOT,
+        fence=lock.assert_held,
+    )
     backend._ensure_managed_proxy()
     finalizer = KubernetesEvaluationFinalizer(
         definition=definition,
@@ -1797,6 +2113,8 @@ def run_cluster_controller(
         benchmark_ref=benchmark_ref,
         campaign_ref=campaign_ref,
         proxy_url=backend._proxy_url,
+        proxy_labels=backend._proxy_labels,
+        fence=lock.assert_held,
     )
     engine = CampaignEngine(
         definition,
@@ -1810,7 +2128,9 @@ def run_cluster_controller(
             source,
             RESULTS_ROOT / "trials" / str(entry["test_id"]),
             max_bytes=campaign.controller.max_published_trial_bytes,
+            fence=lock.assert_held,
         ),
+        fence=lock.assert_held,
     )
     server, _ = start_campaign_server(
         RESULTS_ROOT,
@@ -1840,7 +2160,9 @@ def run_cluster_controller(
                     manifest_sha256=manifest_sha256,
                     manifest_size=manifest_size,
                 )
+                lock.assert_held()
                 client.apply(_status_resource(resources, status))
+                lock.assert_held()
                 time.sleep(campaign.controller.poll_seconds)
                 continue
             state = engine.advance()
@@ -1849,13 +2171,17 @@ def run_cluster_controller(
                 state,
                 result_ready=False,
             )
+            lock.assert_held()
             client.apply(_status_resource(resources, status))
             if state.get("status") in TERMINAL_CAMPAIGN_STATES:
+                lock.assert_held()
                 bundle = finalize_result_bundle(
                     RESULTS_ROOT,
                     state,
                     campaign,
+                    fence=lock.assert_held,
                 )
+                lock.assert_held()
                 client.run(
                     "annotate",
                     "pvc",
@@ -1876,6 +2202,7 @@ def run_cluster_controller(
                     ),
                     "--overwrite",
                 )
+                lock.assert_held()
                 client.apply(
                     _status_resource(
                         resources,
@@ -1888,6 +2215,7 @@ def run_cluster_controller(
                         ),
                     )
                 )
+                lock.assert_held()
             time.sleep(campaign.controller.poll_seconds)
     finally:
         server.shutdown()
@@ -2002,6 +2330,34 @@ class ClusterCampaignClient:
             )
         status["namespace"] = self.resources.namespace
         status["monitor_service"] = self.resources.service
+        preparation = self.client.get(
+            "job",
+            self.resources.preparation_job,
+        )
+        if preparation is not None:
+            conditions = {
+                item.get("type"): item
+                for item in preparation.get("status", {}).get(
+                    "conditions",
+                    (),
+                )
+                if isinstance(item, dict)
+            }
+            if conditions.get("Failed", {}).get("status") == "True":
+                failed = conditions["Failed"]
+                status["preparation_status"] = "failed"
+                status["preparation_error"] = (
+                    failed.get("message")
+                    or failed.get("reason")
+                    or "preparation Job failed"
+                )
+                status["has_attention"] = True
+            elif conditions.get("Complete", {}).get("status") == "True":
+                status["preparation_status"] = "complete"
+            elif preparation.get("status", {}).get("active"):
+                status["preparation_status"] = "running"
+            else:
+                status["preparation_status"] = "pending"
         return status
 
     def monitor(self, *, local_port: int = 8765) -> int:
@@ -2324,6 +2680,9 @@ class ClusterCampaignClient:
                 self.client.delete("pvc", name, wait=True)
         for kind, name in (
             ("service", self.resources.service),
+            ("deployment", self.resources.proxy),
+            ("service", self.resources.proxy),
+            ("configmap", self.resources.proxy),
             ("configmap", self.resources.status_config_map),
             ("rolebinding", self.resources.role),
             ("role", self.resources.role),
