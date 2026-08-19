@@ -13,7 +13,7 @@ from brunner import (
 )
 from brunner.providers import ProviderSettings
 
-from examples.diffusion_benchmark.images import CONTROLLER_IMAGE
+from examples.diffusion_benchmark.images import EVALUATOR_IMAGE
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,7 +44,7 @@ def build_definition() -> BenchmarkDefinition:
                 "-m",
                 "examples.diffusion_benchmark.evaluator",
             ),
-            image=CONTROLLER_IMAGE,
+            image=EVALUATOR_IMAGE,
             primary_report="evaluation/diffusion-report.html",
             timeout_seconds=3 * 60,
             cpu_request="500m",

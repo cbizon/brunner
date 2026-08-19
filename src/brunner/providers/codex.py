@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from brunner.errors import ConfigurationError
@@ -57,6 +58,17 @@ TERMINAL_HARNESS_ERROR_FRAGMENTS = (
     "refusing to create helper binaries under temporary dir",
 )
 TERMINAL_HTTP_STATUSES = frozenset({400, 401, 403, 404})
+HTTP_STATUS_PATTERNS = (
+    re.compile(
+        r"\b(?:unexpected\s+)?status(?:\s+code)?\s*[:=]?\s*"
+        r"([45]\d{2})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bhttp(?:/\d(?:\.\d)?)?\s+([45]\d{2})\b",
+        re.IGNORECASE,
+    ),
+)
 CODEX_TOOL_ITEM_TYPES = frozenset(
     {
         "command_execution",
@@ -125,13 +137,11 @@ class CodexAdapter:
                 settings.model,
             ]
         )
-        if not context.resume_session:
-            if context.read_only:
+        if context.read_only:
+            if not context.resume_session:
                 command.extend(("--sandbox", "read-only"))
-            else:
-                command.append(
-                    "--dangerously-bypass-approvals-and-sandbox"
-                )
+        else:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
         if settings.effort is not None:
             command.extend(
                 ("-c", f"model_reasoning_effort={json.dumps(settings.effort)}")
@@ -265,8 +275,8 @@ class CodexAdapter:
         retry_at_epoch = None
         for record in reversed(records):
             status = record.get("api_error_status")
-            if isinstance(status, int) and api_status is None:
-                api_status = status
+            if not isinstance(status, int):
+                status = None
             rate_limit = record.get("rate_limit_info")
             rejected_rate_limit = (
                 isinstance(rate_limit, dict)
@@ -292,6 +302,10 @@ class CodexAdapter:
                 ):
                     wait_category = "subscription_wait"
             text = error_text(record)
+            if status is None:
+                status = _http_status_from_text(text)
+            if status is not None and api_status is None:
+                api_status = status
             lowered = text.lower()
             is_error = (
                 record.get("is_error") is True
@@ -310,6 +324,8 @@ class CodexAdapter:
                 or any(fragment in lowered for fragment in TERMINAL_ERROR_FRAGMENTS)
             ):
                 terminal = True
+                if status in TERMINAL_HTTP_STATUSES and reason is None:
+                    reason = f"http_{status}"
         if any(
             fragment in summary.lower()
             for fragment in TERMINAL_HARNESS_ERROR_FRAGMENTS
@@ -343,3 +359,11 @@ class CodexAdapter:
             )
         ).lower()
         return any(fragment in lowered for fragment in RETRYABLE_RESUME_ERRORS)
+
+
+def _http_status_from_text(value: str) -> int | None:
+    for pattern in HTTP_STATUS_PATTERNS:
+        match = pattern.search(value)
+        if match is not None:
+            return int(match.group(1))
+    return None

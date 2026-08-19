@@ -415,6 +415,7 @@ def test_qualitative_renderer_derives_report_from_output_path(
     output.parent.mkdir(parents=True)
     output.write_text(json.dumps(_valid_review()))
     monkeypatch.setenv("BRUNNER_TRIAL_ROOT", str(trial))
+    monkeypatch.setenv("BRUNNER_ASSESSMENT_OUTPUT_ROOT", str(trial))
     monkeypatch.setenv("BRUNNER_ASSESSMENT_OUTPUT", str(output))
 
     main()

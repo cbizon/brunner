@@ -21,10 +21,12 @@ from brunner.backends import (
 from brunner.contract import OutputContract, load_output_contract
 from brunner.definition import BenchmarkDefinition
 from brunner.errors import (
+    ArtifactTransferPending,
     ArtifactTransferError,
     BackendConfigurationError,
     BackendConnectivityError,
     BackendError,
+    EvaluationPending,
     IntegrityError,
 )
 from brunner.evaluation import (
@@ -131,6 +133,7 @@ class CampaignTrial:
     provider_name: str = "OpenAI-compatible provider"
     base_url: str | None = None
     environment_key: str = "OPENAI_API_KEY"
+    backend_image: str | None = None
 
     @property
     def provider_settings(self) -> ProviderSettings:
@@ -160,6 +163,10 @@ class CampaignTrial:
             raise ValueError("campaign trial provider cannot be empty")
         if not self.model.strip():
             raise ValueError("campaign trial model cannot be empty")
+        if self.backend_image is not None and not self.backend_image.strip():
+            raise ValueError(
+                "campaign trial backend_image cannot be empty"
+            )
         if not self.provider_name.strip():
             raise ValueError("campaign trial provider_name cannot be empty")
         if not self.environment_key.strip():
@@ -182,6 +189,8 @@ class CampaignTrial:
             "model": self.model,
             "effort": self.effort,
         }
+        if self.backend_image is not None:
+            value["backend_image"] = self.backend_image
         if self.provider_id is not None:
             value["provider_connection"] = {
                 "provider_id": self.provider_id,
@@ -413,7 +422,7 @@ def default_workload_factory(
             definition.runtime.timeout_seconds
             + definition.runtime.backend_shutdown_grace_seconds
         ),
-        image=plan.backend_image,
+        image=campaign_trial.backend_image or plan.backend_image,
         cpu_request=plan.cpu_request,
         cpu_limit=plan.cpu_limit,
         memory_request=plan.memory_request,
@@ -478,6 +487,7 @@ class CampaignEngine:
         workload_factory: WorkloadFactory = default_workload_factory,
         evaluation_finalizer: EvaluationFinalizer | None = None,
         result_publisher: ResultPublisher | None = None,
+        fence: Callable[[], None] | None = None,
     ) -> None:
         if getattr(backend, "agent_isolation", None) != CONTAINER_ISOLATION:
             raise ValueError(
@@ -511,6 +521,13 @@ class CampaignEngine:
             )
         )
         self.result_publisher = result_publisher
+        self._fence = fence or (lambda: None)
+
+    def _external(self, action: Callable[[], Any]) -> Any:
+        self._fence()
+        result = action()
+        self._fence()
+        return result
 
     def _configured_workload(
         self,
@@ -776,21 +793,32 @@ class CampaignEngine:
                 attempts.setdefault("cleanup", 0)
                 attempts.setdefault("publication", 0)
                 attempts.setdefault("infrastructure", 0)
+                identity_expected = {
+                    key: value
+                    for key, value in expected.items()
+                    if key != "backend_image"
+                }
                 actual = {
-                    key: existing.get(key) for key in expected
+                    key: existing.get(key) for key in identity_expected
                 }
                 mismatches = {
                     key: {
                         "expected": value,
                         "actual": actual[key],
                     }
-                    for key, value in expected.items()
+                    for key, value in identity_expected.items()
                     if actual[key] != value
                 }
                 if mismatches:
                     raise RuntimeError(
                         "campaign trial identity changed for "
                         f"{campaign_trial.test_id}: {mismatches}"
+                    )
+                if campaign_trial.backend_image is None:
+                    existing.pop("backend_image", None)
+                else:
+                    existing["backend_image"] = (
+                        campaign_trial.backend_image
                     )
                 metadata = _load_optional_object(
                     Path(existing["trial"]) / "metadata/manifest.json"
@@ -954,13 +982,21 @@ class CampaignEngine:
         entry["challenge_sha256"] = challenge_sha256
 
     def _save(self, state: dict[str, Any]) -> None:
+        def persist_state() -> None:
+            self._fence()
+            write_json_atomic(self.state_path, state)
+            self._fence()
+            write_json_atomic(self.state_backup_path, state)
+            self._fence()
+
         state["updated_at"] = _now()
-        write_json_atomic(self.state_path, state)
-        write_json_atomic(self.state_backup_path, state)
+        persist_state()
         from brunner.dashboard import write_campaign_dashboard
 
         try:
+            self._fence()
             write_campaign_dashboard(state, self.dashboard_path)
+            self._fence()
         except Exception as error:
             state["dashboard"] = {
                 "status": "failed",
@@ -975,8 +1011,7 @@ class CampaignEngine:
                 ),
             }
             try:
-                write_json_atomic(self.state_path, state)
-                write_json_atomic(self.state_backup_path, state)
+                persist_state()
             except OSError:
                 # The authoritative state was written before presentation.
                 # A second persistence failure must not erase that transition.
@@ -988,8 +1023,7 @@ class CampaignEngine:
                     "status": "complete",
                     "generated_at": _now(),
                 }
-                write_json_atomic(self.state_path, state)
-                write_json_atomic(self.state_backup_path, state)
+                persist_state()
 
     @staticmethod
     def _event(
@@ -1095,6 +1129,7 @@ class CampaignEngine:
             provider=str(entry["provider"]),
             model=str(entry["model"]),
             effort=entry.get("effort"),
+            backend_image=entry.get("backend_image"),
             provider_id=connection.get("provider_id"),
             provider_name=str(
                 connection.get(
@@ -1144,7 +1179,9 @@ class CampaignEngine:
         entry.pop("error", None)
         self._save(state)
         try:
-            handle = self.backend.submit(workload)
+            handle = self._external(
+                lambda: self.backend.submit(workload)
+            )
         except BackendConnectivityError:
             raise
         except BackendConfigurationError as error:
@@ -1361,7 +1398,9 @@ class CampaignEngine:
             )
             self._save(state)
         try:
-            restarted = restart(handle, workload, generation)
+            restarted = self._external(
+                lambda: restart(handle, workload, generation)
+            )
         except BackendConnectivityError:
             raise
         except BackendError as error:
@@ -1473,7 +1512,7 @@ class CampaignEngine:
         )
         self._save(state)
         try:
-            self.backend.cleanup(handle)
+            self._external(lambda: self.backend.cleanup(handle))
         except BackendConnectivityError:
             raise
         except Exception as error:
@@ -1545,12 +1584,20 @@ class CampaignEngine:
                 },
             )
             try:
-                collection = self.backend.collect(
-                    collection_handle,
-                    destination,
-                    self.definition.artifacts,
-                    included_groups=self.plan.included_artifact_groups,
+                collection = self._external(
+                    lambda: self.backend.collect(
+                        collection_handle,
+                        destination,
+                        self.definition.artifacts,
+                        included_groups=self.plan.included_artifact_groups,
+                    )
                 )
+            except ArtifactTransferPending as error:
+                entry["phase"] = "collection_pending"
+                entry["collection_status"] = str(error)
+                entry.pop("collection_error", None)
+                self._save(state)
+                return
             except BackendConnectivityError:
                 raise
             except ArtifactTransferError as error:
@@ -1682,6 +1729,7 @@ class CampaignEngine:
             }
             entry["collected_trial"] = str(destination)
             entry.pop("collection_error", None)
+            entry.pop("collection_status", None)
             entry.pop("collection_warning", None)
         elif not destination.is_dir():
             entry["phase"] = "collection_failed"
@@ -1764,7 +1812,15 @@ class CampaignEngine:
         entry["phase"] = "evaluating"
         self._save(state)
         try:
-            evaluation = self.evaluation_finalizer(destination)
+            evaluation = self._external(
+                lambda: self.evaluation_finalizer(destination)
+            )
+        except EvaluationPending as error:
+            entry["phase"] = "evaluation_pending"
+            entry["evaluation_status"] = str(error)
+            entry.pop("evaluation_error", None)
+            self._save(state)
+            return
         except BackendConnectivityError:
             entry["phase"] = "evaluation_pending"
             entry["evaluation_error"] = (
@@ -1920,7 +1976,9 @@ class CampaignEngine:
             entry["phase"] = "publishing"
             self._save(state)
             try:
-                published = self.result_publisher(source, entry)
+                published = self._external(
+                    lambda: self.result_publisher(source, entry)
+                )
             except Exception as error:
                 attempts = int(
                     entry["attempts"].get("publication", 0)
@@ -2178,7 +2236,9 @@ class CampaignEngine:
                 )
                 continue
             try:
-                snapshot = self.backend.inspect(handle)
+                snapshot = self._external(
+                    lambda: self.backend.inspect(handle)
+                )
             except BackendConnectivityError as error:
                 return self._pause_connectivity(state, error)
             except BackendError as error:
@@ -2238,37 +2298,84 @@ class CampaignEngine:
                 overdue = self._overdue_seconds(entry)
                 if overdue is not None:
                     message = (
-                        f"backend still reports {snapshot.phase} "
-                        f"{overdue:.0f}s after submission, past the "
-                        f"{self._trial_timeout_seconds():.0f}s limit"
-                    )
-                    attention = entry.get("attention")
-                    first_report = not (
-                        isinstance(attention, dict)
-                        and attention.get("kind") == "trial_overdue"
-                        and attention.get("active") is True
-                    )
-                    since = (
-                        attention.get("since")
-                        if isinstance(attention, dict)
-                        else None
+                        f"trial exceeded its "
+                        f"{self._trial_timeout_seconds():.0f}s deadline "
+                        f"while the backend reported {snapshot.phase}"
                     )
                     entry["attention"] = {
-                        "kind": "trial_overdue",
-                        "active": True,
-                        "since": since or _now(),
+                        "kind": "trial_deadline_exceeded",
+                        "active": False,
+                        "since": _now(),
+                        "resolved_at": _now(),
                         "message": message,
                         "backend_phase": snapshot.phase,
                         "overdue_seconds": overdue,
                     }
                     entry["error"] = message
-                    if first_report:
+                    try:
+                        terminated = self._external(
+                            lambda: self.backend.terminate(
+                                handle,
+                                reason="TrialDeadlineExceeded",
+                            )
+                        )
+                    except BackendConnectivityError as error:
+                        return self._pause_connectivity(state, error)
+                    except Exception as error:
+                        entry["phase"] = "attention_required"
+                        attach_failure(
+                            entry,
+                            failure_from_exception(
+                                error,
+                                operation="backend_termination",
+                                domain="backend",
+                                reason="TrialDeadlineTerminationFailed",
+                                disposition="attention",
+                                retryable=False,
+                                cleanup_required=True,
+                            ),
+                        )
                         self._event(
                             state,
-                            "trial_overdue",
-                            message,
+                            "trial_deadline_termination_failed",
+                            str(error),
                             test_id=entry["test_id"],
                         )
+                        self._save(state)
+                        continue
+                    entry["backend_snapshot"] = terminated.to_dict()
+                    entry["backend_phase"] = "failed"
+                    entry["backend_workload_live"] = False
+                    attach_failure(
+                        entry,
+                        failure_record(
+                            operation="trial_deadline",
+                            domain="backend",
+                            reason="TrialDeadlineExceeded",
+                            message=message,
+                            disposition="retry",
+                            retryable=True,
+                            cleanup_required=True,
+                            details={
+                                "overdue_seconds": overdue,
+                                "backend_phase": snapshot.phase,
+                            },
+                        ),
+                    )
+                    if (
+                        int(entry["attempts"].get("infrastructure", 0))
+                        < self.plan.infrastructure_max_restarts
+                    ):
+                        entry["phase"] = "infrastructure_retrying"
+                    else:
+                        entry["phase"] = "collection_pending"
+                    self._event(
+                        state,
+                        "trial_deadline_exceeded",
+                        message,
+                        test_id=entry["test_id"],
+                    )
+                    self._save(state)
                 continue
             if snapshot.phase in {"succeeded", "failed"}:
                 if (
@@ -2305,7 +2412,9 @@ class CampaignEngine:
                 log_path = Path(entry["trial"]) / "backend/workload.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    workload_logs = self.backend.logs(handle)
+                    workload_logs = self._external(
+                        lambda: self.backend.logs(handle)
+                    )
                 except BackendConnectivityError as error:
                     return self._pause_connectivity(state, error)
                 except BackendError as error:
@@ -2367,10 +2476,9 @@ class CampaignEngine:
                     ),
                 )
 
-        # A trial needing attention normally frees its slot, but not while the
-        # backend still reports its workload as pending or running: an overdue
-        # trial is still consuming a real slot, and releasing it would let the
-        # campaign exceed max_parallel.
+        # max_parallel limits agent pipeline Jobs. Collection, assessment,
+        # publication, and cleanup are independent controller-side phases and
+        # must not prevent another agent workload from using a freed slot.
         active = sum(
             entry["phase"] in {"submitting", "submission_retry_wait"}
             or (
@@ -2382,13 +2490,6 @@ class CampaignEngine:
                         "infrastructure_retrying",
                         "pending",
                         "running",
-                        "collection_pending",
-                        "collection_retry_wait",
-                        "collecting",
-                        "evaluating",
-                        "publication_pending",
-                        "publishing",
-                        "cleanup_pending",
                     }
                     or bool(entry.get("backend_workload_live"))
                 )
@@ -2424,7 +2525,9 @@ class CampaignEngine:
                         continue
                     break
             try:
-                capacity = self.backend.capacity(capacity_workload)
+                capacity = self._external(
+                    lambda: self.backend.capacity(capacity_workload)
+                )
             except BackendConnectivityError as error:
                 return self._pause_connectivity(state, error)
             except BackendError as error:
@@ -2551,7 +2654,6 @@ class CampaignEngine:
             state["has_attention"] = bool(
                 phases & {"attention_required", "collection_failed"}
                 or state.get("scheduler_error")
-                or state.get("scheduler_wait")
                 or any(
                     entry.get("cleanup_error")
                     for entry in state["trials"]

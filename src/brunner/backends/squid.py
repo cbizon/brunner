@@ -40,8 +40,23 @@ def managed_proxy_sha256(image: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def managed_proxy_labels(
+    name: str,
+    *,
+    campaign_labels: dict[str, str] | None = None,
+) -> dict[str, str]:
+    labels = {
+        **MANAGED_PROXY_LABELS,
+        "app.kubernetes.io/instance": name,
+    }
+    if campaign_labels:
+        labels.update(campaign_labels)
+    return labels
+
+
 def render_managed_proxy_resources(
     *,
+    name: str,
     namespace: str,
     image: str,
     image_pull_secrets: tuple[str, ...],
@@ -51,7 +66,17 @@ def render_managed_proxy_resources(
     cpu_limit: str,
     memory_request: str,
     memory_limit: str,
+    campaign_labels: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
+    labels = managed_proxy_labels(
+        name,
+        campaign_labels=campaign_labels,
+    )
+    selector_labels = managed_proxy_labels(name)
+    workload_source_labels = {
+        "app.kubernetes.io/name": "brunner",
+        **(campaign_labels or {}),
+    }
     pod_spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
         "securityContext": {
@@ -104,7 +129,7 @@ def render_managed_proxy_resources(
         "volumes": [
             {
                 "name": "config",
-                "configMap": {"name": MANAGED_PROXY_NAME},
+                "configMap": {"name": name},
             },
             {"name": "log", "emptyDir": {}},
             {"name": "run", "emptyDir": {}},
@@ -120,9 +145,9 @@ def render_managed_proxy_resources(
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
-                "name": MANAGED_PROXY_NAME,
+                "name": name,
                 "namespace": namespace,
-                "labels": dict(MANAGED_PROXY_LABELS),
+                "labels": dict(labels),
             },
             "data": {"squid.conf": SQUID_CONFIG},
         },
@@ -130,12 +155,12 @@ def render_managed_proxy_resources(
             "apiVersion": "v1",
             "kind": "Service",
             "metadata": {
-                "name": MANAGED_PROXY_NAME,
+                "name": name,
                 "namespace": namespace,
-                "labels": dict(MANAGED_PROXY_LABELS),
+                "labels": dict(labels),
             },
             "spec": {
-                "selector": dict(MANAGED_PROXY_LABELS),
+                "selector": dict(selector_labels),
                 "ports": [
                     {
                         "name": "proxy",
@@ -150,13 +175,13 @@ def render_managed_proxy_resources(
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
             "metadata": {
-                "name": MANAGED_PROXY_NAME,
+                "name": name,
                 "namespace": namespace,
-                "labels": dict(MANAGED_PROXY_LABELS),
+                "labels": dict(labels),
             },
             "spec": {
                 "podSelector": {
-                    "matchLabels": dict(MANAGED_PROXY_LABELS),
+                    "matchLabels": dict(selector_labels),
                 },
                 "policyTypes": ["Ingress", "Egress"],
                 "ingress": [
@@ -165,11 +190,19 @@ def render_managed_proxy_resources(
                             {
                                 "podSelector": {
                                     "matchLabels": {
-                                        "app.kubernetes.io/name": "brunner",
+                                        **workload_source_labels,
                                         "dev.brunner/role": "pipeline",
                                     }
                                 }
-                            }
+                            },
+                            {
+                                "podSelector": {
+                                    "matchLabels": {
+                                        **workload_source_labels,
+                                        "dev.brunner/role": "assessment",
+                                    }
+                                }
+                            },
                         ],
                         "ports": [
                             {
@@ -214,18 +247,18 @@ def render_managed_proxy_resources(
             "apiVersion": "apps/v1",
             "kind": "Deployment",
             "metadata": {
-                "name": MANAGED_PROXY_NAME,
+                "name": name,
                 "namespace": namespace,
-                "labels": dict(MANAGED_PROXY_LABELS),
+                "labels": dict(labels),
             },
             "spec": {
                 "replicas": 1,
                 "selector": {
-                    "matchLabels": dict(MANAGED_PROXY_LABELS),
+                    "matchLabels": dict(selector_labels),
                 },
                 "template": {
                     "metadata": {
-                        "labels": dict(MANAGED_PROXY_LABELS),
+                        "labels": dict(selector_labels),
                         "annotations": {
                             "dev.brunner/squid-config-sha256": (
                                 SQUID_CONFIG_SHA256

@@ -155,13 +155,15 @@ code {{ font-family:"Courier New",monospace; }}
 
 def main() -> None:
     review_path = Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT"])
-    trial = Path(os.environ["BRUNNER_TRIAL_ROOT"])
+    output_root = Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT_ROOT"])
     review = json.loads(review_path.read_text())
     if not isinstance(review, dict):
         raise TypeError("qualitative review output must be an object")
     output = review_path.with_suffix(".html")
-    if not output.resolve().is_relative_to(trial.resolve()):
-        raise ValueError("qualitative review report must remain in the trial")
+    if not output.resolve().is_relative_to(output_root.resolve()):
+        raise ValueError(
+            "qualitative review report must remain in the assessment output"
+        )
     output.write_text(render_review(review))
 
 

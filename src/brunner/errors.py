@@ -46,6 +46,10 @@ class ArtifactTransferError(BrunnerError):
     """Artifact collection was interrupted or incomplete."""
 
 
+class ArtifactTransferPending(BrunnerError):
+    """Artifact collection is still running asynchronously."""
+
+
 class IntegrityError(BrunnerError):
     """Recorded and observed artifact identities differ."""
 
@@ -56,6 +60,10 @@ class ChallengeMaterializationError(BrunnerError):
 
 class EvaluationError(BrunnerError):
     """Trusted evaluation failed."""
+
+
+class EvaluationPending(BrunnerError):
+    """Trusted evaluation is still running asynchronously."""
 
 
 class AssessmentError(BrunnerError):

@@ -518,16 +518,27 @@ def finalize_evaluation(
     definition: BenchmarkDefinition,
     contract: OutputContract,
     trial: Path,
+    *,
+    output_trial: Path | None = None,
 ) -> dict[str, Any]:
     """Validate remote evaluation and run small post-collection assessments."""
     trial = trial.resolve()
-    results_path = trial / definition.evaluation.results_path
-    if not results_path.is_file():
+    output_trial = (
+        output_trial.resolve()
+        if output_trial is not None
+        else trial
+    )
+    output_trial.mkdir(parents=True, exist_ok=True)
+    source_results_path = trial / definition.evaluation.results_path
+    results_path = output_trial / definition.evaluation.results_path
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    if not source_results_path.is_file():
         raise EvaluationError(
-            f"Sterling evaluator result was not collected: {results_path}"
+            "Sterling evaluator result was not collected: "
+            f"{source_results_path}"
         )
     result = _validate_evaluation_result(
-        json.loads(results_path.read_text())
+        json.loads(source_results_path.read_text())
     )
     expected_identity = {
         "benchmark_id": definition.benchmark_id,
@@ -553,6 +564,7 @@ def finalize_evaluation(
         contract,
         trial,
         result,
+        output_trial=output_trial,
     )
     result["assessment_status"] = assessment_index["status"]
     result["required_assessments_complete"] = assessment_index[
@@ -563,31 +575,32 @@ def finalize_evaluation(
         result["assessment_failure"] = assessment_index["failure"]
     write_json_atomic(results_path, result)
 
-    from brunner.report import write_run_report
+    if output_trial == trial:
+        from brunner.report import write_run_report
 
-    try:
-        report_path = write_run_report(
-            trial,
-            results_path.with_name("run-report.html"),
-        )
-    except Exception as error:
-        result["report"] = {
-            "status": "failed",
-            "failure": failure_from_exception(
-                error,
-                operation="run_report",
-                domain="reporting",
-                reason="RunReportFailed",
-                disposition="attention",
-                retryable=False,
-                resource="orchestrator_filesystem",
-            ),
-        }
-    else:
-        result["report"] = {
-            "status": "complete",
-            "path": str(report_path.relative_to(trial)),
-        }
+        try:
+            report_path = write_run_report(
+                trial,
+                results_path.with_name("run-report.html"),
+            )
+        except Exception as error:
+            result["report"] = {
+                "status": "failed",
+                "failure": failure_from_exception(
+                    error,
+                    operation="run_report",
+                    domain="reporting",
+                    reason="RunReportFailed",
+                    disposition="attention",
+                    retryable=False,
+                    resource="orchestrator_filesystem",
+                ),
+            }
+        else:
+            result["report"] = {
+                "status": "complete",
+                "path": str(report_path.relative_to(trial)),
+            }
     try:
         write_json_atomic(results_path, result)
     except OSError:

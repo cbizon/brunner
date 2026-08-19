@@ -31,20 +31,20 @@ fault-injection coverage.
 - Durable retries, session resume, finalization, and timeout handling
 - Cross-provider token normalization and interval-based time accounting
 - Durable Kubernetes execution on the Sterling deployment target
-- Resumable checksum-verified artifact collection with configurable
-  Kubernetes transfer chunks
+- Resumable checksum-verified PVC-to-PVC staging and artifact collection Jobs
 - Trusted evaluation on the trial PVC before artifact collection
 - Packaged evidence-bound qualitative review contract and HTML report
 - Schema-bound command or model-based post-evaluation assessments
 - Evidence dossiers, timing facts, assessment provenance, and report links
 - Reference bundle manifests and integrity checks
 - Append-only campaign task lists with caller-owned trial IDs
-- Cluster-resident reconciliation protected by a compare-and-swap ConfigMap lock
+- Cluster-resident reconciliation protected by a fenced compare-and-swap
+  ConfigMap lock
 - Dedicated control/results PVCs and a persistent cluster monitor
 - Resumable, checksum-verified final result retrieval
 - ResourceQuota-aware campaign capacity and recovery
 - Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
-- Default-deny Sterling egress through Brunner-managed provider-only Squid
+- Default-deny Sterling egress through a campaign-scoped provider-only Squid
 - Immutable image, runtime protocol, challenge, workload, and reference identity
 
 ## Benchmark Slots
@@ -106,7 +106,8 @@ reviewer Pods; it neither reads Secret values nor creates Secrets from laptop
 environment variables.
 
 Production profiles require digest-pinned agent, evaluator, reader, and Squid
-images. Brunner installs the proxy and its deny-by-default provider allowlist,
+images. Brunner installs a separate proxy for each campaign with a
+deny-by-default provider allowlist,
 then applies workload NetworkPolicies before staging. Pipeline Pods may reach
 only the proxy's numeric ClusterIP and cannot issue DNS queries; helper Pods
 have no egress. Squid alone receives DNS and outbound TCP 443 access. Strict
@@ -123,6 +124,13 @@ reconstructed in the collected trial with local hard links rather than being
 downloaded from Sterling again. If an incomplete trial still exceeds the
 normal ceiling, Brunner collects only the bounded diagnostic policy and records
 what was omitted.
+
+Prepared trials move from the control PVC to each trial PVC through a resumable
+stager init container. Completed artifacts move back through a durable
+PVC-to-PVC collection Job. Neither path streams benchmark data through
+`kubectl` or the controller process. Assessment Jobs mount authoritative
+evidence read-only and write into a separate output subtree that Brunner
+validates before merging.
 
 Materialize a harmless candidate-visible example resource before staging:
 

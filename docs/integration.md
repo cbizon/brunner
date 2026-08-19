@@ -345,9 +345,12 @@ artifacts the reviewer actually needs.
 The reviewer provider home is created beside the durable assessment workspace,
 not under the operating system temporary directory. It persists across attempts
 within one review, is removed afterward, and is never published as a result.
-The trusted assessment Job mounts only the selected collected trial subpath,
-not the campaign's complete control PVC. It has no Kubernetes service-account
-token and can reach the network only through the managed provider proxy.
+The trusted assessment Job mounts the selected collected trial subpath
+read-only and a separate assessment-output subpath read/write, not the
+campaign's complete control PVC. It has no Kubernetes service-account token
+and can reach the network only through the campaign's managed provider proxy.
+Brunner validates the separate output before merging it into authoritative
+collected results.
 Codex relies on that outer boundary rather than its nested user-namespace
 sandbox, which Sterling does not support.
 
@@ -739,6 +742,14 @@ The named environment variable must still come from
 connection identity, but never stores the key value in campaign state or
 command arguments.
 
+`CampaignTrial.backend_image` optionally overrides
+`CampaignPlan.backend_image` for one trial. This is the supported way to
+append trials after upgrading the runner image: keep existing trial IDs pinned
+to the image digest that created their workload, and let new IDs use the new
+campaign default. The override is included in the campaign and workload
+digests; changing it for an already-created trial is rejected as a workload
+identity change.
+
 Campaign state is append-only by trial ID. Repeating an existing ID with the
 same execution attributes is a no-op, whether it is pending, running, failed,
 or complete. Adding another ID creates another trial without invalidating
@@ -794,8 +805,10 @@ Production images must use `image@sha256:<digest>` references and must contain
 a compatible Brunner runtime protocol. Set
 `KubernetesProfile.require_image_digests=False` only in controlled tests.
 
-Before any staging helper is created, Brunner installs its namespace-scoped
-Squid proxy and applies two workload NetworkPolicies. The pipeline may reach
+Before any workload is created, Brunner installs its campaign-scoped Squid
+proxy and applies workload NetworkPolicies. Proxy resources and allowed source
+Pods carry the campaign label, so campaigns in the same namespace cannot share
+or mutate each other's proxy path. The pipeline may reach
 only Squid on TCP 3128; helpers have no egress. Brunner injects the proxy's
 numeric Service ClusterIP only into the agent, so the pipeline does not receive
 DNS access. Squid alone may query cluster DNS and connect to external TCP 443,
@@ -807,9 +820,9 @@ Pod, because permissions are additive. The default
 Use `network_isolation_mode="controlled-egress"` only for an
 administrator-owned personal namespace with an accepted baseline ingress
 policy. It preserves exclusive egress enforcement but does not claim that
-Brunner Pods are ingress-isolated. Brunner checks before creating the staging
-helper and again immediately before Job creation, and records the mode in the
-Job and backend handle so adoption or restart cannot change it silently.
+Brunner Pods are ingress-isolated. Brunner checks immediately before Job
+creation and records the mode in the Job and backend handle so adoption or
+restart cannot change it silently.
 
 The example uses `controlled-egress` because its administrator-owned namespace
 has an accepted baseline ingress policy. Before using this mode, inspect the
@@ -822,11 +835,16 @@ Do not place proxy variables in `nonsecret_environment`. Sterling's CNI must
 enforce Kubernetes NetworkPolicy; Brunner cannot infer enforcement from
 successful object creation.
 
-The stager clears an incomplete trial PVC before copying, verifies every
-remote challenge file against the local stage inventory, rejects remote
-symlinks, and annotates the PVC only after verification. Existing Jobs and
-PVCs are adopted only when challenge, workload, runtime-protocol, and ownership
-annotations match the current trial.
+The workload Job begins with a stager init container that mounts the prepared
+trial on the control PVC read-only and the trial PVC read/write. It copies
+directly between PVCs, resumes `.brunner-part` files, removes stale destination
+partials, verifies every size and SHA-256 against the stage inventory, rejects
+symlinks, and annotates the PVC only after verification. It rejects changed or
+unexpected destination content rather than deleting candidate work. No
+challenge bytes pass through `kubectl` or controller memory. A restart skips
+staging when the PVC already has the complete matching stage identity.
+Existing Jobs and PVCs are adopted only when challenge, workload,
+runtime-protocol, and ownership annotations match the current trial.
 
 Brunner hashes the effective agent image even when it is supplied by
 `KubernetesProfile.agent_image`. Custom workload labels must not use
@@ -848,15 +866,14 @@ checks that mounted manifest and requires exact `benchmark_id`,
 the large reference PVC remain deployment operations; Brunner never transfers
 the reference through the candidate PVC.
 
-Kubernetes artifact collection reads each file through resumable
-`kubectl exec` calls. `KubernetesProfile.artifact_chunk_bytes` controls the
-maximum bytes requested by each call, and `command_timeout_seconds` bounds
-that call. `artifact_chunk_attempts` retries a failed path, offset, and byte
-count on the same mounted reader before Brunner replaces the reader pod;
-`artifact_chunk_retry_seconds` controls the delay between those retries.
-Smaller chunks are more resilient on slow or unstable links but increase
-command overhead. These values apply to the controller-side transfer; the
-remote reader protocol accepts any positive chunk size.
+Kubernetes artifact collection runs in a separate durable Job. The collector
+mounts the completed trial PVC read-only and the control PVC once, read/write.
+The prepared baseline and dedicated collected-trial destination are separate
+directories on that control mount; Brunner avoids mounting the same PVC under
+two volume names. It copies directly between PVCs with resumable partial files
+and checksum verification. The controller submits and polls this Job but does
+not stream file contents through `kubectl`, so controller restarts or temporary
+API loss do not restart an in-cluster transfer.
 
 Files recorded in the Sterling evaluator's validated `submission.artifacts`
 list are omitted from collection unless
@@ -926,7 +943,7 @@ campaign state:
 - `proxy_image` supplies the digest-pinned Squid image for Brunner's managed
   provider-only egress proxy.
 - `proxy_cpu_request`, `proxy_cpu_limit`, `proxy_memory_request`, and
-  `proxy_memory_limit` configure the shared proxy Deployment.
+  `proxy_memory_limit` configure each campaign's proxy Deployment.
 
 Every referenced Secret and key must already exist in the namespace. Brunner
 does not read Secret values and does not create, complete, or overwrite
@@ -937,7 +954,7 @@ campaign state, trial metadata, workload hashes, Pod manifests, command
 arguments, or client-side apply annotations.
 
 Only the agent init container receives these Secret references. The evaluator,
-controller, preparation Job, staging helpers, artifact readers, and result
+controller, preparation Job, stager, collector, and result
 retriever receive neither provider mappings nor secret values. Separate
 assessment Jobs receive only reviewer mappings configured in
 `ControllerProfile.reviewer_secret_environment`.
@@ -956,10 +973,10 @@ ephemeral storage, and extended resources, using Kubernetes' effective
 init-container scheduling request. A quota limit appears as a visible
 `backend_capacity` scheduler wait rather than oversubmission.
 
-Kubernetes helper, Job, and PVC cleanup is synchronous. Brunner removes stale
-staging and artifact-reader pods by workload labels before reuse and does not
-mark a trial complete until deletions finish. If Kubernetes becomes unreachable
-during cleanup, the campaign remains in `cleanup_pending` and retries later.
+Kubernetes Job and PVC cleanup is synchronous. Brunner removes durable
+collection Jobs and does not mark a trial complete until deletions finish. If
+Kubernetes becomes unreachable during cleanup, the campaign remains in
+`cleanup_pending` and retries later.
 Other cleanup failures, including deletion timeouts and finalizers, also remain
 in `cleanup_pending` and retry after `cleanup_retry_seconds`. Cleanup failure
 does not replace an already established pipeline or benchmark result.
@@ -967,12 +984,13 @@ Explicit campaign deletion stops controller Pods before deleting workload
 Jobs, then sweeps replacement Pods before deleting PVCs so a terminating
 controller cannot recreate work behind the cleanup pass.
 
-Artifact-transfer interruptions retain verified partial files and retry after
-`collection_retry_seconds`, up to `collection_max_attempts`. Checksum,
+Artifact-transfer interruptions retain verified partial files in the
+collection Job destination. Reconciliation polls or adopts the same Job after
+controller restart or API recovery. A terminal transfer failure retries after
+`collection_retry_seconds`, up to `collection_max_attempts`; checksum,
 identity, path, and other integrity failures are not retried automatically.
-Only completed backend collection calls and non-connectivity collection
-failures consume that attempt limit. Orchestrator interruption and backend
-connectivity pauses leave the in-progress collection attempt uncharged.
+Submission/polling waits and backend connectivity pauses leave the in-progress
+collection attempt uncharged.
 An empty remote log response does not overwrite a previously recovered
 workload log. Terminal Kubernetes snapshots preserve structured Job and Pod
 events before cleanup. They also include relevant warning events for pending
@@ -993,7 +1011,7 @@ Campaigns bound the states a stuck backend can hide in:
 | --- | --- | --- |
 | `submission_retry_seconds` | Delay before retrying an ambiguous or partially failed submission | 60 seconds |
 | `submission_max_attempts` | Bounds idempotent submission/adoption attempts | 3 |
-| `trial_timeout_seconds` | Flags a trial the backend still reports pending or running | Backend workload deadline plus `trial_timeout_margin_seconds` |
+| `trial_timeout_seconds` | Terminates a trial still pending or running and routes it through infrastructure retry or collection | Backend workload deadline plus `trial_timeout_margin_seconds` |
 | `trial_timeout_margin_seconds` | Slack added to the derived default | 5 minutes |
 | `infrastructure_max_restarts` | Relaunches an interrupted backend workload against its existing persistent trial | 2 |
 | `cleanup_retry_seconds` | Delay before retrying failed backend cleanup | 60 seconds |
@@ -1005,10 +1023,11 @@ Campaigns bound the states a stuck backend can hide in:
 Kubernetes enforces evaluator timeout independently of the laptop and
 controller reconciliation loop. Set `evaluation_timeout_seconds` to cap a
 benchmark's configured evaluation timeout for a particular campaign.
-Exceeding `trial_timeout_seconds` marks the live trial as needing attention but
-keeps its lifecycle phase pending or running. Brunner continues inspecting it,
-resolves the attention marker when it terminates, and keeps its slot reserved
-throughout, so the campaign cannot quietly exceed `max_parallel`. Exceeding
+Exceeding `trial_timeout_seconds` captures available Job/Pod events, deletes the
+live Job, records `TrialDeadlineExceeded` as retryable infrastructure, and
+routes the trial through the configured infrastructure restart policy or
+diagnostic collection. Once the pipeline Job is gone, collection, evaluation,
+publication, and cleanup do not occupy an agent `max_parallel` slot. Exceeding
 `max_pause_seconds` moves the campaign to `attention_required` without
 cancelling remote work.
 
