@@ -117,6 +117,22 @@ def _seconds(value: object) -> str:
     return f"{value:.1f}"
 
 
+def _visible_backend_warnings(values: object) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    visible = []
+    for value in values:
+        warning = str(value)
+        lowered = warning.lower()
+        if (
+            lowered.startswith("failedscheduling:")
+            and "pod has unbound immediate persistentvolumeclaims" in lowered
+        ):
+            continue
+        visible.append(warning)
+    return visible
+
+
 def _elapsed(trial: dict[str, Any], now: datetime) -> str:
     submitted_at = trial.get("submitted_at")
     if not submitted_at:
@@ -286,9 +302,9 @@ def write_campaign_dashboard(
                     f"{html.escape(str(assessment.get('assessment_id', 'review')))}</a>"
                 )
         snapshot = trial.get("backend_snapshot", {})
-        snapshot_warnings = snapshot.get("warnings", ())
-        if not isinstance(snapshot_warnings, (list, tuple)):
-            snapshot_warnings = []
+        snapshot_warnings = _visible_backend_warnings(
+            snapshot.get("warnings", ())
+        )
         warning = (
             trial.get("error")
             or trial.get("collection_error")

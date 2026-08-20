@@ -33,8 +33,13 @@ from brunner.errors import (
     BackendConfigurationError,
     BackendConnectivityError,
     BackendRequestError,
+    EvaluationPending,
 )
-from brunner.evaluation import evaluation_spec, execute_evaluation
+from brunner.evaluation import (
+    evaluation_spec,
+    execute_evaluation,
+    finalize_evaluation,
+)
 from brunner.failure import failure_record
 from examples.text_benchmark.definition import build_definition
 
@@ -713,6 +718,62 @@ def test_campaign_runs_explicit_list_collects_and_renders_dashboard(
     assert completed["trials"][0]["benchmark"]["succeeded"] is True
 
 
+def test_campaign_evaluates_completed_trial_before_admitting_next(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ImmediateBackend()
+    calls = 0
+
+    def pending_once(trial: Path) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise EvaluationPending("assessment Job submitted")
+        return finalize_evaluation(definition, contract, trial)
+
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="evaluation-priority",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("run-a", "codex", "model-a"),
+                CampaignTrial("run-b", "codex", "model-a"),
+            ),
+            max_parallel=1,
+        ),
+        backend,
+        workload_factory=_workload,
+        evaluation_finalizer=pending_once,
+    )
+
+    runner.advance()
+    waiting = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in waiting["trials"]}
+
+    assert by_id["run-a"]["phase"] == "evaluation_pending"
+    assert by_id["run-b"]["phase"] == "pending"
+    assert waiting["scheduler_wait"]["kind"] == "evaluation_priority"
+    assert waiting["scheduler_wait"]["trials"] == ["run-a"]
+    assert waiting["scheduler_wait"]["since"]
+    assert len(backend.handles) == 1
+
+    resumed = runner.advance()
+    by_id = {entry["test_id"]: entry for entry in resumed["trials"]}
+
+    assert by_id["run-a"]["phase"] in {"cleanup_pending", "complete"}
+    assert by_id["run-b"]["phase"] == "submitted"
+    assert len(backend.handles) == 2
+    assert "scheduler_wait" not in resumed
+    assert any(
+        event["type"] == "evaluation_priority_resumed"
+        for event in resumed["events"]
+    )
+
+
 def test_campaign_retries_results_pvc_publication_before_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -1299,6 +1360,13 @@ def test_dashboard_shows_live_elapsed_time_and_backend_warning(
                     "submitted_at": "2026-07-31T10:00:00+00:00",
                     "backend_snapshot": {
                         "warnings": [
+                            (
+                                "FailedScheduling: 0/15 nodes are available: "
+                                "pod has unbound immediate "
+                                "PersistentVolumeClaims. preemption: 0/15 "
+                                "nodes are available: 15 Preemption is not "
+                                "helpful for scheduling."
+                            ),
                             "PVC data: ProvisioningFailed: storage offline"
                         ]
                     },
@@ -1314,6 +1382,7 @@ def test_dashboard_shows_live_elapsed_time_and_backend_warning(
     assert "<th>Elapsed</th>" in rendered
     assert "1h 2m 3s" in rendered
     assert "ProvisioningFailed: storage offline" in rendered
+    assert "unbound immediate PersistentVolumeClaims" not in rendered
 
 
 def test_dashboard_prefers_styled_assessment_report(
@@ -2693,8 +2762,9 @@ def test_overdue_trial_is_terminated_and_releases_backend_slot(
         == "trial_deadline_exceeded"
     )
     assert by_id["stuck-a"]["attention"]["active"] is False
-    assert by_id["next-run"]["phase"] == "submitted"
-    assert len(backend.handles) == 2
+    assert by_id["next-run"]["phase"] == "pending"
+    assert len(backend.handles) == 1
+    assert overdue["scheduler_wait"]["kind"] == "evaluation_priority"
     assert overdue["status"] == "running"
     assert overdue["has_attention"] is False
 
@@ -2705,6 +2775,7 @@ def test_overdue_trial_is_terminated_and_releases_backend_slot(
         "cleanup_pending",
         "complete",
     }
+    assert by_id["next-run"]["phase"] == "submitted"
     assert len(backend.handles) == 2
     assert sum(
         event["type"] == "trial_deadline_exceeded"

@@ -314,6 +314,12 @@ soft stop, hard deadline, and process-group termination logic.
 Ordinary transient API failures retry with bounded exponential delay.
 Authentication, authorization, unavailable model, invalid request, and
 disabled-credit conditions terminate immediately.
+Deterministic provider-launch validation failures are terminal as well. Claude
+receives a provider-specific copy of the generated final-response schema with
+the top-level Draft 2020-12 `$schema` declaration omitted because current
+Claude Code releases reject that meta-schema URI locally. The canonical staged
+schema remains unchanged and is still used for prompt generation and Brunner's
+own validation.
 
 Session-unavailable detection examines both parsed JSON events and stderr. If
 a resumed session is missing, Brunner clears the persisted session-started

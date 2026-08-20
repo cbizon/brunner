@@ -30,8 +30,10 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CLAUDE_DISALLOWED_TOOLS = ("WebSearch", "WebFetch")
 CLAUDE_READ_ONLY_TOOLS = ("Read", "Glob", "Grep")
 CLAUDE_TERMINAL_HARNESS_ERROR_FRAGMENTS = (
+    "--json-schema is not a valid json schema",
     "failed to create sandbox",
     "failed to initialize sandbox",
+    "no schema with key or ref",
     "sandbox is not available",
     "sandbox is unavailable",
     "sandboxing is not supported",
@@ -41,6 +43,15 @@ CLAUDE_PERMISSION_DENIAL_FRAGMENTS = (
     "but you haven't granted it yet",
     "but you have not granted it yet",
 )
+
+
+def _claude_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(schema)
+    # Claude Code 2.1.214+ rejects the 2020-12 meta-schema URI locally even
+    # though the schema itself is accepted once the advisory dialect marker
+    # is omitted. Keep the canonical staged schema unchanged.
+    normalized.pop("$schema", None)
+    return normalized
 
 
 class ClaudeAdapter:
@@ -72,7 +83,9 @@ class ClaudeAdapter:
             )
         executable = context.executable or "claude"
         schema = json.dumps(
-            json.loads(context.final_schema_path.read_text()),
+            _claude_provider_schema(
+                json.loads(context.final_schema_path.read_text())
+            ),
             separators=(",", ":"),
         )
         command = [
