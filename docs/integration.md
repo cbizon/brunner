@@ -390,6 +390,14 @@ top-level `assistant.message.model` records for this check and deliberately
 ignores subagent records and `modelUsage`, which may include helper models that
 did not produce the primary response.
 
+The staged final-response schema remains the canonical Draft 2020-12 contract.
+For Claude only, Brunner removes the top-level `$schema` dialect marker from
+the serialized `--json-schema` argument. Claude Code 2.1.214 and later reject
+the Draft 2020-12 meta-schema URI during local CLI validation even though the
+same schema is accepted without that advisory marker. Brunner does not mutate
+the staged schema, and deterministic Claude CLI schema-validation errors are
+terminal configuration failures rather than retryable provider outages.
+
 The canonical `transcript/final.json` is published only after those checks.
 Files left by an earlier attempt cannot terminate a later one. Assessment
 reviewers follow the same current-attempt and terminal-event rules. A
@@ -972,6 +980,11 @@ includes object counts, PVC storage, CPU, memory,
 ephemeral storage, and extended resources, using Kubernetes' effective
 init-container scheduling request. A quota limit appears as a visible
 `backend_capacity` scheduler wait rather than oversubmission.
+After an agent Job exits, pending collection and trusted evaluation take
+admission priority over new agent Jobs. The campaign records an
+`evaluation_priority` scheduler wait until those phases finish, preventing a
+new trial from consuming the resources needed to evaluate the completed one.
+Publication and cleanup do not hold agent admission.
 
 Kubernetes Job and PVC cleanup is synchronous. Brunner removes durable
 collection Jobs and does not mark a trial complete until deletions finish. If
@@ -994,11 +1007,14 @@ collection attempt uncharged.
 An empty remote log response does not overwrite a previously recovered
 workload log. Terminal Kubernetes snapshots preserve structured Job and Pod
 events before cleanup. They also include relevant warning events for pending
-PVCs and artifact-reader mount failures, and the campaign dashboard shows
-those warnings with live elapsed time. The orchestrator's Kubernetes identity
-should be allowed to read Events. Preflight reports missing Event RBAC before
-launch, but terminal Event expiry, RBAC drift, or transient read failure is
-recorded as a warning and never blocks collection or cleanup.
+PVCs and artifact-reader mount failures. The dashboard shows actionable
+warnings with live elapsed time but suppresses the normal startup race where a
+Pod temporarily reports `FailedScheduling` because an immediate PVC has not
+bound yet. The raw Kubernetes event remains in the backend snapshot. The
+orchestrator's Kubernetes identity should be allowed to read Events. Preflight
+reports missing Event RBAC before launch, but terminal Event expiry, RBAC
+drift, or transient read failure is recorded as a warning and never blocks
+collection or cleanup.
 
 `RuntimeDefaults.timeout_seconds` is the agent's hard deadline.
 `backend_shutdown_grace_seconds` leaves time for terminal state and accounting

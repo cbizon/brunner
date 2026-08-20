@@ -78,6 +78,15 @@ TRIAL_PHASES = frozenset(
         "submitting",
     }
 )
+EVALUATION_PRIORITY_PHASES = frozenset(
+    {
+        "collecting",
+        "collection_pending",
+        "collection_retry_wait",
+        "evaluating",
+        "evaluation_pending",
+    }
+)
 
 
 def _now() -> str:
@@ -2476,9 +2485,52 @@ class CampaignEngine:
                     ),
                 )
 
-        # max_parallel limits agent pipeline Jobs. Collection, assessment,
-        # publication, and cleanup are independent controller-side phases and
-        # must not prevent another agent workload from using a freed slot.
+        # Collection and evaluation get first claim on cluster resources after
+        # an agent Job exits. Starting another agent first can leave the
+        # completed trial's assessment unschedulable while its pipeline clock
+        # continues to advance. Publication and cleanup do not hold admission.
+        evaluation_priority = [
+            str(entry["test_id"])
+            for entry in state["trials"]
+            if entry["phase"] in EVALUATION_PRIORITY_PHASES
+        ]
+        previous_scheduler_wait = state.get("scheduler_wait")
+        if evaluation_priority:
+            state["scheduler_wait"] = {
+                "kind": "evaluation_priority",
+                "since": (
+                    previous_scheduler_wait.get("since")
+                    if isinstance(previous_scheduler_wait, dict)
+                    and previous_scheduler_wait.get("kind")
+                    == "evaluation_priority"
+                    else _now()
+                ),
+                "trials": evaluation_priority,
+            }
+            if not (
+                isinstance(previous_scheduler_wait, dict)
+                and previous_scheduler_wait.get("kind")
+                == "evaluation_priority"
+            ):
+                self._event(
+                    state,
+                    "evaluation_priority_wait",
+                    (
+                        "pending trial admission paused until collection and "
+                        "evaluation complete"
+                    ),
+                )
+        elif (
+            isinstance(previous_scheduler_wait, dict)
+            and previous_scheduler_wait.get("kind") == "evaluation_priority"
+        ):
+            self._event(
+                state,
+                "evaluation_priority_resumed",
+                "collection and evaluation completed; trial admission resumed",
+            )
+            state.pop("scheduler_wait", None)
+
         active = sum(
             entry["phase"] in {"submitting", "submission_retry_wait"}
             or (
@@ -2496,7 +2548,11 @@ class CampaignEngine:
             )
             for entry in state["trials"]
         )
-        available_by_plan = max(0, self.plan.max_parallel - active)
+        available_by_plan = (
+            0
+            if evaluation_priority
+            else max(0, self.plan.max_parallel - active)
+        )
         if available_by_plan:
             capacity_workload = None
             for candidate in state["trials"]:

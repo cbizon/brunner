@@ -308,6 +308,66 @@ exit 1
     assert (trial / "workspace/.attempt-count").read_text() == "1"
 
 
+def test_claude_invalid_json_schema_failure_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "claude-schema-failure",
+            "claude",
+            "claude-test",
+            None,
+        ),
+    )
+    binary = tmp_path / "claude"
+    _write_executable(
+        binary,
+        """
+count_file=.attempt-count
+count=0
+if [ -f "$count_file" ]; then
+    count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+echo '--json-schema is not a valid JSON Schema:' >&2
+echo 'no schema with key or ref "https://json-schema.org/draft/2020-12/schema"' >&2
+exit 1
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="claude",
+            model="claude-test",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            max_attempts=10,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "provider_error"
+    assert len(state["attempts"]) == 1
+    assert state["attempts"][0]["failure_reason"] == (
+        "harness_configuration_error"
+    )
+    assert (trial / "workspace/.attempt-count").read_text() == "1"
+
+
 def test_codex_invalid_output_schema_failure_is_not_retried(
     tmp_path: Path,
 ) -> None:

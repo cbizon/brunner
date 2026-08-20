@@ -151,6 +151,28 @@ def test_claude_adapter_disables_external_tools(tmp_path: Path) -> None:
     assert "--allowedTools" not in command
 
 
+def test_claude_adapter_omits_unsupported_schema_dialect_marker(
+    tmp_path: Path,
+) -> None:
+    selected = context(tmp_path)
+    canonical = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"status": {"type": "string"}},
+    }
+    selected.final_schema_path.write_text(json.dumps(canonical))
+
+    command = ClaudeAdapter().build_command(
+        ProviderSettings(provider="claude", model="claude-test"),
+        selected,
+    ).command
+    provider_schema = json.loads(command[command.index("--json-schema") + 1])
+
+    assert "$schema" not in provider_schema
+    assert provider_schema["properties"] == canonical["properties"]
+    assert json.loads(selected.final_schema_path.read_text()) == canonical
+
+
 def test_claude_adapter_limits_read_only_reviewer_tools(
     tmp_path: Path,
 ) -> None:
@@ -181,6 +203,13 @@ def test_claude_adapter_limits_read_only_reviewer_tools(
         (
             [],
             "unshare: unshare failed: Operation not permitted",
+        ),
+        (
+            [],
+            (
+                "--json-schema is not a valid JSON Schema: no schema with "
+                'key or ref "https://json-schema.org/draft/2020-12/schema"'
+            ),
         ),
         (
             [
