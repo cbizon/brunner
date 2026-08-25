@@ -774,19 +774,42 @@ brunner --benchmark my_benchmark.definition \
 brunner --benchmark my_benchmark.definition \
   campaign-status my_benchmark.campaign
 brunner --benchmark my_benchmark.definition \
-  campaign-monitor my_benchmark.campaign --local-port 8765
+  campaign-sync my_benchmark.campaign ./comparison-01-results
+brunner campaign-monitor ./comparison-01-results --local-port 8765
 brunner --benchmark my_benchmark.definition \
-  campaign-retrieve my_benchmark.campaign ./comparison-01-results
-brunner --benchmark my_benchmark.definition \
-  campaign-delete my_benchmark.campaign --delete-results
+  campaign-retire my_benchmark.campaign ./comparison-01-results
 ```
 
 `campaign-submit` creates the control/results PVCs, preparation Job, controller
-Deployment, RBAC, status ConfigMap, and monitor Service. `campaign-monitor`
-port-forwards that ClusterIP Service; closing the port-forward does not affect
-reconciliation. `campaign-retrieve` is resumable and verifies the finalized
-manifest and every downloaded file. `campaign-delete` preserves the results
-PVC unless `--delete-results` is explicit.
+Deployment, RBAC, and status ConfigMap. The controller publishes a checksummed
+results snapshot after every reconciliation pass. `campaign-sync` is resumable
+and verifies the snapshot manifest and every downloaded file, whether the
+campaign is active or terminal. `campaign-monitor` serves only the synchronized
+local archive and does not contact Kubernetes.
+
+`campaign-retire` first synchronizes again, requires a terminal archive in
+which every trial has durable completed state, verifies that exact manifest
+against the results PVC and controller status, and then deletes every
+campaign-owned remote resource, including control, results, and trial PVCs.
+Shared benchmark-owned reference or resource-cache PVCs are not campaign
+resources and are not included in the candidate-visible archive.
+
+After retirement, append new trial IDs to the campaign and restore the old
+state before starting the new work:
+
+```sh
+brunner --benchmark my_benchmark.definition \
+  campaign-submit my_benchmark.campaign \
+  --resume-from ./comparison-01-results
+```
+
+The archive must be terminal, checksum-valid, benchmark/contract/evaluator
+compatible, and contain metadata for every historical trial. Brunner creates
+fresh PVCs, restores only manifest-listed published files plus the compact
+campaign and trial metadata needed for reconciliation, then runs preparation
+and starts the controller. Existing completed IDs remain complete; newly added
+IDs are staged and run. A restore is refused while the old controller
+Deployment still exists or if either new PVC already contains different state.
 
 The controller image must contain Brunner, `kubectl`, the benchmark definition
 and campaign modules, assessment materials, reviewer CLIs when configured, and
@@ -1058,9 +1081,9 @@ reference-build      Build a reference manifest
 reference-validate   Verify a reference bundle
 campaign-submit      Create/update the Sterling campaign control plane
 campaign-status      Read controller availability and persisted summary
-campaign-monitor     Port-forward the cluster-resident monitor
-campaign-retrieve    Resume and verify final result retrieval
-campaign-delete      Retire controller/control resources; optionally results
+campaign-sync        Resume and verify a local campaign archive snapshot
+campaign-monitor     Serve a synchronized campaign archive locally
+campaign-retire      Verify terminal sync and delete remote campaign resources
 ```
 
 Kubernetes invokes `python -m brunner.agent_cli` inside the agent init

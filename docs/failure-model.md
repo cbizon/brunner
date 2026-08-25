@@ -86,9 +86,11 @@ state publication must be atomic so they cannot expose partial state.
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
 | Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
 | Artifact collection | Transfer Job failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, control-PVC exhaustion | PVC-to-PVC collection Job and controller | Adopt or poll the durable Job after controller/API interruption, reuse unchanged staged files on the control PVC, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry terminal transport failure only |
-| Result publication | Results-PVC exhaustion, oversized result, interruption, checksum/path violation | Controller | Omit unchanged challenge and assessment working copies; publish atomically; do not clean trial storage until complete |
+| Result publication | Results-PVC exhaustion, oversized result, interruption, checksum/path violation | Controller | Omit unchanged challenge and assessment working copies; publish checksummed snapshots when durable state changes; do not clean trial storage until publication completes |
 | Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure, output merge failure | Trusted assessment Job and controller | Mount evidence read-only, write separately, validate before merge; `assessment`; required-review failure makes result indeterminate |
-| Final retrieval | Reader startup, laptop disconnect, partial file, manifest/file checksum mismatch, local disk | Retrieval client | Preserve `.part` files, resume by offset, publish only verified files, never delete results automatically |
+| Archive synchronization | Reader startup, laptop disconnect, partial file, changing remote snapshot, manifest/file checksum mismatch, local disk | Sync client | Download into a resumable sibling staging tree, preserve the prior local archive, and swap only after complete verification |
+| Archive restoration | Writer startup, laptop disconnect, partial upload, changed destination, invalid historical state | Submit client | Require a terminal compatible archive; resume checksum-verified uploads; restore state before preparation/controller startup; never overwrite differing remote content |
+| Campaign retirement | Final sync failure, nonterminal/nonresumable archive, stale controller status, deletion timeout | Retirement client | Verify remote bytes and exact terminal manifest before deletion; delete all campaign-owned workloads and PVCs only after verification |
 | Reporting | Serialization, template error, disk full | Evaluation or campaign save | Record `reporting`; never block cleanup or replace the authoritative result |
 | Cleanup | API loss, controller shutdown race, finalizer, deletion timeout, helper leak | Campaign cleanup reconciliation | Stop controller Pods before deleting Jobs, sweep replacement Pods, persist `cleanup_pending`, and retry; result remains authoritative |
 | Aggregation | Unknown phase or contradictory fields | Campaign | Durable `orchestrator` attention; never silently report `running` |
@@ -140,8 +142,8 @@ and event evidence before attributing exhaustion to either phase.
   reason and start time must be durable and visible.
 - The laptop is not a reconciliation principal; laptop sleep or disconnect
   cannot pause a running campaign.
-- Result deletion is explicit and separate from controller/control-PVC
-  retirement.
+- Remote campaign deletion is explicit and gated by a final verified terminal
+  archive; retirement removes all campaign-owned PVCs and control resources.
 - A successful test suite is insufficient unless each external boundary has
   failure injection for side-effect ambiguity and restart recovery.
 
@@ -158,7 +160,8 @@ campaign-scoped NetworkPolicy rendering/order, resumable remote stage
 verification, read-only assessment evidence, runtime identity,
 immutable images, multi-Pod retries, missing Jobs, reference identity,
 ResourceQuota capacity, diagnostic collection, bounded result publication,
-resumable verified retrieval, and persistent cluster monitoring.
+resumable verified archive synchronization, local archive monitoring,
+verified retirement, and terminal archive restoration.
 
 Backend-side submission journals, detached child reaping,
 candidate-versus-runner cgroup attribution, and backup recovery after a

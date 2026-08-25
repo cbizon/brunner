@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from brunner.archive import load_campaign_archive
 from brunner.cluster import (
     ClusterCampaign,
     ClusterCampaignClient,
@@ -16,6 +17,7 @@ from brunner.cluster import (
     run_cluster_controller,
 )
 from brunner.contract import load_output_contract, render_output_requirements
+from brunner.dashboard import start_campaign_server
 from brunner.definition import BenchmarkDefinition
 from brunner.reference import (
     build_reference_manifest,
@@ -72,12 +74,11 @@ def load_cluster_campaign(
 
 def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="brunner")
-    if require_benchmark:
-        parser.add_argument(
-            "--benchmark",
-            required=True,
-            help="Python module and optional attribute, MODULE[:ATTRIBUTE]",
-        )
+    parser.add_argument(
+        "--benchmark",
+        required=require_benchmark,
+        help="Python module and optional attribute, MODULE[:ATTRIBUTE]",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("contract-check")
@@ -98,21 +99,18 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
 
     campaign_submit = subparsers.add_parser("campaign-submit")
     campaign_submit.add_argument("campaign")
+    campaign_submit.add_argument("--resume-from", type=_path)
     campaign_status = subparsers.add_parser("campaign-status")
     campaign_status.add_argument("campaign")
     campaign_monitor = subparsers.add_parser("campaign-monitor")
-    campaign_monitor.add_argument("campaign")
+    campaign_monitor.add_argument("archive", type=_path)
     campaign_monitor.add_argument("--local-port", type=int, default=8765)
-    campaign_retrieve = subparsers.add_parser("campaign-retrieve")
-    campaign_retrieve.add_argument("campaign")
-    campaign_retrieve.add_argument("destination", type=_path)
-    campaign_delete = subparsers.add_parser("campaign-delete")
-    campaign_delete.add_argument("campaign")
-    campaign_delete.add_argument(
-        "--delete-results",
-        action="store_true",
-        help="also delete the finalized results PVC",
-    )
+    campaign_sync = subparsers.add_parser("campaign-sync")
+    campaign_sync.add_argument("campaign")
+    campaign_sync.add_argument("destination", type=_path)
+    campaign_retire = subparsers.add_parser("campaign-retire")
+    campaign_retire.add_argument("campaign")
+    campaign_retire.add_argument("archive", type=_path)
 
     for name in (
         "controller-prepare",
@@ -135,9 +133,29 @@ def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def execute(
-    definition: BenchmarkDefinition,
+    definition: BenchmarkDefinition | None,
     args: argparse.Namespace,
 ) -> Any:
+    if args.command == "campaign-monitor":
+        if not 1 <= args.local_port <= 65535:
+            raise ValueError("local monitor port is invalid")
+        archive = load_campaign_archive(args.archive)
+        server, url = start_campaign_server(
+            archive["root"],
+            port=args.local_port,
+        )
+        print(url, flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return None
+        finally:
+            server.server_close()
+        return None
+    if definition is None:
+        raise ValueError(
+            f"{args.command} requires --benchmark"
+        )
     contract = load_output_contract(
         definition.contract_path,
         expected_benchmark_id=definition.benchmark_id,
@@ -239,15 +257,13 @@ def execute(
             campaign_ref=args.campaign,
         )
         if args.command == "campaign-submit":
-            return client.submit()
+            return client.submit(resume_from=args.resume_from)
         if args.command == "campaign-status":
             return client.status()
-        if args.command == "campaign-monitor":
-            return {"return_code": client.monitor(local_port=args.local_port)}
-        if args.command == "campaign-retrieve":
-            return client.retrieve(args.destination)
-        if args.command == "campaign-delete":
-            return client.delete(delete_results=args.delete_results)
+        if args.command == "campaign-sync":
+            return client.sync(args.destination)
+        if args.command == "campaign-retire":
+            return client.retire(args.archive)
     raise AssertionError(args.command)
 
 
@@ -262,9 +278,15 @@ def run_cli(
 
 
 def main() -> None:
-    parser = build_parser(require_benchmark=True)
+    parser = build_parser(require_benchmark=False)
     args = parser.parse_args()
-    definition = load_definition(args.benchmark)
+    if args.command != "campaign-monitor" and not args.benchmark:
+        parser.error(f"{args.command} requires --benchmark")
+    definition = (
+        load_definition(args.benchmark)
+        if args.benchmark
+        else None
+    )
     result = execute(definition, args)
     if result is not None:
         _print(result)

@@ -4,13 +4,15 @@
 the reusable lifecycle:
 
 ```text
-laptop submit/observe/retrieve client
-              |
-              v
-Sterling campaign controller -> agent init container -> evaluator container
-                            -> cluster-local verified collection
-                            -> trusted assessment Jobs
-                            -> immutable result bundle
+laptop submit/status/sync/retire client
+              |                         local verified archive
+              v                                  |
+Sterling campaign controller                     v
+  -> agent init container                local static monitor
+  -> evaluator container
+  -> cluster-local verified collection
+  -> trusted assessment Jobs
+  -> checksummed result snapshots
 ```
 
 Each benchmark imports Brunner and supplies only its challenge, canonical
@@ -40,8 +42,9 @@ fault-injection coverage.
 - Append-only campaign task lists with caller-owned trial IDs
 - Cluster-resident reconciliation protected by a fenced compare-and-swap
   ConfigMap lock
-- Dedicated control/results PVCs and a persistent cluster monitor
-- Resumable, checksum-verified final result retrieval
+- Dedicated temporary control/results PVCs
+- Resumable, checksum-verified active and terminal archive synchronization
+- Local archive monitoring, verified remote retirement, and archive rehydration
 - ResourceQuota-aware campaign capacity and recovery
 - Independent Kubernetes CPU, memory, and ephemeral-storage requests and limits
 - Default-deny Sterling egress through a campaign-scoped provider-only Squid
@@ -92,12 +95,32 @@ brunner --benchmark examples.text_benchmark.definition \
 brunner --benchmark examples.text_benchmark.definition \
   campaign-status examples.text_benchmark.campaign
 brunner --benchmark examples.text_benchmark.definition \
-  campaign-monitor examples.text_benchmark.campaign
+  campaign-sync examples.text_benchmark.campaign ./results
+brunner campaign-monitor ./results
 brunner --benchmark examples.text_benchmark.definition \
-  campaign-retrieve examples.text_benchmark.campaign ./results
-brunner --benchmark examples.text_benchmark.definition \
-  campaign-delete examples.text_benchmark.campaign --delete-results
+  campaign-retire examples.text_benchmark.campaign ./results
 ```
+
+`campaign-sync` may be repeated while a campaign is active; each invocation
+resumes partial files and verifies the current checksummed snapshot. Once every
+desired trial is complete, `campaign-retire` performs one final synchronization,
+verifies the terminal archive, and deletes all campaign-owned cluster resources,
+including control, results, and trial PVCs. The local archive is then the
+durable campaign record and `campaign-monitor` serves it without Kubernetes or
+benchmark code.
+
+To add trials later, append new caller-owned IDs to the campaign and recreate
+the remote control plane from the terminal archive:
+
+```sh
+brunner --benchmark examples.text_benchmark.definition \
+  campaign-submit examples.text_benchmark.campaign \
+  --resume-from ./results
+```
+
+Brunner restores completed state and published results before preparation and
+reconciliation, so unchanged historical IDs are not rerun and new IDs append
+normally.
 
 The controller image must contain Brunner, `kubectl`, and the benchmark
 definition/campaign/assessment code. Provider credentials must already exist

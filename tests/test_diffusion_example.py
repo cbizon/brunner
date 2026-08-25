@@ -254,12 +254,21 @@ def test_diffusion_campaign_runs_two_models_and_exposes_dashboard(
         benchmark_ref="examples.diffusion_benchmark.definition",
         campaign_ref="examples.diffusion_benchmark.campaign",
     )
-    service = next(
+    controller = next(
         resource
         for resource in rendered
-        if resource["kind"] == "Service"
+        if resource["kind"] == "Deployment"
+        and resource["metadata"]["name"].endswith("-controller")
     )
-    assert service["spec"]["ports"][0]["port"] == 8765
+    container = controller["spec"]["template"]["spec"]["containers"][0]
+    assert "ports" not in container
+    assert all(
+        not (
+            resource["kind"] == "Service"
+            and resource["metadata"]["name"].endswith("-monitor")
+        )
+        for resource in rendered
+    )
     assert campaign.controller.reviewer_secret_environment["codex"][
         "AZURE_OPENAI_API_KEY"
     ] == (

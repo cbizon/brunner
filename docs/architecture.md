@@ -20,7 +20,8 @@ stages.
    domain-specific, schema-bound command or model reviews.
 6. **Campaign**: a cluster-resident controller schedules the matrix,
    reconciles backend state, collects outputs, starts assessment Jobs, cleans
-   up trial resources, publishes a monitor, and finalizes a result bundle.
+   up trial resources, and publishes checksummed result snapshots for local
+   synchronization.
 
 ## Ownership
 
@@ -36,7 +37,7 @@ stages.
 | References | Manifest and integrity validation | Reference content |
 | Artifacts | Inventory, resume, checksum, groups | Retention policy |
 | Infrastructure | Backend interfaces and implementations | Runtime profile/images |
-| Campaigns | Controller, ConfigMap lock, durable state/results PVCs, monitor, retrieval | Trial matrix and deployment profile |
+| Campaigns | Controller, ConfigMap lock, temporary state/results PVCs, archive synchronization/restoration, local monitor, verified retirement | Trial matrix and deployment profile |
 
 ## Canonical Output Contract
 
@@ -506,7 +507,7 @@ fault-injection requirements are defined in
 [`failure-model.md`](failure-model.md). Every external operation must translate
 failure into durable state before returning control to reconciliation.
 
-The laptop is only a submit, observe, port-forward, retrieve, and explicit
+The laptop is only a submit, status, archive-sync, local-monitor, and explicit
 retirement client. It never calls the campaign reconciliation engine.
 `campaign-submit` creates one campaign control plane in Sterling:
 
@@ -518,7 +519,6 @@ trusted preparation Job
 one-replica Recreate controller Deployment
 controller lock ConfigMap
 status ConfigMap
-ClusterIP monitor Service
 ```
 
 The preparation Job has no service-account token. It has explicit CPU and
@@ -600,18 +600,43 @@ environment; the controller receives neither provider nor reviewer
 credentials. Assessment Pods have no service-account token and their
 NetworkPolicy permits egress only to that campaign's numeric Squid ClusterIP.
 
-At terminal campaign state, the controller copies authoritative state to the
-results PVC and creates `result-manifest.json` with every result file's path,
-size, and SHA-256. It annotates the results PVC with the manifest identity and
-then stops mutating the result tree. The status ConfigMap remains a small
-observable summary; it is not the authoritative campaign record.
+When durable campaign state changes, the controller copies authoritative state
+and newly published trial results to the results PVC, regenerates the dashboard,
+and creates `result-manifest.json` with every archive file's path, size, and
+SHA-256. A state digest excludes the poll-only `updated_at` field, so an idle
+controller does not repeatedly hash a large result tree. It annotates the
+results PVC and status ConfigMap with the manifest identity. At terminal
+campaign state the manifest is marked terminal and the controller stops
+mutating the result tree. The status ConfigMap remains a small observable
+summary; it is not the authoritative campaign record.
 
-`campaign-retrieve` starts a short-lived, tokenless, read-only helper Pod with
+`campaign-sync` starts a short-lived, tokenless, read-only helper Pod with
 deny-all ingress and egress. It reads files in bounded chunks, resumes local
-`.part` files by byte offset, verifies every SHA-256, and atomically publishes
-completed files. Retrieval remains possible after controller retirement
-because the results PVC annotations carry the manifest identity.
+`.part` files by byte offset, detects a snapshot that changed during transfer,
+verifies every SHA-256, and atomically publishes the matching manifest last.
+The local directory is therefore either the previous valid archive or the new
+valid archive, never a claimed partially downloaded snapshot. Active snapshots
+can be synchronized repeatedly; only a terminal snapshot is eligible for
+retirement or restoration.
 
-`campaign-delete` removes controller resources and the control PVC. It
-preserves the results PVC unless `--delete-results` is explicit. This makes
-result deletion a separate irreversible decision after verified retrieval.
+`campaign-monitor` is a local static server over a verified archive. It needs
+neither a benchmark import nor cluster connectivity, so retired results remain
+browsable indefinitely.
+
+`campaign-retire` synchronizes once more, requires a terminal resumable archive,
+checks the exact manifest identity against the results PVC and live controller
+status, and only then deletes the Deployment, Jobs, Pods, NetworkPolicies, RBAC,
+status/lock ConfigMaps, and every campaign-labeled PVC. This releases requested
+cluster storage quota; the local verified archive becomes the durable campaign
+record. Shared reference and resource-cache claims are benchmark-owned and are
+not deleted or copied into the archive.
+
+`campaign-submit --resume-from ARCHIVE` reverses that boundary. It validates
+the archive's checksums, terminal state, benchmark, contract, evaluator, backend,
+trial identities, and standardized paths before creating remote resources. A
+short-lived tokenless helper Pod with deny-all networking restores
+manifest-listed results, authoritative campaign state, and each trial's compact
+metadata into fresh PVCs. Preparation and the controller start only after
+restore completes. Reconciliation then preserves historical completed IDs and
+stages only newly appended IDs. Existing differing remote content is never
+overwritten silently.
