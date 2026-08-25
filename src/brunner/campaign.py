@@ -496,6 +496,7 @@ class CampaignEngine:
         workload_factory: WorkloadFactory = default_workload_factory,
         evaluation_finalizer: EvaluationFinalizer | None = None,
         result_publisher: ResultPublisher | None = None,
+        dashboard_path: Path | None = None,
         fence: Callable[[], None] | None = None,
     ) -> None:
         if getattr(backend, "agent_isolation", None) != CONTAINER_ISOLATION:
@@ -519,7 +520,11 @@ class CampaignEngine:
         self.results_root = results_root.resolve()
         self.state_path = self.control_root / "campaign.json"
         self.state_backup_path = self.control_root / "campaign.json.bak"
-        self.dashboard_path = self.results_root / "index.html"
+        self.dashboard_path = (
+            dashboard_path.resolve()
+            if dashboard_path is not None
+            else self.results_root / "index.html"
+        )
         self.evaluation_finalizer = (
             evaluation_finalizer
             if evaluation_finalizer is not None

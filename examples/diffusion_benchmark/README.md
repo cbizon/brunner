@@ -9,7 +9,8 @@ This example exercises Brunner end to end:
 - analytical profile, performance, steady-convergence, and grid-convergence
   measurements;
 - model-based qualitative review of the implementation and diagnostics;
-- campaign dashboard generation and resumable retrieval.
+- campaign dashboard generation, resumable synchronization, local monitoring,
+  verified retirement, and later archive restoration.
 
 The candidate implements a standard-library Python CLI for the one-dimensional
 heat equation. Three visible requests cover zero and unequal Dirichlet
@@ -88,18 +89,40 @@ UV_CACHE_DIR=.uv-cache uv run brunner \
 
 UV_CACHE_DIR=.uv-cache uv run brunner \
   --benchmark examples.diffusion_benchmark.definition \
-  campaign-monitor examples.diffusion_benchmark.campaign --local-port 8765
+  campaign-sync examples.diffusion_benchmark.campaign \
+  ./diffusion-equation-results
+
+UV_CACHE_DIR=.uv-cache uv run brunner \
+  campaign-monitor ./diffusion-equation-results --local-port 8765
 ```
 
 The dashboard at `http://127.0.0.1:8765/` links and embeds each trial's
 diffusion report, links the qualitative review, and shows campaign lifecycle,
-usage, and timing fields.
+usage, and timing fields. Run `campaign-sync` again to refresh the local
+archive while the remote campaign is active.
 
-Retrieve the finalized, checksum-verified result bundle:
+After all desired trials finish, synchronize once more and retire every
+campaign-owned Sterling resource:
 
 ```sh
 UV_CACHE_DIR=.uv-cache uv run brunner \
   --benchmark examples.diffusion_benchmark.definition \
-  campaign-retrieve examples.diffusion_benchmark.campaign \
+  campaign-sync examples.diffusion_benchmark.campaign \
   ./diffusion-equation-results
+
+UV_CACHE_DIR=.uv-cache uv run brunner \
+  --benchmark examples.diffusion_benchmark.definition \
+  campaign-retire examples.diffusion_benchmark.campaign \
+  ./diffusion-equation-results
+```
+
+The local archive remains browsable without Sterling. To add another model
+later, append a new trial ID in `campaign.py` and recreate the remote campaign
+from the archive:
+
+```sh
+UV_CACHE_DIR=.uv-cache uv run brunner \
+  --benchmark examples.diffusion_benchmark.definition \
+  campaign-submit examples.diffusion_benchmark.campaign \
+  --resume-from ./diffusion-equation-results
 ```

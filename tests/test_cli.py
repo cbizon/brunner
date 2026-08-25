@@ -24,9 +24,22 @@ def test_public_cli_does_not_expose_host_agent_execution() -> None:
     assert "campaign-step" not in help_text
     assert "campaign-run" not in help_text
     assert "campaign-submit" in help_text
-    assert "campaign-retrieve" in help_text
+    assert "campaign-sync" in help_text
+    assert "campaign-monitor" in help_text
+    assert "campaign-retire" in help_text
+    assert "campaign-retrieve" not in help_text
+    assert "campaign-delete" not in help_text
     assert "brunner-agent" not in project["project"]["scripts"]
     assert not hasattr(evaluation, "evaluate_trial")
+
+
+def test_local_campaign_monitor_does_not_require_benchmark() -> None:
+    args = build_parser(require_benchmark=False).parse_args(
+        ["campaign-monitor", "./results"]
+    )
+
+    assert args.benchmark is None
+    assert args.archive == Path("results")
 
 
 def test_public_backends_are_container_isolated() -> None:

@@ -10,10 +10,12 @@ import pytest
 
 import brunner
 import brunner.cluster as cluster_module
+from brunner.archive import load_campaign_archive
 from brunner.backends import KubernetesProfile
 from brunner.campaign import CampaignPlan, CampaignTrial
 from brunner.cluster import (
     CAMPAIGN_IMAGE_OVERRIDES_ENV,
+    CAMPAIGN_SHA256_ANNOTATION,
     EVALUATION_IMAGE_OVERRIDE_ENV,
     RESULT_MANIFEST,
     RESULT_MANIFEST_SHA256_ANNOTATION,
@@ -34,6 +36,7 @@ from brunner.cluster import (
     publish_trial_results,
     render_cluster_resources,
 )
+from brunner.contract import load_output_contract
 from brunner.errors import (
     BackendRequestError,
     EvaluationPending,
@@ -225,8 +228,10 @@ def test_rendered_control_plane_enforces_cluster_ownership() -> None:
         for value in controller["containers"][0]["env"]
     )
 
-    monitor = by_kind["Service"][0]
-    assert monitor["spec"].get("type", "ClusterIP") == "ClusterIP"
+    assert "Service" not in by_kind
+    container = controller["containers"][0]
+    assert "ports" not in container
+    assert "readinessProbe" not in container
 
 
 def test_assessment_job_receives_submitted_image_identity() -> None:
@@ -586,6 +591,9 @@ def test_result_bundle_manifest_covers_all_result_files(
     bundle = finalize_result_bundle(tmp_path, state, _campaign())
 
     manifest = bundle["manifest"]
+    assert manifest["state_sha256"] == (
+        cluster_module._result_state_sha256(state)
+    )
     paths = {record["path"] for record in manifest["files"]}
     assert paths == {
         "campaign.json",
@@ -676,6 +684,106 @@ def test_publication_omits_unchanged_challenge_and_assessment_workspace(
     assert (destination / "publication.json").is_file()
 
 
+def _archive_payload(
+    campaign: ClusterCampaign,
+    *,
+    terminal: bool = True,
+) -> tuple[dict[str, bytes], bytes]:
+    definition = build_definition()
+    contract = load_output_contract(
+        definition.contract_path,
+        expected_benchmark_id=definition.benchmark_id,
+    )
+    metadata = {
+        "schema_version": "2.0",
+        "test_id": "run-a",
+        "resource_id": "resource-a",
+        "provider": "codex",
+        "model": "model-a",
+        "effort": None,
+        "benchmark_id": definition.benchmark_id,
+        "benchmark_version": definition.version,
+        "contract_sha256": contract.sha256,
+        "challenge_sha256": "a" * 64,
+    }
+    state = {
+        "schema_version": "3.0",
+        "campaign_id": campaign.plan.campaign_id,
+        "benchmark_id": definition.benchmark_id,
+        "benchmark_version": definition.version,
+        "contract_sha256": contract.sha256,
+        "evaluation_sha256": cluster_module._evaluation_sha256(
+            cluster_module._campaign_evaluation_spec(
+                definition,
+                contract,
+                campaign.plan,
+            )
+        ),
+        "challenge_sha256": "a" * 64,
+        "backend": "kubernetes",
+        "status": "complete" if terminal else "running",
+        "trials": [
+            {
+                "test_id": "run-a",
+                "provider": "codex",
+                "model": "model-a",
+                "effort": None,
+                "trial": "/brunner/control/trials/run-a",
+                "collected_trial": "/brunner/results/trials/run-a",
+                "phase": "complete" if terminal else "running",
+                "outcome": "succeeded" if terminal else None,
+                "attempts": {},
+                "challenge_sha256": "a" * 64,
+            }
+        ],
+        "events": [],
+    }
+    files = {
+        "campaign.json": (
+            json.dumps(state, indent=2, sort_keys=True) + "\n"
+        ).encode(),
+        "index.html": b"<html>campaign</html>",
+        "trials/run-a/metadata/manifest.json": (
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+        ).encode(),
+        "trials/run-a/result.txt": b"complete result content",
+    }
+    records = [
+        {
+            "path": path,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for path, content in sorted(files.items())
+    ]
+    manifest = {
+        "schema_version": "2.0",
+        "campaign_id": campaign.plan.campaign_id,
+        "benchmark_id": definition.benchmark_id,
+        "benchmark_version": definition.version,
+        "contract_sha256": contract.sha256,
+        "campaign_sha256": campaign.sha256,
+        "terminal": terminal,
+        "files": records,
+    }
+    return files, json.dumps(manifest).encode()
+
+
+def _write_archive(
+    root: Path,
+    campaign: ClusterCampaign,
+    *,
+    terminal: bool = True,
+) -> tuple[dict[str, bytes], bytes]:
+    files, manifest = _archive_payload(campaign, terminal=terminal)
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (root / RESULT_MANIFEST).write_bytes(manifest)
+    return files, manifest
+
+
 class FakeRetrievalKubectl:
     def __init__(
         self,
@@ -728,25 +836,13 @@ class FakeRetrievalKubectl:
         self.deleted.append((kind, name))
 
 
-def test_retrieval_resumes_partial_files_and_verifies_checksums(
+def test_sync_resumes_partial_files_and_verifies_checksums(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     campaign = _campaign()
     definition = build_definition()
-    content = b"complete result content"
-    file_record = {
-        "path": "trials/run-a/result.txt",
-        "size": len(content),
-        "sha256": hashlib.sha256(content).hexdigest(),
-    }
-    manifest = {
-        "schema_version": "1.0",
-        "campaign_id": campaign.plan.campaign_id,
-        "campaign_sha256": campaign.sha256,
-        "files": [file_record],
-    }
-    manifest_bytes = json.dumps(manifest).encode()
+    files, manifest_bytes = _archive_payload(campaign)
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     fake = FakeRetrievalKubectl(
         status={
@@ -764,7 +860,7 @@ def test_retrieval_resumes_partial_files_and_verifies_checksums(
         campaign_ref="my_benchmark.campaign",
     )
     client.client = fake  # type: ignore[assignment]
-    monkeypatch.setattr(client, "_wait_reader", lambda name: None)
+    monkeypatch.setattr(client, "_wait_transfer_pod", lambda name: None)
 
     def read(
         pod: str,
@@ -775,29 +871,125 @@ def test_retrieval_resumes_partial_files_and_verifies_checksums(
         source = (
             manifest_bytes
             if path == RESULT_MANIFEST
-            else content
+            else files[path]
         )
         return source[offset : offset + count]
 
     monkeypatch.setattr(client, "_read", read)
-    partial = tmp_path / "trials/run-a/result.txt.part"
+    destination = tmp_path / "archive"
+    staging = tmp_path / ".archive.brunner-sync"
+    partial = staging / "trials/run-a/result.txt.part"
     partial.parent.mkdir(parents=True)
-    partial.write_bytes(content[:7])
+    partial.write_bytes(files["trials/run-a/result.txt"][:7])
 
-    result = client.retrieve(tmp_path)
+    result = client.sync(destination)
 
-    assert result["files"] == 1
-    assert (tmp_path / "trials/run-a/result.txt").read_bytes() == content
+    assert result["files"] == len(files)
+    assert (
+        destination / "trials/run-a/result.txt"
+    ).read_bytes() == files["trials/run-a/result.txt"]
     assert not partial.exists()
-    assert (tmp_path / RESULT_MANIFEST).read_bytes() == manifest_bytes
+    assert (
+        destination / RESULT_MANIFEST
+    ).read_bytes() == manifest_bytes
+    assert not staging.exists()
+    assert result["terminal"] is True
     assert {resource["kind"] for resource in fake.applied} == {
         "NetworkPolicy",
         "Pod",
     }
 
 
-class FakeCleanupKubectl:
-    def __init__(self) -> None:
+def test_interrupted_sync_preserves_previous_valid_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    destination = tmp_path / "archive"
+    _, old_manifest = _write_archive(destination, campaign)
+    files, _ = _archive_payload(campaign)
+    files["trials/run-a/result.txt"] = b"new remote result"
+    records = [
+        {
+            "path": path,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for path, content in sorted(files.items())
+    ]
+    remote_manifest = json.dumps(
+        {
+            "schema_version": "2.0",
+            "campaign_id": campaign.plan.campaign_id,
+            "benchmark_id": definition.benchmark_id,
+            "benchmark_version": definition.version,
+            "contract_sha256": load_output_contract(
+                definition.contract_path
+            ).sha256,
+            "campaign_sha256": campaign.sha256,
+            "terminal": True,
+            "files": records,
+        }
+    ).encode()
+    manifest_sha256 = hashlib.sha256(remote_manifest).hexdigest()
+    fake = FakeRetrievalKubectl(
+        status={
+            "result_ready": True,
+            "result_manifest_sha256": manifest_sha256,
+            "result_manifest_size": len(remote_manifest),
+        },
+        manifest_sha256=manifest_sha256,
+        manifest_size=len(remote_manifest),
+    )
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    client.client = fake  # type: ignore[assignment]
+    monkeypatch.setattr(client, "_wait_transfer_pod", lambda name: None)
+
+    def read(
+        pod: str,
+        path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        if path == RESULT_MANIFEST:
+            return remote_manifest[offset : offset + count]
+        if path == "trials/run-a/result.txt":
+            raise BackendRequestError("network disconnected")
+        return files[path][offset : offset + count]
+
+    monkeypatch.setattr(client, "_read", read)
+
+    with pytest.raises(BackendRequestError, match="network disconnected"):
+        client.sync(destination)
+
+    assert (destination / RESULT_MANIFEST).read_bytes() == old_manifest
+    load_campaign_archive(
+        destination,
+        expected_campaign_id=campaign.plan.campaign_id,
+        require_terminal=True,
+        require_resumable=True,
+    )
+    assert (tmp_path / ".archive.brunner-sync").is_dir()
+
+
+class FakeRetireKubectl:
+    def __init__(
+        self,
+        client: ClusterCampaignClient,
+        manifest_sha256: str,
+        manifest_size: int,
+        campaign_sha256: str,
+    ) -> None:
+        self.client = client
+        self.manifest_sha256 = manifest_sha256
+        self.manifest_size = manifest_size
+        self.campaign_sha256 = campaign_sha256
         self.queries: list[tuple[str, str | None]] = []
         self.deleted: list[tuple[str, str | None]] = []
         self.delete_calls: list[
@@ -812,16 +1004,56 @@ class FakeCleanupKubectl:
         labels: str | None = None,
     ) -> dict[str, Any] | None:
         self.queries.append((kind, labels))
-        assert kind == "pvc"
-        return {
-            "items": [
-                {
-                    "metadata": {
-                        "name": "brunner-run-a-data",
+        if kind == "pvc" and name == self.client.resources.results_claim:
+            return {
+                "metadata": {
+                    "annotations": {
+                        RESULT_MANIFEST_SHA256_ANNOTATION: (
+                            self.manifest_sha256
+                        ),
+                        RESULT_MANIFEST_SIZE_ANNOTATION: str(
+                            self.manifest_size
+                        ),
+                        CAMPAIGN_SHA256_ANNOTATION: self.campaign_sha256,
                     }
                 }
-            ]
-        }
+            }
+        if kind == "pvc" and name == self.client.resources.control_claim:
+            return {"metadata": {}}
+        if kind == "configmap":
+            return {
+                "data": {
+                    "status.json": json.dumps(
+                        {
+                            "result_ready": True,
+                            "result_manifest_sha256": self.manifest_sha256,
+                        }
+                    )
+                }
+            }
+        if kind == "deployment":
+            return {"metadata": {"name": name}}
+        if kind == "pvc" and labels is not None:
+            return {
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "brunner-run-a-data",
+                        }
+                    },
+                    {
+                        "metadata": {
+                            "name": self.client.resources.control_claim,
+                        }
+                    },
+                    {
+                        "metadata": {
+                            "name": self.client.resources.results_claim,
+                        }
+                    },
+                ]
+            }
+        raise AssertionError((kind, name, labels))
 
     def delete(
         self,
@@ -835,29 +1067,37 @@ class FakeCleanupKubectl:
         self.delete_calls.append((kind, name, labels, wait))
 
 
-def test_cluster_cleanup_queries_pvc_resource() -> None:
+def test_campaign_retirement_deletes_all_remote_claims_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     campaign = _campaign()
     definition = build_definition()
-    fake = FakeCleanupKubectl()
+    _, manifest = _write_archive(tmp_path, campaign)
     client = ClusterCampaignClient(
         definition,
         campaign,
         benchmark_ref="examples.text_benchmark.definition",
         campaign_ref="my_benchmark.campaign",
     )
+    fake = FakeRetireKubectl(
+        client,
+        hashlib.sha256(manifest).hexdigest(),
+        len(manifest),
+        campaign.sha256,
+    )
     client.client = fake  # type: ignore[assignment]
+    sync_calls: list[Path] = []
+    monkeypatch.setattr(
+        client,
+        "sync",
+        lambda destination: sync_calls.append(destination)
+        or {"terminal": True},
+    )
 
-    result = client.delete(delete_results=True)
+    result = client.retire(tmp_path)
 
-    assert fake.queries == [
-        (
-            "pvc",
-            (
-                "dev.brunner/campaign="
-                f"{client.resources.base}"
-            ),
-        )
-    ]
+    assert sync_calls == [tmp_path]
     assert ("pvc", "brunner-run-a-data") in fake.deleted
     assert ("pvc", client.resources.control_claim) in fake.deleted
     assert ("pvc", client.resources.results_claim) in fake.deleted
@@ -870,7 +1110,253 @@ def test_cluster_cleanup_queries_pvc_resource() -> None:
         ("job", None, campaign_labels, True),
         ("pod", None, campaign_labels, True),
     ]
-    assert result["deleted_results"] is True
+    assert result["already_retired"] is False
+    assert set(result["deleted_claims"]) == {
+        "brunner-run-a-data",
+        client.resources.control_claim,
+        client.resources.results_claim,
+    }
+
+
+def test_retirement_does_not_delete_resources_when_final_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    _, manifest = _write_archive(tmp_path, campaign)
+    fake = FakeRetireKubectl(
+        None,  # type: ignore[arg-type]
+        hashlib.sha256(manifest).hexdigest(),
+        len(manifest),
+        campaign.sha256,
+    )
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    fake.client = client
+    client.client = fake  # type: ignore[assignment]
+    monkeypatch.setattr(
+        client,
+        "sync",
+        lambda destination: (_ for _ in ()).throw(
+            BackendRequestError("cluster disconnected")
+        ),
+    )
+
+    with pytest.raises(
+        BackendRequestError,
+        match="cluster disconnected",
+    ):
+        client.retire(tmp_path)
+
+    assert fake.deleted == []
+
+
+def test_remote_manifest_identity_prefers_results_pvc_annotation() -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    annotated_sha256 = "a" * 64
+    fake = FakeRetrievalKubectl(
+        status={
+            "result_manifest_sha256": "b" * 64,
+            "result_manifest_size": 1,
+        },
+        manifest_sha256=annotated_sha256,
+        manifest_size=42,
+    )
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    client.client = fake  # type: ignore[assignment]
+
+    digest, size, _ = client._remote_manifest_identity()
+
+    assert digest == annotated_sha256
+    assert size == 42
+
+
+class FakeSubmitKubectl:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def get(
+        self,
+        kind: str,
+        name: str | None = None,
+        *,
+        labels: str | None = None,
+    ) -> dict[str, Any] | None:
+        assert labels is None
+        if kind == "deployment":
+            return None
+        raise AssertionError((kind, name, labels))
+
+    def apply(self, resource: dict[str, Any]) -> None:
+        self.events.append(
+            (
+                "apply",
+                f"{resource['kind']}/{resource['metadata']['name']}",
+            )
+        )
+
+    def delete(
+        self,
+        kind: str,
+        name: str | None = None,
+        *,
+        labels: str | None = None,
+        wait: bool = False,
+    ) -> None:
+        target = name or str(labels)
+        self.events.append(("delete", f"{kind}/{target}"))
+
+
+def test_submit_restores_archive_before_preparation_and_controller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    _write_archive(tmp_path, campaign)
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    fake = FakeSubmitKubectl()
+    client.client = fake  # type: ignore[assignment]
+    monkeypatch.setattr(
+        client,
+        "_restore_archive",
+        lambda archive: fake.events.append(
+            ("restore", str(archive["root"]))
+        ),
+    )
+
+    result = client.submit(resume_from=tmp_path)
+
+    restore_index = fake.events.index(("restore", str(tmp_path)))
+    preparation_index = fake.events.index(
+        ("apply", f"Job/{client.resources.preparation_job}")
+    )
+    controller_index = fake.events.index(
+        ("apply", f"Deployment/{client.resources.deployment}")
+    )
+    assert restore_index < preparation_index < controller_index
+    assert result["resumed_from"] == str(tmp_path)
+
+
+def test_restore_uploads_published_results_and_compact_control_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    _write_archive(tmp_path, campaign)
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    archive = client._validate_resume_archive(tmp_path)
+    fake = FakeSubmitKubectl()
+    client.client = fake  # type: ignore[assignment]
+    uploads: list[tuple[Path, str]] = []
+    byte_uploads: list[tuple[Path, str]] = []
+    monkeypatch.setattr(client, "_wait_transfer_pod", lambda name: None)
+    monkeypatch.setattr(
+        client,
+        "_remote_file_info",
+        lambda *args: {"exists": False},
+    )
+    monkeypatch.setattr(
+        client,
+        "_upload_file",
+        lambda pod, root, relative, *args, **kwargs: uploads.append(
+            (root, relative)
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "_upload_bytes",
+        lambda pod, root, relative, content: byte_uploads.append(
+            (root, relative)
+        ),
+    )
+
+    client._restore_archive(archive)
+
+    result_paths = {
+        relative
+        for root, relative in uploads
+        if root == cluster_module.RESULTS_ROOT
+    }
+    assert result_paths == {
+        *archive["files"],
+        RESULT_MANIFEST,
+    }
+    control_paths = {
+        relative
+        for root, relative in uploads
+        if root == cluster_module.CONTROL_ROOT
+    }
+    assert control_paths == {
+        "campaign.json",
+        "campaign.json.bak",
+        "trials/run-a/metadata/manifest.json",
+    }
+    assert byte_uploads == [
+        (
+            cluster_module.CONTROL_ROOT,
+            cluster_module.RESUME_ARCHIVE_MARKER,
+        )
+    ]
+
+
+def test_resume_rejects_incompatible_trial_metadata(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    _write_archive(tmp_path, campaign)
+    metadata_path = (
+        tmp_path / "trials/run-a/metadata/manifest.json"
+    )
+    metadata = json.loads(metadata_path.read_text())
+    metadata["model"] = "different-model"
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    )
+    manifest_path = tmp_path / RESULT_MANIFEST
+    manifest = json.loads(manifest_path.read_text())
+    for record in manifest["files"]:
+        if record["path"] == "trials/run-a/metadata/manifest.json":
+            record["size"] = metadata_path.stat().st_size
+            record["sha256"] = hashlib.sha256(
+                metadata_path.read_bytes()
+            ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+
+    with pytest.raises(
+        IntegrityError,
+        match="trial metadata is incompatible",
+    ):
+        client._validate_resume_archive(tmp_path)
 
 
 def test_cluster_client_uses_configured_kubectl_binary() -> None:

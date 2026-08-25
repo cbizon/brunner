@@ -5,9 +5,9 @@ import json
 import math
 import os
 import re
-import signal
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -16,6 +16,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from brunner.archive import (
+    ARCHIVE_MANIFEST,
+    load_campaign_archive,
+)
 from brunner.backends import KubernetesBackend, KubernetesProfile
 from brunner.artifacts import artifact_metadata
 from brunner.backends.squid import (
@@ -25,6 +29,8 @@ from brunner.backends.squid import (
 from brunner.campaign import (
     CampaignEngine,
     CampaignPlan,
+    _campaign_evaluation_spec,
+    _evaluation_sha256,
     campaign_resource_name,
 )
 from brunner.contract import OutputContract
@@ -41,11 +47,12 @@ from brunner.io import write_json_atomic
 
 CONTROL_ROOT = Path("/brunner/control")
 RESULTS_ROOT = Path("/brunner/results")
-RESULT_MANIFEST = "result-manifest.json"
+RESULT_MANIFEST = ARCHIVE_MANIFEST
 RESULT_MANIFEST_SHA256_ANNOTATION = (
     "dev.brunner/result-manifest-sha256"
 )
 RESULT_MANIFEST_SIZE_ANNOTATION = "dev.brunner/result-manifest-size"
+RESUME_ARCHIVE_MARKER = "resume-archive.json"
 PREPARATION_MARKER_GRACE_SECONDS = 10
 CAMPAIGN_SHA256_ANNOTATION = "dev.brunner/campaign-sha256"
 CAMPAIGN_IMAGE_OVERRIDES_ENV = "BRUNNER_CAMPAIGN_IMAGE_OVERRIDES"
@@ -115,7 +122,6 @@ class ControllerProfile:
     poll_seconds: float = 5
     preparation_timeout_seconds: float = 60 * 60
     lock_duration_seconds: int = 60
-    dashboard_port: int = 8765
     command_timeout_seconds: float = 120
     retrieval_chunk_bytes: int = 4 * 1024 * 1024
     max_published_trial_bytes: int | None = 10 * 1024 * 1024 * 1024
@@ -163,8 +169,6 @@ class ControllerProfile:
             raise ValueError(
                 "controller lock_duration_seconds must be at least 15"
             )
-        if not 1 <= self.dashboard_port <= 65535:
-            raise ValueError("controller dashboard_port is invalid")
         if self.command_timeout_seconds <= 0:
             raise ValueError(
                 "controller command_timeout_seconds must be positive"
@@ -397,10 +401,6 @@ class CampaignResources:
     @property
     def deployment(self) -> str:
         return f"{self.base}-controller"
-
-    @property
-    def service(self) -> str:
-        return f"{self.base}-monitor"
 
     @property
     def assessment_policy(self) -> str:
@@ -823,13 +823,6 @@ def render_cluster_resources(
             campaign_sha256=campaign.sha256,
         ),
         "workingDir": "/tmp",
-        "ports": [
-            {
-                "name": "http",
-                "containerPort": profile.dashboard_port,
-                "protocol": "TCP",
-            }
-        ],
         "env": [
             *campaign_environment,
             {
@@ -857,11 +850,6 @@ def render_cluster_resources(
         },
         "securityContext": _security_context(),
         "volumeMounts": mounts,
-        "readinessProbe": {
-            "httpGet": {"path": "/", "port": "http"},
-            "initialDelaySeconds": 2,
-            "periodSeconds": 10,
-        },
     }
     controller_pod_spec: dict[str, Any] = {
         "automountServiceAccountToken": True,
@@ -998,25 +986,6 @@ def render_cluster_resources(
                     },
                     "spec": controller_pod_spec,
                 },
-            },
-        },
-        {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": resources.service,
-                "namespace": resources.namespace,
-                "labels": labels,
-            },
-            "spec": {
-                "selector": pod_labels,
-                "ports": [
-                    {
-                        "name": "http",
-                        "port": profile.dashboard_port,
-                        "targetPort": "http",
-                    }
-                ],
             },
         },
     )
@@ -1273,6 +1242,12 @@ def _result_inventory(
     return files
 
 
+def _result_state_sha256(state: dict[str, Any]) -> str:
+    stable = dict(state)
+    stable.pop("updated_at", None)
+    return _json_sha256(stable)
+
+
 def publish_trial_results(
     source: Path,
     destination: Path,
@@ -1417,16 +1392,27 @@ def finalize_result_bundle(
     *,
     fence: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    from brunner.dashboard import write_campaign_dashboard
+
     fence = fence or (lambda: None)
     fence()
     results_root.mkdir(parents=True, exist_ok=True)
     fence()
     write_json_atomic(results_root / "campaign.json", state)
     fence()
+    write_campaign_dashboard(state, results_root / "index.html")
+    fence()
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "campaign_id": campaign.plan.campaign_id,
+        "benchmark_id": state.get("benchmark_id"),
+        "benchmark_version": state.get("benchmark_version"),
+        "contract_sha256": state.get("contract_sha256"),
+        "evaluation_sha256": state.get("evaluation_sha256"),
+        "challenge_sha256": state.get("challenge_sha256"),
         "campaign_sha256": campaign.sha256,
+        "state_sha256": _result_state_sha256(state),
+        "terminal": state.get("status") in TERMINAL_CAMPAIGN_STATES,
         "created_at": _now(),
         "files": _result_inventory(results_root, fence=fence),
     }
@@ -1891,6 +1877,7 @@ def prepare_cluster_campaign(
             backend,
             control_root=CONTROL_ROOT,
             results_root=RESULTS_ROOT,
+            dashboard_path=CONTROL_ROOT / "index.html",
         )
         state = engine.initialize()
         failure_marker.unlink(missing_ok=True)
@@ -2069,6 +2056,34 @@ def _wait_for_preparation(
         time.sleep(campaign.controller.poll_seconds)
 
 
+def _publish_manifest_identity(
+    client: Kubectl,
+    resources: CampaignResources,
+    campaign: ClusterCampaign,
+    bundle: dict[str, Any],
+) -> None:
+    client.run(
+        "annotate",
+        "pvc",
+        resources.results_claim,
+        "-n",
+        resources.namespace,
+        (
+            f"{RESULT_MANIFEST_SHA256_ANNOTATION}="
+            f"{bundle['sha256']}"
+        ),
+        (
+            f"{RESULT_MANIFEST_SIZE_ANNOTATION}="
+            f"{bundle['size']}"
+        ),
+        (
+            f"{CAMPAIGN_SHA256_ANNOTATION}="
+            f"{campaign.sha256}"
+        ),
+        "--overwrite",
+    )
+
+
 def run_cluster_controller(
     definition: BenchmarkDefinition,
     contract: OutputContract,
@@ -2078,8 +2093,6 @@ def run_cluster_controller(
     campaign_ref: str,
     expected_sha256: str,
 ) -> None:
-    from brunner.dashboard import start_campaign_server
-
     verify_campaign_sha256(campaign, expected_sha256)
     resources = campaign_resources(definition, campaign)
     client = Kubectl(
@@ -2130,32 +2143,40 @@ def run_cluster_controller(
             max_bytes=campaign.controller.max_published_trial_bytes,
             fence=lock.assert_held,
         ),
+        dashboard_path=CONTROL_ROOT / "index.html",
         fence=lock.assert_held,
     )
-    server, _ = start_campaign_server(
-        RESULTS_ROOT,
-        host="0.0.0.0",
-        port=campaign.controller.dashboard_port,
-    )
-    server_thread = threading.Thread(
-        target=server.serve_forever,
-        name="brunner-cluster-monitor",
-        daemon=True,
-    )
-    server_thread.start()
     try:
         while True:
             lock.assert_held()
             marker = RESULTS_ROOT / RESULT_MANIFEST
-            if marker.is_file():
-                state = json.loads(
-                    (RESULTS_ROOT / "campaign.json").read_text()
-                )
+            control_state = CONTROL_ROOT / "campaign.json"
+            existing_state = (
+                json.loads(control_state.read_text())
+                if control_state.is_file()
+                else None
+            )
+            existing_manifest = (
+                json.loads(marker.read_text())
+                if marker.is_file()
+                else None
+            )
+            if (
+                isinstance(existing_state, dict)
+                and existing_state.get("status")
+                in TERMINAL_CAMPAIGN_STATES
+                and isinstance(existing_manifest, dict)
+                and existing_manifest.get("campaign_sha256")
+                == campaign.sha256
+                and existing_manifest.get("state_sha256")
+                == _result_state_sha256(existing_state)
+                and existing_manifest.get("terminal", True) is True
+            ):
                 manifest_sha256 = sha256_file(marker)
                 manifest_size = marker.stat().st_size
                 status = _campaign_status(
                     campaign,
-                    state,
+                    existing_state,
                     result_ready=True,
                     manifest_sha256=manifest_sha256,
                     manifest_size=manifest_size,
@@ -2166,15 +2187,27 @@ def run_cluster_controller(
                 time.sleep(campaign.controller.poll_seconds)
                 continue
             state = engine.advance()
-            status = _campaign_status(
-                campaign,
-                state,
-                result_ready=False,
-            )
             lock.assert_held()
-            client.apply(_status_resource(resources, status))
-            if state.get("status") in TERMINAL_CAMPAIGN_STATES:
-                lock.assert_held()
+            state_sha256 = _result_state_sha256(state)
+            marker = RESULTS_ROOT / RESULT_MANIFEST
+            current_manifest = (
+                json.loads(marker.read_text())
+                if marker.is_file()
+                else None
+            )
+            if (
+                isinstance(current_manifest, dict)
+                and current_manifest.get("campaign_sha256")
+                == campaign.sha256
+                and current_manifest.get("state_sha256")
+                == state_sha256
+            ):
+                bundle = {
+                    "manifest": current_manifest,
+                    "sha256": sha256_file(marker),
+                    "size": marker.stat().st_size,
+                }
+            else:
                 bundle = finalize_result_bundle(
                     RESULTS_ROOT,
                     state,
@@ -2182,45 +2215,30 @@ def run_cluster_controller(
                     fence=lock.assert_held,
                 )
                 lock.assert_held()
-                client.run(
-                    "annotate",
-                    "pvc",
-                    resources.results_claim,
-                    "-n",
-                    resources.namespace,
-                    (
-                        f"{RESULT_MANIFEST_SHA256_ANNOTATION}="
-                        f"{bundle['sha256']}"
-                    ),
-                    (
-                        f"{RESULT_MANIFEST_SIZE_ANNOTATION}="
-                        f"{bundle['size']}"
-                    ),
-                    (
-                        f"{CAMPAIGN_SHA256_ANNOTATION}="
-                        f"{campaign.sha256}"
-                    ),
-                    "--overwrite",
+                _publish_manifest_identity(
+                    client,
+                    resources,
+                    campaign,
+                    bundle,
                 )
-                lock.assert_held()
-                client.apply(
-                    _status_resource(
-                        resources,
-                        _campaign_status(
-                            campaign,
-                            state,
-                            result_ready=True,
-                            manifest_sha256=str(bundle["sha256"]),
-                            manifest_size=int(bundle["size"]),
+            lock.assert_held()
+            client.apply(
+                _status_resource(
+                    resources,
+                    _campaign_status(
+                        campaign,
+                        state,
+                        result_ready=(
+                            state.get("status") in TERMINAL_CAMPAIGN_STATES
                         ),
-                    )
+                        manifest_sha256=str(bundle["sha256"]),
+                        manifest_size=int(bundle["size"]),
+                    ),
                 )
-                lock.assert_held()
+            )
+            lock.assert_held()
             time.sleep(campaign.controller.poll_seconds)
     finally:
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=5)
         lock.close()
 
 
@@ -2246,7 +2264,183 @@ class ClusterCampaignClient:
             timeout_seconds=campaign.controller.command_timeout_seconds,
         )
 
-    def submit(self) -> dict[str, Any]:
+    def _validate_archive_compatibility(
+        self,
+        archive: dict[str, Any],
+    ) -> None:
+        from brunner.contract import load_output_contract
+
+        state = archive["state"]
+        contract = load_output_contract(
+            self.definition.contract_path,
+            expected_benchmark_id=self.definition.benchmark_id,
+        )
+        expected_identity = {
+            "benchmark_id": self.definition.benchmark_id,
+            "benchmark_version": self.definition.version,
+            "contract_sha256": contract.sha256,
+            "evaluation_sha256": _evaluation_sha256(
+                _campaign_evaluation_spec(
+                    self.definition,
+                    contract,
+                    self.campaign.plan,
+                )
+            ),
+            "backend": "kubernetes",
+        }
+        mismatches = {
+            key: {"expected": value, "actual": state.get(key)}
+            for key, value in expected_identity.items()
+            if state.get(key) != value
+        }
+        if mismatches:
+            raise IntegrityError(
+                f"campaign archive identity is incompatible: {mismatches}"
+            )
+
+        entries = state.get("trials")
+        if not isinstance(entries, list):
+            raise IntegrityError(
+                "archived campaign state has no valid trial list"
+            )
+        configured = {
+            trial.test_id: trial.to_dict()
+            for trial in self.campaign.plan.trials
+        }
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise IntegrityError(
+                    "archived campaign state has a malformed trial entry"
+                )
+            test_id_value = entry.get("test_id")
+            if not isinstance(test_id_value, str) or not test_id_value:
+                raise IntegrityError(
+                    "archived campaign state has a trial without a valid "
+                    "test_id"
+                )
+            test_id = test_id_value
+            if test_id in seen:
+                raise IntegrityError(
+                    f"archived campaign state repeats trial {test_id!r}"
+                )
+            seen.add(test_id)
+            expected_trial_path = str(CONTROL_ROOT / "trials" / test_id)
+            expected_result_path = str(RESULTS_ROOT / "trials" / test_id)
+            if entry.get("trial") != expected_trial_path:
+                raise IntegrityError(
+                    "campaign archive contains an unsafe trial path for "
+                    f"{test_id}: {entry.get('trial')!r}"
+                )
+            if (
+                entry.get("collected_trial") is not None
+                and entry.get("collected_trial") != expected_result_path
+            ):
+                raise IntegrityError(
+                    "campaign archive contains an unsafe result path for "
+                    f"{test_id}: {entry.get('collected_trial')!r}"
+                )
+            current = configured.get(test_id)
+            if current is None:
+                continue
+            identity_keys = set(current) - {"backend_image"}
+            trial_mismatches = {
+                key: {
+                    "expected": current.get(key),
+                    "actual": entry.get(key),
+                }
+                for key in identity_keys
+                if entry.get(key) != current.get(key)
+            }
+            if trial_mismatches:
+                raise IntegrityError(
+                    "campaign archive trial identity changed for "
+                    f"{test_id}: {trial_mismatches}"
+                )
+            metadata_relative = (
+                f"trials/{test_id}/metadata/manifest.json"
+            )
+            metadata_record = archive["files"].get(metadata_relative)
+            if metadata_record is None:
+                if entry.get("phase") == "complete":
+                    raise IntegrityError(
+                        "campaign archive is missing completed trial "
+                        f"metadata: {test_id}"
+                    )
+                continue
+            try:
+                metadata = json.loads(
+                    (archive["root"] / metadata_relative).read_text()
+                )
+            except (json.JSONDecodeError, OSError) as error:
+                raise IntegrityError(
+                    "campaign archive contains unreadable trial metadata: "
+                    f"{test_id}"
+                ) from error
+            if not isinstance(metadata, dict):
+                raise IntegrityError(
+                    "campaign archive trial metadata must be an object: "
+                    f"{test_id}"
+                )
+            expected_metadata = {
+                "test_id": test_id,
+                "provider": entry.get("provider"),
+                "model": entry.get("model"),
+                "effort": entry.get("effort"),
+                "benchmark_id": state.get("benchmark_id"),
+                "benchmark_version": state.get("benchmark_version"),
+                "contract_sha256": state.get("contract_sha256"),
+                "challenge_sha256": entry.get("challenge_sha256"),
+            }
+            metadata_mismatches = {
+                key: {
+                    "expected": value,
+                    "actual": metadata.get(key),
+                }
+                for key, value in expected_metadata.items()
+                if metadata.get(key) != value
+            }
+            resource_id = metadata.get("resource_id")
+            if metadata_mismatches or not isinstance(
+                resource_id,
+                str,
+            ) or not resource_id:
+                raise IntegrityError(
+                    "campaign archive trial metadata is incompatible for "
+                    f"{test_id}: mismatches={metadata_mismatches}, "
+                    f"resource_id_valid={bool(resource_id)}"
+                )
+
+    def _validate_resume_archive(self, root: Path) -> dict[str, Any]:
+        archive = load_campaign_archive(
+            root,
+            expected_campaign_id=self.campaign.plan.campaign_id,
+            require_terminal=True,
+            require_resumable=True,
+        )
+        self._validate_archive_compatibility(archive)
+        return archive
+
+    def submit(
+        self,
+        *,
+        resume_from: Path | None = None,
+    ) -> dict[str, Any]:
+        archive = (
+            self._validate_resume_archive(resume_from)
+            if resume_from is not None
+            else None
+        )
+        if (
+            archive is not None
+            and self.client.get("deployment", self.resources.deployment)
+            is not None
+        ):
+            raise BackendRequestError(
+                "cannot restore a campaign archive while its controller "
+                "Deployment exists; retire the remote campaign first or "
+                "submit without --resume-from"
+            )
         rendered = render_cluster_resources(
             self.definition,
             self.campaign,
@@ -2276,6 +2470,8 @@ class ClusterCampaignClient:
             ),
             wait=True,
         )
+        if archive is not None:
+            self._restore_archive(archive)
         self.client.apply(preparation)
         self.client.apply(deployment)
         return {
@@ -2283,9 +2479,11 @@ class ClusterCampaignClient:
             "campaign_sha256": self.campaign.sha256,
             "namespace": self.resources.namespace,
             "controller": self.resources.deployment,
-            "monitor_service": self.resources.service,
             "control_claim": self.resources.control_claim,
             "results_claim": self.resources.results_claim,
+            "resumed_from": (
+                str(archive["root"]) if archive is not None else None
+            ),
             "status": "submitted",
         }
 
@@ -2329,7 +2527,6 @@ class ClusterCampaignClient:
                 self.campaign.controller.poll_seconds * 4,
             )
         status["namespace"] = self.resources.namespace
-        status["monitor_service"] = self.resources.service
         preparation = self.client.get(
             "job",
             self.resources.preparation_job,
@@ -2360,32 +2557,47 @@ class ClusterCampaignClient:
                 status["preparation_status"] = "pending"
         return status
 
-    def monitor(self, *, local_port: int = 8765) -> int:
-        if not 1 <= local_port <= 65535:
-            raise ValueError("local monitor port is invalid")
-        command = [
-            self.client.executable,
-            "port-forward",
-            "-n",
-            self.resources.namespace,
-            f"service/{self.resources.service}",
-            (
-                f"{local_port}:"
-                f"{self.campaign.controller.dashboard_port}"
-            ),
-        ]
-        process = subprocess.Popen(command)
-        try:
-            return process.wait()
-        except KeyboardInterrupt:
-            process.send_signal(signal.SIGINT)
-            return process.wait()
-
-    def _retrieval_pod(self) -> dict[str, Any]:
+    def _transfer_pod(self, *, write: bool) -> dict[str, Any]:
+        role = "archive-writer" if write else "archive-reader"
         labels = {
             **_labels(self.resources),
-            "dev.brunner/role": "result-reader",
+            "dev.brunner/role": role,
         }
+        mounts = [
+            {
+                "name": "results",
+                "mountPath": str(RESULTS_ROOT),
+                "readOnly": not write,
+            },
+            {"name": "tmp", "mountPath": "/tmp"},
+        ]
+        volumes = [
+            {
+                "name": "results",
+                "persistentVolumeClaim": {
+                    "claimName": self.resources.results_claim,
+                    "readOnly": not write,
+                },
+            },
+            {"name": "tmp", "emptyDir": {}},
+        ]
+        if write:
+            mounts.insert(
+                0,
+                {
+                    "name": "control",
+                    "mountPath": str(CONTROL_ROOT),
+                },
+            )
+            volumes.insert(
+                0,
+                {
+                    "name": "control",
+                    "persistentVolumeClaim": {
+                        "claimName": self.resources.control_claim,
+                    },
+                },
+            )
         pod_spec: dict[str, Any] = {
             "automountServiceAccountToken": False,
             "enableServiceLinks": False,
@@ -2402,40 +2614,29 @@ class ClusterCampaignClient:
                     ],
                     "workingDir": "/tmp",
                     "securityContext": _security_context(),
-                    "volumeMounts": [
-                        {
-                            "name": "results",
-                            "mountPath": str(RESULTS_ROOT),
-                            "readOnly": True,
-                        },
-                        {"name": "tmp", "mountPath": "/tmp"},
-                    ],
+                    "volumeMounts": mounts,
                 }
             ],
-            "volumes": [
-                {
-                    "name": "results",
-                    "persistentVolumeClaim": {
-                        "claimName": self.resources.results_claim,
-                        "readOnly": True,
-                    },
-                },
-                {"name": "tmp", "emptyDir": {}},
-            ],
+            "volumes": volumes,
         }
         _pod_placement(self.campaign.controller, pod_spec)
         return {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
-                "name": f"{self.resources.base}-result-reader",
+                "name": f"{self.resources.base}-{role}",
                 "namespace": self.resources.namespace,
                 "labels": labels,
             },
             "spec": pod_spec,
         }
 
-    def _retrieval_network_policy(self, pod_name: str) -> dict[str, Any]:
+    def _transfer_network_policy(
+        self,
+        pod_name: str,
+        *,
+        role: str,
+    ) -> dict[str, Any]:
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -2448,7 +2649,7 @@ class ClusterCampaignClient:
                 "podSelector": {
                     "matchLabels": {
                         **_labels(self.resources),
-                        "dev.brunner/role": "result-reader",
+                        "dev.brunner/role": role,
                     }
                 },
                 "policyTypes": ["Ingress", "Egress"],
@@ -2457,7 +2658,7 @@ class ClusterCampaignClient:
             },
         }
 
-    def _wait_reader(self, name: str) -> None:
+    def _wait_transfer_pod(self, name: str) -> None:
         result = self.client.run(
             "wait",
             f"pod/{name}",
@@ -2470,13 +2671,14 @@ class ClusterCampaignClient:
         )
         if result.returncode:
             raise BackendRequestError(
-                f"result reader did not become ready: "
+                f"campaign archive transfer Pod did not become ready: "
                 f"{result.stderr or result.stdout}"
             )
 
-    def _read(
+    def _remote_read(
         self,
         pod: str,
+        root: Path,
         path: str,
         offset: int,
         count: int,
@@ -2491,12 +2693,324 @@ class ClusterCampaignClient:
             "-m",
             "brunner.backends.remote",
             "read",
-            str(RESULTS_ROOT),
+            str(root),
             path,
             str(offset),
             str(count),
         )
         return result.stdout
+
+    def _read(
+        self,
+        pod: str,
+        path: str,
+        offset: int,
+        count: int,
+    ) -> bytes:
+        return self._remote_read(
+            pod,
+            RESULTS_ROOT,
+            path,
+            offset,
+            count,
+        )
+
+    def _remote_file_info(
+        self,
+        pod: str,
+        root: Path,
+        relative: str,
+    ) -> dict[str, Any]:
+        result = self.client.run(
+            "exec",
+            "-n",
+            self.resources.namespace,
+            pod,
+            "--",
+            "python",
+            "-m",
+            "brunner.backends.remote",
+            "file-info",
+            str(root),
+            relative,
+        )
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            raise IntegrityError(
+                "archive transfer returned malformed file metadata"
+            )
+        return value
+
+    def _write_remote_chunk(
+        self,
+        pod: str,
+        root: Path,
+        relative: str,
+        *,
+        offset: int,
+        total_size: int,
+        data: bytes,
+    ) -> None:
+        self.client.run_bytes(
+            "exec",
+            "-i",
+            "-n",
+            self.resources.namespace,
+            pod,
+            "--",
+            "python",
+            "-m",
+            "brunner.backends.remote",
+            "write-chunk",
+            str(root),
+            relative,
+            str(offset),
+            str(total_size),
+            input_bytes=data,
+        )
+
+    def _commit_remote_file(
+        self,
+        pod: str,
+        root: Path,
+        relative: str,
+        *,
+        size: int,
+        sha256: str,
+    ) -> None:
+        self.client.run(
+            "exec",
+            "-n",
+            self.resources.namespace,
+            pod,
+            "--",
+            "python",
+            "-m",
+            "brunner.backends.remote",
+            "commit-file",
+            str(root),
+            relative,
+            str(size),
+            sha256,
+        )
+
+    def _upload_file(
+        self,
+        pod: str,
+        root: Path,
+        relative: str,
+        source: Path,
+        *,
+        size: int,
+        expected_sha256: str,
+    ) -> None:
+        existing = self._remote_file_info(pod, root, relative)
+        if existing.get("exists") is True:
+            if (
+                existing.get("size") == size
+                and existing.get("sha256") == expected_sha256
+            ):
+                return
+            raise IntegrityError(
+                "campaign archive restore refuses to overwrite changed "
+                f"remote content: {relative}"
+            )
+        partial_relative = relative + ".brunner-part"
+        partial = self._remote_file_info(
+            pod,
+            root,
+            partial_relative,
+        )
+        offset = int(partial.get("size") or 0)
+        if offset > size:
+            offset = 0
+        if offset:
+            prefix_digest = hashlib.sha256()
+            remaining = offset
+            with source.open("rb") as stream:
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    prefix_digest.update(chunk)
+                    remaining -= len(chunk)
+            if (
+                remaining
+                or partial.get("sha256") != prefix_digest.hexdigest()
+            ):
+                offset = 0
+        with source.open("rb") as stream:
+            stream.seek(offset)
+            if size == 0 and offset == 0:
+                self._write_remote_chunk(
+                    pod,
+                    root,
+                    relative,
+                    offset=0,
+                    total_size=0,
+                    data=b"",
+                )
+            while offset < size:
+                data = stream.read(
+                    min(
+                        self.campaign.controller.retrieval_chunk_bytes,
+                        size - offset,
+                    )
+                )
+                if not data:
+                    raise IntegrityError(
+                        "campaign archive source ended early during restore: "
+                        f"{relative} at {offset}"
+                    )
+                self._write_remote_chunk(
+                    pod,
+                    root,
+                    relative,
+                    offset=offset,
+                    total_size=size,
+                    data=data,
+                )
+                offset += len(data)
+        self._commit_remote_file(
+            pod,
+            root,
+            relative,
+            size=size,
+            sha256=expected_sha256,
+        )
+
+    def _upload_bytes(
+        self,
+        pod: str,
+        root: Path,
+        relative: str,
+        content: bytes,
+    ) -> None:
+        descriptor, name = tempfile.mkstemp(
+            prefix="brunner-archive-",
+            suffix=".json",
+        )
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            temporary.write_bytes(content)
+            self._upload_file(
+                pod,
+                root,
+                relative,
+                temporary,
+                size=len(content),
+                expected_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _restore_archive(self, archive: dict[str, Any]) -> None:
+        pod_resource = self._transfer_pod(write=True)
+        pod = str(pod_resource["metadata"]["name"])
+        role = "archive-writer"
+        self.client.delete("pod", pod, wait=True)
+        self.client.delete("networkpolicy", pod, wait=True)
+        self.client.apply(
+            self._transfer_network_policy(pod, role=role)
+        )
+        self.client.apply(pod_resource)
+        try:
+            self._wait_transfer_pod(pod)
+            expected_manifest = archive["manifest_sha256"]
+            existing_manifest = self._remote_file_info(
+                pod,
+                RESULTS_ROOT,
+                RESULT_MANIFEST,
+            )
+            if (
+                existing_manifest.get("exists") is True
+                and existing_manifest.get("sha256") != expected_manifest
+            ):
+                raise IntegrityError(
+                    "results PVC already contains a different campaign "
+                    "archive"
+                )
+            campaign_record = archive["files"]["campaign.json"]
+            existing_state = self._remote_file_info(
+                pod,
+                CONTROL_ROOT,
+                "campaign.json",
+            )
+            if existing_state.get("exists") is True and (
+                existing_state.get("size") != campaign_record["size"]
+                or existing_state.get("sha256")
+                != campaign_record["sha256"]
+            ):
+                raise IntegrityError(
+                    "control PVC already contains different campaign state"
+                )
+
+            for relative, record in sorted(archive["files"].items()):
+                self._upload_file(
+                    pod,
+                    RESULTS_ROOT,
+                    relative,
+                    archive["root"] / relative,
+                    size=int(record["size"]),
+                    expected_sha256=str(record["sha256"]),
+                )
+            manifest_path = archive["manifest_path"]
+            self._upload_file(
+                pod,
+                RESULTS_ROOT,
+                RESULT_MANIFEST,
+                manifest_path,
+                size=manifest_path.stat().st_size,
+                expected_sha256=expected_manifest,
+            )
+            for trial in archive["state"]["trials"]:
+                test_id = str(trial["test_id"])
+                relative = f"trials/{test_id}/metadata/manifest.json"
+                record = archive["files"][relative]
+                self._upload_file(
+                    pod,
+                    CONTROL_ROOT,
+                    relative,
+                    archive["root"] / relative,
+                    size=int(record["size"]),
+                    expected_sha256=str(record["sha256"]),
+                )
+            state_path = archive["root"] / "campaign.json"
+            self._upload_file(
+                pod,
+                CONTROL_ROOT,
+                "campaign.json",
+                state_path,
+                size=int(campaign_record["size"]),
+                expected_sha256=str(campaign_record["sha256"]),
+            )
+            self._upload_file(
+                pod,
+                CONTROL_ROOT,
+                "campaign.json.bak",
+                state_path,
+                size=int(campaign_record["size"]),
+                expected_sha256=str(campaign_record["sha256"]),
+            )
+            marker = json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "campaign_id": self.campaign.plan.campaign_id,
+                    "archive_manifest_sha256": expected_manifest,
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode() + b"\n"
+            self._upload_bytes(
+                pod,
+                CONTROL_ROOT,
+                RESUME_ARCHIVE_MARKER,
+                marker,
+            )
+        finally:
+            self.client.delete("pod", pod, wait=True)
+            self.client.delete("networkpolicy", pod, wait=True)
 
     def _download_file(
         self,
@@ -2510,6 +3024,15 @@ class ClusterCampaignClient:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_name(target.name + ".part")
+        if target.is_symlink() or partial.is_symlink():
+            raise IntegrityError(
+                f"campaign archive destination contains a symlink: {target}"
+            )
+        if target.exists() and not target.is_file():
+            raise IntegrityError(
+                "campaign archive destination contains a non-file at "
+                f"{target}"
+            )
         if target.is_file():
             if (
                 target.stat().st_size == size
@@ -2542,7 +3065,168 @@ class ClusterCampaignClient:
             )
         partial.replace(target)
 
-    def retrieve(self, destination: Path) -> dict[str, Any]:
+    def _assert_local_archive_tree(self, root: Path) -> None:
+        if not root.exists():
+            return
+        if not root.is_dir() or root.is_symlink():
+            raise IntegrityError(
+                f"campaign archive path is unsafe: {root}"
+            )
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise IntegrityError(
+                    f"campaign archive path contains a symlink: {path}"
+                )
+
+    def _check_existing_archive_identity(
+        self,
+        root: Path,
+        *,
+        require_manifest: bool,
+    ) -> None:
+        if not root.exists() or not any(root.iterdir()):
+            return
+        manifest_path = root / RESULT_MANIFEST
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            if not require_manifest:
+                return
+            raise IntegrityError(
+                "campaign archive destination is nonempty but has no "
+                f"valid {RESULT_MANIFEST}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as error:
+            raise IntegrityError(
+                "existing campaign archive manifest is unreadable"
+            ) from error
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("campaign_id")
+            != self.campaign.plan.campaign_id
+        ):
+            raise IntegrityError(
+                "campaign archive destination belongs to another campaign"
+            )
+
+    def _prepare_local_sync(
+        self,
+        destination: Path,
+    ) -> tuple[Path, Path]:
+        if not destination.name:
+            raise IntegrityError(
+                "campaign archive destination must not be a filesystem root"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.with_name(
+            f".{destination.name}.brunner-sync"
+        )
+        backup = destination.with_name(
+            f".{destination.name}.brunner-backup"
+        )
+        for path in (destination, staging, backup):
+            self._assert_local_archive_tree(path)
+
+        if backup.exists():
+            load_campaign_archive(
+                backup,
+                expected_campaign_id=self.campaign.plan.campaign_id,
+            )
+            try:
+                load_campaign_archive(
+                    destination,
+                    expected_campaign_id=self.campaign.plan.campaign_id,
+                )
+            except IntegrityError:
+                if destination.exists():
+                    shutil.rmtree(destination)
+                backup.replace(destination)
+            else:
+                shutil.rmtree(backup)
+
+        self._check_existing_archive_identity(
+            destination,
+            require_manifest=True,
+        )
+        self._check_existing_archive_identity(
+            staging,
+            require_manifest=False,
+        )
+        staging.mkdir(parents=True, exist_ok=True)
+        return staging, backup
+
+    def _seed_staging_file(
+        self,
+        source_root: Path,
+        staging_root: Path,
+        record: dict[str, Any],
+    ) -> None:
+        relative = str(record["path"])
+        source = source_root / relative
+        target = staging_root / relative
+        partial = target.with_name(target.name + ".part")
+        if target.exists() or partial.exists() or not source.is_file():
+            return
+        if source.is_symlink():
+            raise IntegrityError(
+                f"campaign archive contains a symlink: {source}"
+            )
+        if (
+            source.stat().st_size != int(record["size"])
+            or sha256_file(source) != str(record["sha256"])
+        ):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.link(source, target)
+
+    def _prune_staging_archive(
+        self,
+        staging: Path,
+        records: list[dict[str, Any]],
+    ) -> None:
+        expected = {
+            str(record["path"])
+            for record in records
+        }
+        expected.add(RESULT_MANIFEST)
+        for path in sorted(staging.rglob("*"), reverse=True):
+            if path.is_symlink():
+                raise IntegrityError(
+                    f"campaign archive staging contains a symlink: {path}"
+                )
+            relative = path.relative_to(staging).as_posix()
+            if path.is_file() and relative not in expected:
+                path.unlink()
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    def _publish_local_archive(
+        self,
+        destination: Path,
+        staging: Path,
+        backup: Path,
+    ) -> None:
+        if backup.exists():
+            raise IntegrityError(
+                f"campaign archive backup was not recovered: {backup}"
+            )
+        if destination.exists():
+            destination.replace(backup)
+        try:
+            staging.replace(destination)
+        except Exception:
+            if not destination.exists() and backup.exists():
+                backup.replace(destination)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+
+    def _remote_manifest_identity(
+        self,
+    ) -> tuple[str, int, dict[str, Any] | None]:
         status_config_map = self.client.get(
             "configmap",
             self.resources.status_config_map,
@@ -2558,17 +3242,31 @@ class ClusterCampaignClient:
                 f"results PVC does not exist: {self.resources.results_claim}"
             )
         annotations = claim.get("metadata", {}).get("annotations", {})
-        if status is not None and status.get("result_ready") is not True:
-            raise BackendRequestError("campaign result bundle is not ready")
-        expected_manifest_sha256 = (
+        status_sha256 = (
             status.get("result_manifest_sha256")
-            if status is not None
-            else annotations.get(RESULT_MANIFEST_SHA256_ANNOTATION)
+            if isinstance(status, dict)
+            else None
+        )
+        status_size = (
+            status.get("result_manifest_size")
+            if isinstance(status, dict)
+            else None
+        )
+        annotation_sha256 = annotations.get(
+            RESULT_MANIFEST_SHA256_ANNOTATION
+        )
+        annotation_size = annotations.get(
+            RESULT_MANIFEST_SIZE_ANNOTATION
+        )
+        expected_manifest_sha256 = (
+            annotation_sha256
+            if isinstance(annotation_sha256, str)
+            else status_sha256
         )
         raw_manifest_size = (
-            status.get("result_manifest_size")
-            if status is not None
-            else annotations.get(RESULT_MANIFEST_SIZE_ANNOTATION)
+            annotation_size
+            if annotation_size is not None
+            else status_size
         )
         try:
             manifest_size = int(raw_manifest_size)
@@ -2576,71 +3274,300 @@ class ClusterCampaignClient:
             manifest_size = None
         if (
             not isinstance(expected_manifest_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                expected_manifest_sha256,
+            )
+            is None
             or not isinstance(manifest_size, int)
+            or manifest_size <= 0
         ):
             raise IntegrityError(
                 "campaign status has no valid result manifest identity"
             )
-        pod_resource = self._retrieval_pod()
+        return expected_manifest_sha256, manifest_size, status
+
+    def _parse_remote_manifest(
+        self,
+        manifest_bytes: bytes,
+    ) -> dict[str, Any]:
+        try:
+            manifest = json.loads(manifest_bytes)
+        except json.JSONDecodeError as error:
+            raise IntegrityError(
+                "campaign result manifest is not valid JSON"
+            ) from error
+        if not isinstance(manifest, dict):
+            raise IntegrityError(
+                "campaign result manifest must be an object"
+            )
+        if manifest.get("schema_version") not in {"1.0", "2.0"}:
+            raise IntegrityError(
+                "campaign result manifest has an unsupported schema version"
+            )
+        if manifest.get("campaign_id") != self.campaign.plan.campaign_id:
+            raise IntegrityError(
+                "result manifest belongs to a different campaign"
+            )
+        campaign_sha256 = manifest.get("campaign_sha256")
+        if (
+            not isinstance(campaign_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", campaign_sha256) is None
+        ):
+            raise IntegrityError(
+                "result manifest has no valid campaign definition digest"
+            )
+        records = manifest.get("files")
+        if not isinstance(records, list):
+            raise IntegrityError(
+                "campaign result manifest files must be an array"
+            )
+        paths: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise IntegrityError(
+                    "result manifest contains a malformed file record"
+                )
+            relative = Path(str(record.get("path") or ""))
+            if (
+                not relative.parts
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or relative.as_posix() == RESULT_MANIFEST
+            ):
+                raise IntegrityError(
+                    f"result manifest has unsafe path: {relative}"
+                )
+            relative_name = relative.as_posix()
+            if relative_name in paths:
+                raise IntegrityError(
+                    f"result manifest repeats a path: {relative_name}"
+                )
+            paths.add(relative_name)
+            try:
+                size = int(record["size"])
+                digest = str(record["sha256"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise IntegrityError(
+                    "result manifest contains invalid file metadata: "
+                    f"{relative_name}"
+                ) from error
+            if size < 0 or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise IntegrityError(
+                    "result manifest contains invalid file metadata: "
+                    f"{relative_name}"
+                )
+        return manifest
+
+    def sync(self, destination: Path) -> dict[str, Any]:
+        requested_destination = destination.expanduser()
+        if requested_destination.is_symlink():
+            raise IntegrityError(
+                "campaign archive destination is unsafe: "
+                f"{requested_destination}"
+            )
+        destination = requested_destination.resolve()
+        staging, backup = self._prepare_local_sync(destination)
+
+        pod_resource = self._transfer_pod(write=False)
         pod = str(pod_resource["metadata"]["name"])
+        role = "archive-reader"
         self.client.delete("pod", pod, wait=True)
         self.client.delete("networkpolicy", pod, wait=True)
-        self.client.apply(self._retrieval_network_policy(pod))
+        self.client.apply(
+            self._transfer_network_policy(pod, role=role)
+        )
         self.client.apply(pod_resource)
         try:
-            self._wait_reader(pod)
-            manifest_bytes = self._read(
-                pod,
-                RESULT_MANIFEST,
-                0,
-                manifest_size,
-            )
-            observed = hashlib.sha256(manifest_bytes).hexdigest()
-            if observed != expected_manifest_sha256:
-                raise IntegrityError(
-                    "result manifest checksum mismatch: "
-                    f"{observed} != {expected_manifest_sha256}"
+            self._wait_transfer_pod(pod)
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                expected_sha256, manifest_size, status = (
+                    self._remote_manifest_identity()
                 )
-            manifest = json.loads(manifest_bytes)
-            if manifest.get("campaign_sha256") != self.campaign.sha256:
-                raise IntegrityError(
-                    "result manifest belongs to a different campaign "
-                    "definition"
+                manifest_bytes = self._read(
+                    pod,
+                    RESULT_MANIFEST,
+                    0,
+                    manifest_size,
                 )
-            destination = destination.expanduser().resolve()
-            destination.mkdir(parents=True, exist_ok=True)
-            for record in manifest.get("files", ()):
-                if not isinstance(record, dict):
-                    raise IntegrityError(
-                        "result manifest contains a malformed file record"
+                observed = hashlib.sha256(manifest_bytes).hexdigest()
+                if observed != expected_sha256:
+                    last_error = IntegrityError(
+                        "result manifest changed during synchronization: "
+                        f"{observed} != {expected_sha256}"
                     )
-                relative = Path(str(record.get("path") or ""))
-                if (
-                    not relative.parts
-                    or relative.is_absolute()
-                    or ".." in relative.parts
-                ):
-                    raise IntegrityError(
-                        f"result manifest has unsafe path: {relative}"
-                    )
-                self._download_file(pod, destination, record)
-            manifest_path = destination / RESULT_MANIFEST
-            partial_manifest = manifest_path.with_name(
-                manifest_path.name + ".part"
+                    continue
+                manifest = self._parse_remote_manifest(manifest_bytes)
+                try:
+                    for record in manifest["files"]:
+                        self._seed_staging_file(
+                            destination,
+                            staging,
+                            record,
+                        )
+                        self._download_file(pod, staging, record)
+                except IntegrityError as error:
+                    last_error = error
+                    if attempt < 3:
+                        continue
+                    raise
+                self._prune_staging_archive(
+                    staging,
+                    manifest["files"],
+                )
+                manifest_path = staging / RESULT_MANIFEST
+                partial_manifest = manifest_path.with_name(
+                    manifest_path.name + ".part"
+                )
+                with partial_manifest.open("wb") as stream:
+                    stream.write(manifest_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                partial_manifest.replace(manifest_path)
+                archive = load_campaign_archive(
+                    staging,
+                    expected_campaign_id=self.campaign.plan.campaign_id,
+                )
+                self._validate_archive_compatibility(archive)
+                self._publish_local_archive(
+                    destination,
+                    staging,
+                    backup,
+                )
+                return {
+                    "campaign_id": self.campaign.plan.campaign_id,
+                    "destination": str(destination),
+                    "files": len(manifest["files"]),
+                    "manifest_sha256": observed,
+                    "terminal": archive["terminal"],
+                    "remote_status": (
+                        status.get("status")
+                        if isinstance(status, dict)
+                        else None
+                    ),
+                }
+            if last_error is not None:
+                raise last_error
+            raise IntegrityError(
+                "campaign archive synchronization did not complete"
             )
-            partial_manifest.write_bytes(manifest_bytes)
-            partial_manifest.replace(manifest_path)
-            return {
-                "campaign_id": self.campaign.plan.campaign_id,
-                "destination": str(destination),
-                "files": len(manifest.get("files", ())),
-                "manifest_sha256": observed,
-            }
         finally:
             self.client.delete("pod", pod, wait=True)
             self.client.delete("networkpolicy", pod, wait=True)
 
-    def delete(self, *, delete_results: bool) -> dict[str, Any]:
+    def retire(self, archive_root: Path) -> dict[str, Any]:
+        result_claim = self.client.get(
+            "pvc",
+            self.resources.results_claim,
+        )
+        control_claim = self.client.get(
+            "pvc",
+            self.resources.control_claim,
+        )
+        if result_claim is None and control_claim is None:
+            archive = load_campaign_archive(
+                archive_root,
+                expected_campaign_id=self.campaign.plan.campaign_id,
+                require_terminal=True,
+                require_resumable=True,
+            )
+            return {
+                "campaign_id": self.campaign.plan.campaign_id,
+                "archive": str(archive["root"]),
+                "manifest_sha256": archive["manifest_sha256"],
+                "already_retired": True,
+                "deleted_claims": [],
+            }
+        if result_claim is None:
+            raise IntegrityError(
+                "cannot verify retirement because the results PVC is missing"
+            )
+        self.sync(archive_root)
+        archive = load_campaign_archive(
+            archive_root,
+            expected_campaign_id=self.campaign.plan.campaign_id,
+            require_terminal=True,
+            require_resumable=True,
+        )
+        result_claim = self.client.get(
+            "pvc",
+            self.resources.results_claim,
+        )
+        if result_claim is None:
+            raise IntegrityError(
+                "results PVC disappeared during verified retirement"
+            )
+        annotations = result_claim.get("metadata", {}).get(
+            "annotations",
+            {},
+        )
+        remote_sha256 = annotations.get(
+            RESULT_MANIFEST_SHA256_ANNOTATION
+        )
+        remote_size = annotations.get(RESULT_MANIFEST_SIZE_ANNOTATION)
+        if (
+            remote_sha256 != archive["manifest_sha256"]
+            or str(remote_size)
+            != str(archive["manifest_path"].stat().st_size)
+        ):
+            raise IntegrityError(
+                "local archive does not match the finalized results PVC; "
+                "run campaign-sync again before retirement"
+            )
+        remote_campaign_sha256 = annotations.get(
+            CAMPAIGN_SHA256_ANNOTATION
+        )
+        if remote_campaign_sha256 != archive["manifest"].get(
+            "campaign_sha256"
+        ):
+            raise IntegrityError(
+                "local archive campaign revision does not match the "
+                "results PVC"
+            )
+        status_config_map = self.client.get(
+            "configmap",
+            self.resources.status_config_map,
+        )
+        deployment = self.client.get(
+            "deployment",
+            self.resources.deployment,
+        )
+        if deployment is not None:
+            raw_status = (
+                status_config_map.get("data", {}).get("status.json")
+                if status_config_map is not None
+                else None
+            )
+            status = (
+                json.loads(raw_status)
+                if isinstance(raw_status, str)
+                else None
+            )
+            if (
+                not isinstance(status, dict)
+                or status.get("result_ready") is not True
+                or status.get("result_manifest_sha256")
+                != archive["manifest_sha256"]
+            ):
+                raise BackendRequestError(
+                    "campaign controller has not confirmed the verified "
+                    "terminal archive; synchronization and retirement must "
+                    "wait"
+                )
+
+        campaign_labels = (
+            f"dev.brunner/campaign={self.resources.base}"
+        )
+        claims = self.client.get(
+            "pvc",
+            labels=campaign_labels,
+        ) or {"items": []}
+        claim_names = sorted(
+            str(claim.get("metadata", {}).get("name"))
+            for claim in claims.get("items", ())
+            if claim.get("metadata", {}).get("name")
+        )
         self.client.delete(
             "deployment",
             self.resources.deployment,
@@ -2648,61 +3575,45 @@ class ClusterCampaignClient:
         )
         self.client.delete(
             "pod",
-            labels=f"dev.brunner/campaign={self.resources.base}",
+            labels=campaign_labels,
             wait=True,
         )
         self.client.delete(
             "job",
-            labels=f"dev.brunner/campaign={self.resources.base}",
+            labels=campaign_labels,
             wait=True,
         )
         self.client.delete(
             "pod",
-            labels=f"dev.brunner/campaign={self.resources.base}",
+            labels=campaign_labels,
             wait=True,
         )
         self.client.delete(
             "networkpolicy",
-            labels=f"dev.brunner/campaign={self.resources.base}",
+            labels=campaign_labels,
             wait=True,
         )
-        claims = self.client.get(
-            "pvc",
-            labels=f"dev.brunner/campaign={self.resources.base}",
-        ) or {"items": []}
-        preserved = {
-            self.resources.control_claim,
-            self.resources.results_claim,
-        }
-        for claim in claims.get("items", ()):
-            name = claim.get("metadata", {}).get("name")
-            if isinstance(name, str) and name not in preserved:
-                self.client.delete("pvc", name, wait=True)
+        self.client.delete(
+            "service",
+            labels=campaign_labels,
+            wait=True,
+        )
+        for name in claim_names:
+            self.client.delete("pvc", name, wait=True)
         for kind, name in (
-            ("service", self.resources.service),
             ("deployment", self.resources.proxy),
-            ("service", self.resources.proxy),
             ("configmap", self.resources.proxy),
             ("configmap", self.resources.status_config_map),
             ("rolebinding", self.resources.role),
             ("role", self.resources.role),
             ("serviceaccount", self.resources.service_account),
             ("configmap", self.resources.lock_config_map),
-            ("pvc", self.resources.control_claim),
         ):
             self.client.delete(kind, name, wait=True)
-        if delete_results:
-            self.client.delete(
-                "pvc",
-                self.resources.results_claim,
-                wait=True,
-            )
         return {
             "campaign_id": self.campaign.plan.campaign_id,
-            "deleted_results": delete_results,
-            "results_claim": (
-                None
-                if delete_results
-                else self.resources.results_claim
-            ),
+            "archive": str(archive["root"]),
+            "manifest_sha256": archive["manifest_sha256"],
+            "already_retired": False,
+            "deleted_claims": claim_names,
         }
