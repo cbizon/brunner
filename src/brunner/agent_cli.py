@@ -11,11 +11,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from brunner.definition import RuntimeDefaults
+from brunner.backends import TrialContinuation
 from brunner.failure import failure_from_exception
 from brunner.io import write_json_atomic
 from brunner.pipeline import summarize_pipeline_state
 from brunner.providers import ProviderSettings
-from brunner.runner import run_staged_trial
+from brunner.runner import prepare_trial_continuation, run_staged_trial
 from brunner.runtime_protocol import validate_trial_runtime
 from brunner.trial import load_trial_identity
 
@@ -98,9 +99,13 @@ def main() -> None:
             validate_trial_runtime(args.trial)
             identity = load_trial_identity(args.trial)
             runtime = None
+            continuation_value = os.environ.get(
+                "BRUNNER_CONTINUATION_REQUEST"
+            )
             if (
                 args.timeout_seconds is not None
                 or args.finalization_seconds is not None
+                or continuation_value is not None
             ):
                 staged = json.loads(
                     (args.trial / "metadata/agent-run.json").read_text()
@@ -119,6 +124,32 @@ def main() -> None:
                         else defaults.finalization_seconds
                     ),
                 )
+                if continuation_value is not None:
+                    continuation_data = json.loads(continuation_value)
+                    if not isinstance(continuation_data, dict):
+                        raise ValueError(
+                            "BRUNNER_CONTINUATION_REQUEST must be a JSON "
+                            "object"
+                        )
+                    continuation = TrialContinuation(
+                        request_id=str(
+                            continuation_data.get("request_id") or ""
+                        ),
+                        additional_attempts=int(
+                            continuation_data.get(
+                                "additional_attempts",
+                                1,
+                            )
+                        ),
+                        timeout_seconds=continuation_data.get(
+                            "timeout_seconds"
+                        ),
+                    )
+                    runtime = prepare_trial_continuation(
+                        args.trial,
+                        continuation,
+                        runtime,
+                    )
             state = run_staged_trial(
                 args.trial,
                 ProviderSettings(

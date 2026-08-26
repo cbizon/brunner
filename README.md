@@ -95,6 +95,8 @@ brunner --benchmark examples.text_benchmark.definition \
 brunner --benchmark examples.text_benchmark.definition \
   campaign-status examples.text_benchmark.campaign
 brunner --benchmark examples.text_benchmark.definition \
+  campaign-continue examples.text_benchmark.campaign FAILED_TEST_ID
+brunner --benchmark examples.text_benchmark.definition \
   campaign-sync examples.text_benchmark.campaign ./results
 brunner campaign-monitor ./results
 brunner --benchmark examples.text_benchmark.definition \
@@ -108,6 +110,14 @@ verifies the terminal archive, and deletes all campaign-owned cluster resources,
 including control, results, and trial PVCs. The local archive is then the
 durable campaign record and `campaign-monitor` serves it without Kubernetes or
 benchmark code.
+
+`campaign-continue` is an explicit paid-session recovery operation for a
+completed `provider_error` trial whose trial PVC and provider session were
+retained. It reuses the exact staged workspace, provider home, session ID,
+workload identity, and attempt history, and permits exactly one additional
+provider launch. If the saved session cannot be resumed, Brunner fails without
+starting a new session. The command does not apply to candidate failures,
+successful trials, deleted PVCs, or arbitrary infrastructure retries.
 
 To add trials later, append new caller-owned IDs to the campaign and recreate
 the remote control plane from the terminal archive:

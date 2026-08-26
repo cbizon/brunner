@@ -11,6 +11,7 @@ from brunner.backends.base import (
     BackendCapacity,
     BackendHandle,
     BackendSnapshot,
+    TrialContinuation,
     WorkloadSpec,
     native_resource_name,
 )
@@ -227,6 +228,8 @@ class ContainerBackend:
         handle: BackendHandle,
         workload: WorkloadSpec,
         generation: int,
+        *,
+        continuation: TrialContinuation | None = None,
     ) -> BackendHandle:
         raise BackendRequestError(
             "automatic infrastructure restart is not supported by the "

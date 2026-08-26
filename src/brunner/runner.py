@@ -7,7 +7,7 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Callable
@@ -18,6 +18,7 @@ from brunner.contract import (
     render_final_response_handoff,
     validate_final_response,
 )
+from brunner.backends import TrialContinuation
 from brunner.definition import BenchmarkDefinition, RuntimeDefaults
 from brunner.errors import ContractError
 from brunner.io import write_json_atomic
@@ -1086,6 +1087,105 @@ def launched_attempt_count(attempts: list[dict[str, Any]]) -> int:
     )
 
 
+def prepare_trial_continuation(
+    trial: Path,
+    continuation: TrialContinuation,
+    runtime: RuntimeDefaults,
+) -> RuntimeDefaults:
+    continuation.validate()
+    status_path = trial / "status.json"
+    if not status_path.is_file():
+        raise RuntimeError(
+            "cannot continue a trial without persistent provider state"
+        )
+    state = json.loads(status_path.read_text())
+    if not isinstance(state, dict):
+        raise RuntimeError("persistent trial state must be an object")
+    attempts = state.get("attempts")
+    if not isinstance(attempts, list):
+        raise RuntimeError("persistent trial attempts must be a list")
+    active = state.get("active_continuation")
+    if isinstance(active, dict) and active.get("request_id") == (
+        continuation.request_id
+    ):
+        target_attempts = active.get("target_attempts")
+        if not isinstance(target_attempts, int):
+            raise RuntimeError(
+                "active continuation has no valid target attempt count"
+            )
+        if (
+            state.get("status") in PIPELINE_TERMINAL_STATUSES
+            and launched_attempt_count(attempts) >= target_attempts
+        ):
+            raise RuntimeError(
+                "continuation already consumed its additional provider "
+                "attempt"
+            )
+    else:
+        if state.get("status") != "provider_error":
+            raise RuntimeError(
+                "only a terminal provider_error trial can be continued"
+            )
+        if isinstance(state.get("final_response"), dict):
+            raise RuntimeError(
+                "cannot continue a trial that already has a provider result"
+            )
+        if state.get("session_started") is not True or not isinstance(
+            state.get("session_id"),
+            str,
+        ):
+            raise RuntimeError(
+                "cannot continue a trial without a resumable provider session"
+            )
+        baseline_attempts = launched_attempt_count(attempts)
+        if baseline_attempts < 1:
+            raise RuntimeError(
+                "cannot continue a trial that never launched the provider"
+            )
+        if isinstance(active, dict):
+            active["status"] = "finished"
+            active["finished_at"] = utc_now()
+        target_attempts = baseline_attempts + continuation.additional_attempts
+        active = {
+            **continuation.to_dict(),
+            "status": "running",
+            "started_at": utc_now(),
+            "baseline_attempts": baseline_attempts,
+            "target_attempts": target_attempts,
+        }
+        state["active_continuation"] = active
+        history = state.setdefault("continuations", [])
+        if not isinstance(history, list):
+            raise RuntimeError("persistent trial continuations must be a list")
+        history.append(dict(active))
+
+    timeout_seconds = (
+        continuation.timeout_seconds
+        if continuation.timeout_seconds is not None
+        else runtime.timeout_seconds
+    )
+    if timeout_seconds > runtime.timeout_seconds:
+        raise RuntimeError(
+            "continuation timeout cannot exceed the staged trial timeout"
+        )
+    now = time.time()
+    state["status"] = "retrying"
+    state["deadline_epoch"] = now + timeout_seconds
+    state["finalization_started"] = False
+    state.pop("finalization_started_at", None)
+    state.pop("completed_at", None)
+    state.pop("failure", None)
+    state.pop("harness_failure", None)
+    state.pop("interruption", None)
+    clear_retry_state(state)
+    write_json_atomic(status_path, state)
+    return replace(
+        runtime,
+        max_attempts=target_attempts,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def next_attempt_number(attempts: list[dict[str, Any]]) -> int:
     return max(
         (
@@ -1175,6 +1275,29 @@ def write_terminal_artifacts(
     adapter: ProviderAdapter,
 ) -> None:
     if state["status"] in PIPELINE_TERMINAL_STATUSES:
+        active = state.get("active_continuation")
+        if isinstance(active, dict):
+            continuation_status = (
+                "complete"
+                if state["status"] in PROVIDER_FINAL_STATUSES
+                else "failed"
+            )
+            updates = {
+                "status": continuation_status,
+                "finished_at": state.get("completed_at", utc_now()),
+                "outcome": state["status"],
+            }
+            active.update(updates)
+            history = state.get("continuations")
+            if isinstance(history, list):
+                for record in reversed(history):
+                    if (
+                        isinstance(record, dict)
+                        and record.get("request_id")
+                        == active.get("request_id")
+                    ):
+                        record.update(updates)
+                        break
         clear_retry_state(state)
         write_json_atomic(trial / "status.json", state)
     created_epoch = float(state.get("created_epoch", time.time()))
@@ -1601,6 +1724,27 @@ def _run_configured_trial(
             attempt["wait_category"] = failure.wait_category
             attempt["retry_at_epoch"] = failure.retry_at_epoch
 
+        active_continuation = state.get("active_continuation")
+        if (
+            resume_unavailable
+            and isinstance(active_continuation, dict)
+            and active_continuation.get("strict_resume") is True
+        ):
+            attempt["status"] = "failed"
+            attempt["failure"] = (
+                "saved provider session is unavailable; strict continuation "
+                "will not start a new paid session"
+            )
+            active_continuation["status"] = "failed"
+            active_continuation["finished_at"] = utc_now()
+            active_continuation["failure"] = attempt["failure"]
+            state["status"] = "provider_error"
+            state["failure"] = attempt["failure"]
+            state["completed_at"] = utc_now()
+            write_json_atomic(state_path, state)
+            write_terminal_artifacts(trial, state, adapter)
+            return state
+
         final_response = None
         if return_code == 0 and outcome["terminal_result_succeeded"]:
             final_response = load_final_response(
@@ -1661,6 +1805,9 @@ def _run_configured_trial(
             )
 
         if final_response is not None:
+            if isinstance(active_continuation, dict):
+                active_continuation["status"] = "complete"
+                active_continuation["finished_at"] = utc_now()
             state["status"] = str(final_response["status"])
             state["completed_at"] = utc_now()
             state["final_response"] = final_response

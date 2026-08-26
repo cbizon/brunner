@@ -17,6 +17,7 @@ from brunner.backends import (
     BackendCapacity,
     BackendHandle,
     BackendSnapshot,
+    TrialContinuation,
     WorkloadSpec,
 )
 from brunner.campaign import (
@@ -26,7 +27,7 @@ from brunner.campaign import (
     default_workload_factory,
 )
 from brunner.contract import load_output_contract
-from brunner.definition import ArtifactPolicy
+from brunner.definition import ArtifactPolicy, QualitativeReviewDefinition
 from brunner.dashboard import write_campaign_dashboard
 from brunner.errors import (
     ArtifactTransferError,
@@ -41,6 +42,7 @@ from brunner.evaluation import (
     finalize_evaluation,
 )
 from brunner.failure import failure_record
+from brunner.providers import ProviderSettings
 from examples.text_benchmark.definition import build_definition
 
 
@@ -80,6 +82,7 @@ class ImmediateBackend:
     name = "fake"
     agent_isolation = "container"
     trusted_evaluation = "kubernetes"
+    retain_failed_storage = False
 
     def __init__(self) -> None:
         self.handles: dict[str, BackendHandle] = {}
@@ -454,6 +457,32 @@ class RetryableInfrastructureBackend(ImmediateBackend):
             trial=workload.trial,
             metadata={"submitted_at": f"2026-08-04T12:00:0{generation}+00:00"},
         )
+
+
+class ContinuationBackend(ImmediateBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.continuation: TrialContinuation | None = None
+
+    def restart(
+        self,
+        handle: BackendHandle,
+        workload: WorkloadSpec,
+        generation: int,
+        *,
+        continuation: TrialContinuation | None = None,
+    ) -> BackendHandle:
+        self.continuation = continuation
+        return BackendHandle(
+            backend=self.name,
+            workload_id=workload.workload_id,
+            native_id=f"{workload.workload_id}-c{generation}",
+            trial=workload.trial,
+            metadata={"submitted_at": "2026-08-26T12:00:00+00:00"},
+        )
+
+    def inspect(self, handle: BackendHandle) -> BackendSnapshot:
+        return BackendSnapshot(phase="running")
 
 
 class InterruptedInfrastructureBackend(RetryableInfrastructureBackend):
@@ -2579,6 +2608,107 @@ def test_campaign_stops_restarting_after_infrastructure_limit(
     assert completed["trials"][0]["attempts"]["infrastructure"] == 1
 
 
+def test_campaign_continues_failed_provider_on_retained_backend(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ContinuationBackend()
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="continue",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("continue-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+    state = runner.initialize()
+    entry = state["trials"][0]
+    handle = BackendHandle(
+        backend=backend.name,
+        workload_id="continue-a",
+        native_id="continue-a",
+        trial=Path(entry["trial"]),
+    )
+    entry.update(
+        {
+            "phase": "complete",
+            "outcome": "failed",
+            "handle": handle.to_dict(),
+            "pipeline": {
+                "status": "provider_error",
+                "provider_result_present": False,
+            },
+            "benchmark": {"status": "not_run"},
+            "evaluation": {"status": "not_run"},
+            "collected_trial": str(
+                runner.control_root / "collected" / "continue-a"
+            ),
+        }
+    )
+    collected = Path(entry["collected_trial"])
+    collected.mkdir(parents=True)
+    (collected / "old.txt").write_text("old")
+    state["status"] = "complete"
+    runner._save(state)
+
+    requested = runner.request_continuation(
+        request_id="request-1",
+        test_id="continue-a",
+    )
+    advanced = runner.advance()
+
+    assert requested["trials"][0]["phase"] == "continuation_retrying"
+    assert advanced["trials"][0]["phase"] == "running"
+    assert advanced["trials"][0]["handle"]["native_id"] == "continue-a-c1"
+    assert advanced["trials"][0]["outcome"] is None
+    assert advanced["trials"][0]["continuations"][-1]["status"] == "running"
+    assert backend.continuation == TrialContinuation("request-1")
+    assert not collected.exists()
+
+
+def test_campaign_retains_provider_error_storage_for_continuation(
+    tmp_path: Path,
+) -> None:
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    backend = ImmediateBackend()
+    backend.retain_failed_storage = True
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="retain",
+            root=tmp_path / "campaign",
+            trials=(CampaignTrial("retain-a", "codex", "model-a"),),
+        ),
+        backend,
+        workload_factory=_workload,
+    )
+    state = runner.initialize()
+    entry = state["trials"][0]
+    entry["pipeline"] = {
+        "status": "provider_error",
+        "provider_result_present": False,
+    }
+    entry["outcome"] = "failed"
+    handle = BackendHandle(
+        backend=backend.name,
+        workload_id="retain-a",
+        native_id="retain-a",
+        trial=Path(entry["trial"]),
+    )
+
+    runner._cleanup_entry(state, entry, handle)
+
+    assert entry["phase"] == "complete"
+    assert entry["backend_storage_retained"] is True
+    assert entry["handle"]["metadata"]["retain_storage"] is True
+
+
 def test_campaign_does_not_evaluate_interrupted_infrastructure_run(
     tmp_path: Path,
     monkeypatch: Any,
@@ -2626,6 +2756,82 @@ def test_campaign_does_not_evaluate_interrupted_infrastructure_run(
     assert entry["evaluation"]["status"] == "not_run"
     assert any(
         event["type"] == "evaluation_skipped"
+        for event in completed["events"]
+    )
+
+
+def test_campaign_assesses_incomplete_pipeline_when_configured(
+    tmp_path: Path,
+) -> None:
+    definition = replace(
+        build_definition(),
+        qualitative_review=QualitativeReviewDefinition(
+            reviewer=ProviderSettings(
+                provider="codex",
+                model="review-model",
+            ),
+            required=True,
+            run_if_evaluation_failed=True,
+        ),
+    )
+    contract = load_output_contract(definition.contract_path)
+    backend = InterruptedInfrastructureBackend()
+    calls: list[bool] = []
+
+    def finalizer(
+        trial: Path,
+        *,
+        assessment_only: bool = False,
+    ) -> dict[str, Any]:
+        calls.append(assessment_only)
+        return {
+            "status": "not_run",
+            "assessment_status": "complete",
+            "required_assessments_complete": True,
+            "assessments": [
+                {
+                    "assessment_id": "qualitative-review",
+                    "status": "complete",
+                    "required": True,
+                }
+            ],
+            "reports": [],
+        }
+
+    runner = CampaignRunner(
+        definition,
+        contract,
+        CampaignPlan(
+            campaign_id="interrupted-assessment",
+            root=tmp_path / "campaign",
+            trials=(
+                CampaignTrial("interrupted-a", "codex", "model-a"),
+            ),
+            infrastructure_max_restarts=0,
+        ),
+        backend,
+        workload_factory=_workload,
+        evaluation_finalizer=finalizer,
+    )
+
+    runner.advance()
+    completed = runner.advance()
+
+    entry = completed["trials"][0]
+    assert calls == [True]
+    assert entry["phase"] == "complete"
+    assert entry["outcome"] == "failed"
+    assert entry["failure"]["reason"] == "AgentInterrupted"
+    assert entry["benchmark"] == {
+        "status": "not_run",
+        "succeeded": None,
+        "reason": "AgentInterrupted",
+    }
+    assert entry["evaluation"]["status"] == "not_run"
+    assert entry["evaluation"]["assessment_status"] == "complete"
+    assert entry["evaluation"]["required_assessments_complete"] is True
+    assert any(
+        event["type"] == "incomplete_trial_assessed"
         for event in completed["events"]
     )
 

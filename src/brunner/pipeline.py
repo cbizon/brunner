@@ -62,6 +62,8 @@ def summarize_pipeline_state(
         "signal": interruption.get("signal"),
         "signal_name": interruption.get("signal_name"),
         "failure": value.get("failure"),
+        "provider_failure_reason": last_attempt.get("failure_reason"),
+        "provider_api_status": last_attempt.get("api_status"),
         "infrastructure_failure": not provider_result_present,
         "infrastructure_reason": infrastructure_reason,
         "retryable_infrastructure": retryable_infrastructure,

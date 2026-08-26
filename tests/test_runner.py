@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from brunner import agent_cli
+from brunner.backends import TrialContinuation
 from brunner.contract import load_output_contract
 from brunner.definition import (
     BenchmarkDefinition,
@@ -23,6 +24,7 @@ from brunner.providers import CodexAdapter, ProviderSettings
 from brunner.runner import (
     continuation_prompt,
     finalization_prompt,
+    prepare_trial_continuation,
     process_group_alive,
     run_attempt,
     run_staged_trial,
@@ -1061,6 +1063,83 @@ print(json.dumps({
     assert timing["summary"]["subscription_wait_seconds"] > 0
 
 
+def test_claude_runner_stops_immediately_when_credits_are_exhausted(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity(
+            "claude-out-of-credits",
+            "claude",
+            "claude-fable-5",
+            None,
+        ),
+    )
+    binary = tmp_path / "claude"
+    _write_python_executable(
+        binary,
+        r"""
+import json
+
+print(json.dumps({
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+        "status": "rejected",
+        "resetsAt": 1788220800,
+        "overageDisabledReason": "out_of_credits",
+        "errorCode": "credits_required",
+        "canUserPurchaseCredits": True,
+    },
+}), flush=True)
+print(json.dumps({
+    "type": "result",
+    "is_error": True,
+    "api_error_status": 429,
+    "result": (
+        "You're out of usage credits. "
+        "Switch to another model to continue."
+    ),
+    "usage": {
+        "input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+    },
+}), flush=True)
+raise SystemExit(1)
+""",
+    )
+
+    state = run_trial(
+        benchmark,
+        contract,
+        trial,
+        ProviderSettings(
+            provider="claude",
+            model="claude-fable-5",
+        ),
+        executable=str(binary),
+        runtime=RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            max_attempts=20,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.02,
+            provider_exit_grace_seconds=0.05,
+        ),
+    )
+
+    assert state["status"] == "provider_error"
+    assert len(state["attempts"]) == 1
+    assert state["attempts"][0]["failure_reason"] == "out_of_credits"
+    assert state["attempts"][0]["wait_category"] is None
+    assert "out of usage credits" in state["failure"].lower()
+
+
 def test_claude_resume_repairs_missing_structured_final_response(
     tmp_path: Path,
 ) -> None:
@@ -2074,6 +2153,142 @@ def test_trial_stops_after_max_attempts(tmp_path: Path) -> None:
     assert "3 attempts that launched" in state["failure"]
     assert len(state["attempts"]) == 3
     assert all(attempt["provider_started"] for attempt in state["attempts"])
+
+
+def test_continuation_preserves_session_and_adds_one_attempt(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("continue-once", "codex", "model-a", None),
+    )
+    original = {
+        "schema_version": "1.0",
+        "test_id": "continue-once",
+        "provider": "codex",
+        "model": "model-a",
+        "effort": None,
+        "benchmark_id": benchmark.benchmark_id,
+        "benchmark_version": benchmark.version,
+        "contract_sha256": contract.sha256,
+        "status": "provider_error",
+        "failure": "out of usage credits",
+        "completed_at": "2026-08-26T12:00:00+00:00",
+        "deadline_epoch": 1,
+        "session_id": "saved-session",
+        "session_started": True,
+        "finalization_started": True,
+        "attempts": [
+            {
+                "number": 1,
+                "status": "failed",
+                "provider_started": True,
+                "failure_reason": "out_of_credits",
+            }
+        ],
+    }
+    (trial / "status.json").write_text(json.dumps(original))
+    runtime = RuntimeDefaults(max_attempts=1)
+
+    continued = prepare_trial_continuation(
+        trial,
+        TrialContinuation("request-1"),
+        runtime,
+    )
+    state = json.loads((trial / "status.json").read_text())
+
+    assert continued.max_attempts == 2
+    assert state["status"] == "retrying"
+    assert state["session_id"] == "saved-session"
+    assert state["session_started"] is True
+    assert state["attempts"] == original["attempts"]
+    assert state["active_continuation"]["baseline_attempts"] == 1
+    assert state["active_continuation"]["target_attempts"] == 2
+    assert "completed_at" not in state
+    assert "failure" not in state
+
+
+def test_strict_continuation_never_starts_a_new_session(
+    tmp_path: Path,
+) -> None:
+    benchmark = definition()
+    contract = load_output_contract(benchmark.contract_path)
+    trial = create_trial(
+        benchmark,
+        contract,
+        tmp_path / "tests",
+        TrialIdentity("strict-resume", "codex", "model-a", None),
+    )
+    (trial / "status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "test_id": "strict-resume",
+                "provider": "codex",
+                "model": "model-a",
+                "effort": None,
+                "benchmark_id": benchmark.benchmark_id,
+                "benchmark_version": benchmark.version,
+                "contract_sha256": contract.sha256,
+                "status": "provider_error",
+                "created_at": "2026-08-26T12:00:00+00:00",
+                "created_epoch": 1,
+                "deadline_epoch": 1,
+                "session_id": "saved-session",
+                "session_started": True,
+                "finalization_started": False,
+                "attempts": [
+                    {
+                        "number": 1,
+                        "status": "failed",
+                        "provider_started": True,
+                    }
+                ],
+            }
+        )
+    )
+    runtime = prepare_trial_continuation(
+        trial,
+        TrialContinuation("request-1"),
+        RuntimeDefaults(
+            timeout_seconds=5,
+            finalization_seconds=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+            max_attempts=1,
+        ),
+    )
+    binary = tmp_path / "missing-session"
+    _write_python_executable(
+        binary,
+        """
+import json
+print(json.dumps({
+    "type": "error",
+    "message": "No session found for requested identifier",
+}), flush=True)
+raise SystemExit(1)
+""",
+    )
+
+    state = run_staged_trial(
+        trial,
+        ProviderSettings(provider="codex", model="model-a"),
+        runtime=runtime,
+        executable=str(binary),
+    )
+
+    assert state["status"] == "provider_error"
+    assert len(state["attempts"]) == 2
+    assert state["attempts"][-1]["mode"] == "resume"
+    assert state["attempts"][-1]["session_reset"] is True
+    assert "will not start a new paid session" in state["failure"]
+    assert state["active_continuation"]["status"] == "failed"
+    assert state["continuations"][-1]["status"] == "failed"
 
 
 def test_interrupted_attempt_that_never_launched_does_not_consume_cap(

@@ -98,10 +98,14 @@ versioned Brunner contract.
 A benchmark enables that contract with `QualitativeReviewDefinition`, which
 supplies the fixed reviewer identity and policy. Brunner records the standard
 contract digest when it creates the trial and runs the review automatically
-after the Sterling evaluator result and selected evidence have been collected.
-The reviewer receives the same output schema that Brunner later uses to
-validate the response. This post-collection review does not rerun deterministic
-scoring or require the raw evaluator-only dataset.
+after the selected evidence has been collected. Normally the dossier includes
+Sterling's deterministic evaluator result. If the agent pipeline never produces
+a terminal provider result, Brunner records deterministic evaluation as
+`not_run` and still runs assessments whose
+`run_if_evaluation_failed` policy is enabled. The reviewer receives the same
+output schema that Brunner later uses to validate the response. This
+post-collection review does not rerun deterministic scoring or require the raw
+evaluator-only dataset.
 
 Benchmarks may also own additional assessment directories for domain-specific
 criteria. Those directories contain their reviewer prompt, rubric, output
@@ -159,8 +163,9 @@ Assessment status is separate from deterministic evaluation status. Optional
 assessment failures remain visible but do not fail a campaign trial. A failed
 required assessment sets `required_assessments_complete` to false and makes
 the campaign trial unsuccessful. The standard qualitative review is
-non-gating by default and runs on failed deterministic evaluations so it can
-diagnose the failure; both behaviors are configurable.
+non-gating by default and runs on failed or unavailable deterministic
+evaluations so it can diagnose the failure and describe partial agent work;
+both behaviors are configurable.
 
 ## Trust Boundary
 
@@ -313,8 +318,10 @@ thread, so a provider that never reads stdin remains subject to the normal
 soft stop, hard deadline, and process-group termination logic.
 
 Ordinary transient API failures retry with bounded exponential delay.
-Authentication, authorization, unavailable model, invalid request, and
-disabled-credit conditions terminate immediately.
+Subscription boundaries with a provider reset timestamp wait until that
+boundary. Authentication, authorization, unavailable model, invalid request,
+and permanent credit exhaustion such as Claude's `out_of_credits` /
+`credits_required` rejection terminate immediately.
 Deterministic provider-launch validation failures are terminal as well. Claude
 receives a provider-specific copy of the generated final-response schema with
 the top-level Draft 2020-12 `$schema` declaration omitted because current
@@ -487,9 +494,10 @@ same PVC is not mounted a second time. It resumes partial files,
 verifies every SHA-256, and hard-links unchanged staged files from the prepared
 trial instead of copying them again. The controller only submits and observes
 this Job; Kubernetes API connectivity loss cannot interrupt the data transfer.
-Final cleanup waits for collection Jobs, workload Jobs, and eligible PVCs to
-be deleted. A failed workload's PVC is retained until artifact collection
-succeeds.
+Final cleanup waits for collection Jobs and workload Jobs. A failed
+provider-error workload's PVC remains retained after artifact collection when
+retained-session continuation is enabled; successful and non-resumable
+workloads release their eligible PVCs normally.
 
 Failed Kubernetes Jobs whose agent process was interrupted by a signal,
 eviction, node loss, OOM termination, or another retryable infrastructure event
@@ -499,6 +507,16 @@ generation names, so an ambiguous restart response is adoptable. Deadline
 expiry, terminal provider/configuration failures, and container configuration
 failures are not retried. The campaign bounds automatic restart generations
 with `infrastructure_max_restarts`.
+
+Provider-error continuation is separate from automatic infrastructure retry.
+The laptop writes an immutable request to a campaign continuation ConfigMap;
+the fenced controller validates the terminal campaign entry and launches a
+continuation generation against the original PVC. The request is excluded from
+the workload digest because it changes retry authority, not the pinned
+challenge, image, command, resources, secrets, or evaluator. The agent reopens
+the terminal runner state, preserves prior attempts, resets its deadline, and
+raises the attempt ceiling by exactly one. A strict-resume marker prevents
+missing provider sessions from falling back to a new session.
 
 ## Cluster Campaign Control
 
@@ -519,6 +537,7 @@ trusted preparation Job
 one-replica Recreate controller Deployment
 controller lock ConfigMap
 status ConfigMap
+continuation request ConfigMap
 ```
 
 The preparation Job has no service-account token. It has explicit CPU and

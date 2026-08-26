@@ -77,17 +77,17 @@ state publication must be atomic so they cannot expose partial state.
 | Submission | Partial NetworkPolicy/PVC/Job, interrupted PVC-to-PVC stage, corrupt remote copy, rejection, timeout, ambiguous response | Campaign submission reconciliation and stager init container | Resume partial staging; adopt only matching digests after ambiguity; possible side effects require cleanup |
 | Scheduling/startup | Unschedulable, image pull, mount, secret, GPU/storage unavailable | Backend inspection | Typed backend failure; retry only transient infrastructure |
 | Agent startup | Missing executable/config, corrupt trial state, permission/disk failure | Agent CLI and backend | Durable nonzero infrastructure result with diagnostics |
-| Provider execution | Auth, subscription/rate limit, model substitution, deterministic CLI/schema validation, tool/sandbox denial, network, malformed terminal event | Runner/provider adapter | Retry transient service/network failures; terminate deterministic configuration failures; preserve requested/observed identity |
+| Provider execution | Auth, subscription/rate limit, exhausted credits, model substitution, deterministic CLI/schema validation, tool/sandbox denial, network, malformed terminal event | Runner/provider adapter | Retry transient service/network failures; wait for a stated subscription reset; terminate permanent credit exhaustion and deterministic configuration failures; preserve requested/observed identity |
 | Runtime resources | CPU, memory, ephemeral storage, PVC, PID/FD, token/context, deadline | Backend plus runner | Attribute to candidate only when a candidate-specific limit proves ownership |
 | Output/timing capture | Log disk full, malformed event, output flood | Runner | Terminal provider parsing must not depend on optional diagnostic writes |
 | Inspection | Connectivity, malformed JSON, deleted Job/PVC, multi-Pod retry history, missing Events | Backend and campaign | Pause on connectivity; restart missing Job with intact PVC; event loss is diagnostic-only |
-| Retry/resume | Retry deadline, exhausted budget, stale session, unsupported resume | Runner or campaign | Absolute persisted retry time; bounded retries; terminal reason at exhaustion |
+| Retry/resume | Retry deadline, exhausted budget, stale session, unsupported resume, duplicate continuation request, missing retained PVC | Runner, campaign, or continuation ConfigMap | Absolute persisted retry time; bounded automatic retries; explicit one-attempt continuation only for a retained terminal provider session; never replace a missing saved session with a fresh paid session |
 | Submission validation | Missing/invalid manifest, schema/path/size violation | Evaluator | `candidate_failed`; this is a valid benchmark result |
 | Reference validation | Drift, missing trusted files, validator failure | Evaluator | `integrity` or `evaluation`; benchmark result indeterminate |
 | Deterministic evaluation | Launch, timeout, crash, invalid result, runtime resource failure | Sterling evaluator and campaign | `evaluation`; never `benchmark` unless a valid evaluator reports candidate failure |
 | Artifact collection | Transfer Job failure, oversized changed/new inventory, staged-file reuse failure, malformed inventory, checksum/path violation, control-PVC exhaustion | PVC-to-PVC collection Job and controller | Adopt or poll the durable Job after controller/API interruption, reuse unchanged staged files on the control PVC, omit declared/evaluated raw artifacts, use bounded diagnostics for incomplete oversized trials, retry terminal transport failure only |
 | Result publication | Results-PVC exhaustion, oversized result, interruption, checksum/path violation | Controller | Omit unchanged challenge and assessment working copies; publish checksummed snapshots when durable state changes; do not clean trial storage until publication completes |
-| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure, output merge failure | Trusted assessment Job and controller | Mount evidence read-only, write separately, validate before merge; `assessment`; required-review failure makes result indeterminate |
+| Qualitative assessment | Provider quota/auth, timeout, invalid review, renderer failure, output merge failure | Trusted assessment Job and controller | Mount evidence read-only, write separately, validate before merge; run opted-in reviews even when deterministic evaluation is unavailable; `assessment`; required-review failure makes result indeterminate |
 | Archive synchronization | Reader startup, laptop disconnect, partial file, changing remote snapshot, manifest/file checksum mismatch, local disk | Sync client | Download into a resumable sibling staging tree, preserve the prior local archive, and swap only after complete verification |
 | Archive restoration | Writer startup, laptop disconnect, partial upload, changed destination, invalid historical state | Submit client | Require a terminal compatible archive; resume checksum-verified uploads; restore state before preparation/controller startup; never overwrite differing remote content |
 | Campaign retirement | Final sync failure, nonterminal/nonresumable archive, stale controller status, deletion timeout | Retirement client | Verify remote bytes and exact terminal manifest before deletion; delete all campaign-owned workloads and PVCs only after verification |
@@ -120,6 +120,8 @@ and event evidence before attributing exhaustion to either phase.
 
 - Candidate failures require a valid terminal provider result and a trusted
   validation/evaluation decision.
+- An incomplete provider pipeline remains an infrastructure failure, but it
+  does not suppress assessments configured to review failed runs.
 - Trusted evaluator, reference, reviewer, reporting, and cleanup failures never
   become candidate failures.
 - Integrity failures are never automatically retried as transport failures.
@@ -144,6 +146,9 @@ and event evidence before attributing exhaustion to either phase.
   cannot pause a running campaign.
 - Remote campaign deletion is explicit and gated by a final verified terminal
   archive; retirement removes all campaign-owned PVCs and control resources.
+- A terminal provider-error trial is continuable only while its original PVC,
+  provider home, session ID, workload digest, and challenge digest remain
+  available. Continuation preserves history and authorizes exactly one launch.
 - A successful test suite is insufficient unless each external boundary has
   failure injection for side-effect ambiguity and restart recovery.
 

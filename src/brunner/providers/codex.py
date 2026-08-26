@@ -40,6 +40,7 @@ RETRYABLE_RESUME_ERRORS = (
     "could not find session",
 )
 TERMINAL_ERROR_FRAGMENTS = (
+    "out of usage credits",
     "usage credits are required",
     "credit balance is too low",
     "invalid api key",

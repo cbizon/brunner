@@ -22,6 +22,7 @@ from brunner.errors import ContractError, EvaluationError, IntegrityError
 from brunner.failure import failure_from_exception, failure_record
 from brunner.io import write_json_atomic
 from brunner.hashing import sha256_file
+from brunner.pipeline import summarize_pipeline_state
 from brunner.reference import validate_reference_manifest
 from brunner.submission import ValidatedSubmission, validate_submission
 
@@ -33,11 +34,20 @@ def _evaluation_schema() -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _validate_evaluation_result(value: Any) -> dict[str, Any]:
+def _validate_evaluation_result(
+    value: Any,
+    *,
+    allow_not_run: bool = False,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise EvaluationError("evaluation result must be a JSON object")
+    validated_value = value
+    if allow_not_run and value.get("status") == "not_run":
+        validated_value = {**value, "status": "failed"}
     errors = sorted(
-        Draft202012Validator(_evaluation_schema()).iter_errors(value),
+        Draft202012Validator(_evaluation_schema()).iter_errors(
+            validated_value
+        ),
         key=lambda error: list(error.absolute_path),
     )
     if errors:
@@ -557,8 +567,101 @@ def finalize_evaluation(
     for report in result["reports"]:
         _safe_report_path(trial, str(report["path"]))
 
+    return _finalize_assessments(
+        definition,
+        contract,
+        trial,
+        result,
+        output_trial=output_trial,
+    )
+
+
+def finalize_incomplete_evaluation(
+    definition: BenchmarkDefinition,
+    contract: OutputContract,
+    trial: Path,
+    *,
+    output_trial: Path | None = None,
+) -> dict[str, Any]:
+    """Run eligible assessments when deterministic evaluation cannot run."""
+    trial = trial.resolve()
+    output_trial = (
+        output_trial.resolve()
+        if output_trial is not None
+        else trial
+    )
+    output_trial.mkdir(parents=True, exist_ok=True)
+    state_path = trial / "status.json"
+    runner_state = (
+        json.loads(state_path.read_text())
+        if state_path.is_file()
+        else None
+    )
+    pipeline = summarize_pipeline_state(
+        runner_state if isinstance(runner_state, dict) else None
+    )
+    reason = str(
+        pipeline.get("infrastructure_reason")
+        or "AgentPipelineIncomplete"
+    )
+    provider_failure = pipeline.get("failure")
+    message = (
+        str(provider_failure)
+        if provider_failure
+        else "agent pipeline did not produce a terminal provider result"
+    )
+    result = _validate_evaluation_result(
+        {
+            "schema_version": "1.0",
+            "status": "not_run",
+            "summary": {
+                "reason": reason,
+                "pipeline_status": pipeline["status"],
+                "message": message,
+            },
+            "metrics": {},
+            "reports": [],
+            "failure": failure_record(
+                operation="agent_pipeline",
+                domain="provider",
+                reason=reason,
+                message=message,
+                disposition="terminal",
+                retryable=False,
+            ),
+            "benchmark_id": definition.benchmark_id,
+            "benchmark_version": definition.version,
+            "contract_sha256": contract.sha256,
+            "provider_status": None,
+            "evaluator_return_code": None,
+            "evaluated_at": datetime.now(UTC).isoformat(),
+        },
+        allow_not_run=True,
+    )
+    results_path = output_trial / definition.evaluation.results_path
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(results_path, result)
+    return _finalize_assessments(
+        definition,
+        contract,
+        trial,
+        result,
+        output_trial=output_trial,
+    )
+
+
+def _finalize_assessments(
+    definition: BenchmarkDefinition,
+    contract: OutputContract,
+    trial: Path,
+    result: dict[str, Any],
+    *,
+    output_trial: Path,
+) -> dict[str, Any]:
     from brunner.assessment import run_assessments
 
+    results_path = output_trial / definition.evaluation.results_path
+    results_path.parent.mkdir(parents=True, exist_ok=True)
     assessment_index = run_assessments(
         definition,
         contract,

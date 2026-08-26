@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,7 +21,11 @@ from brunner.archive import (
     ARCHIVE_MANIFEST,
     load_campaign_archive,
 )
-from brunner.backends import KubernetesBackend, KubernetesProfile
+from brunner.backends import (
+    KubernetesBackend,
+    KubernetesProfile,
+    TrialContinuation,
+)
 from brunner.artifacts import artifact_metadata
 from brunner.backends.squid import (
     MANAGED_PROXY_PORT,
@@ -385,6 +390,10 @@ class CampaignResources:
     @property
     def status_config_map(self) -> str:
         return f"{self.base}-status"
+
+    @property
+    def continuation_config_map(self) -> str:
+        return f"{self.base}-continuations"
 
     @property
     def control_claim(self) -> str:
@@ -927,6 +936,26 @@ def render_cluster_resources(
                 )
             },
         },
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": resources.continuation_config_map,
+                "namespace": resources.namespace,
+                "labels": labels,
+            },
+            "data": {
+                "requests.json": json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "campaign_id": campaign.plan.campaign_id,
+                        "campaign_sha256": campaign.sha256,
+                        "requests": [],
+                    },
+                    sort_keys=True,
+                )
+            },
+        },
         _pvc(
             resources,
             name=resources.control_claim,
@@ -1212,6 +1241,88 @@ def _campaign_status(
     }
 
 
+def _continuation_requests(
+    resource: dict[str, Any],
+    campaign: ClusterCampaign,
+) -> dict[str, Any]:
+    raw = resource.get("data", {}).get("requests.json")
+    if not isinstance(raw, str):
+        raise IntegrityError(
+            "campaign continuation ConfigMap is malformed"
+        )
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise IntegrityError(
+            "campaign continuation request data must be an object"
+        )
+    expected = {
+        "campaign_id": campaign.plan.campaign_id,
+        "campaign_sha256": campaign.sha256,
+    }
+    mismatches = {
+        key: {"expected": expected_value, "actual": value.get(key)}
+        for key, expected_value in expected.items()
+        if value.get(key) != expected_value
+    }
+    if mismatches:
+        raise IntegrityError(
+            f"campaign continuation identity changed: {mismatches}"
+        )
+    if not isinstance(value.get("requests"), list):
+        raise IntegrityError(
+            "campaign continuation requests must be a list"
+        )
+    return value
+
+
+def _process_continuation_request(
+    engine: CampaignEngine,
+    campaign: ClusterCampaign,
+    resources: CampaignResources,
+    client: Kubectl,
+) -> bool:
+    resource = client.get(
+        "configmap",
+        resources.continuation_config_map,
+    )
+    if resource is None:
+        raise IntegrityError(
+            "campaign continuation ConfigMap does not exist"
+        )
+    value = _continuation_requests(resource, campaign)
+    request = next(
+        (
+            item
+            for item in value["requests"]
+            if isinstance(item, dict) and item.get("status") == "pending"
+        ),
+        None,
+    )
+    if request is None:
+        return False
+    try:
+        engine.request_continuation(
+            request_id=str(request.get("request_id") or ""),
+            test_id=str(request.get("test_id") or ""),
+            additional_attempts=int(
+                request.get("additional_attempts", 1)
+            ),
+            timeout_seconds=request.get("timeout_seconds"),
+        )
+    except Exception as error:
+        request["status"] = "rejected"
+        request["error"] = f"{type(error).__name__}: {error}"
+    else:
+        request["status"] = "accepted"
+    request["processed_at"] = _now()
+    resource["data"]["requests.json"] = json.dumps(
+        value,
+        sort_keys=True,
+    )
+    client.replace(resource)
+    return True
+
+
 def _result_inventory(
     results_root: Path,
     *,
@@ -1432,11 +1543,17 @@ def finalize_result_bundle(
 
 def _assessment_providers(
     definition: BenchmarkDefinition,
+    *,
+    assessment_only: bool = False,
 ) -> frozenset[str]:
     return frozenset(
         assessment.reviewer.provider
         for assessment in definition.resolved_assessments()
         if assessment.reviewer is not None
+        and (
+            not assessment_only
+            or assessment.run_if_evaluation_failed
+        )
     )
 
 
@@ -1512,10 +1629,17 @@ class KubernetesEvaluationFinalizer:
         self.proxy_labels = dict(proxy_labels)
         self.fence = fence or (lambda: None)
 
-    def _job_name(self, trial: Path) -> str:
+    def _job_name(
+        self,
+        trial: Path,
+        *,
+        assessment_only: bool = False,
+    ) -> str:
         identity = (
             f"{self.resources.base}\0{self.campaign.sha256}\0{trial.name}"
         )
+        if assessment_only:
+            identity += "\0assessment-only"
         digest = hashlib.sha256(identity.encode()).hexdigest()[:10]
         prefix = _safe_slug(trial.name)[:28].rstrip("-")
         return f"brunner-assess-{prefix}-{digest}"
@@ -1524,9 +1648,14 @@ class KubernetesEvaluationFinalizer:
         self,
         job_name: str,
         labels: dict[str, str],
+        *,
+        assessment_only: bool = False,
     ) -> dict[str, Any]:
         egress = []
-        if _assessment_providers(self.definition):
+        if _assessment_providers(
+            self.definition,
+            assessment_only=assessment_only,
+        ):
             if self.proxy_url is None:
                 raise BackendRequestError(
                     "model assessments require the managed proxy"
@@ -1567,8 +1696,17 @@ class KubernetesEvaluationFinalizer:
     def _output_relative(self, job_name: str) -> str:
         return f"assessment-output/{job_name}"
 
-    def _job(self, trial: Path, job_name: str) -> dict[str, Any]:
-        providers = _assessment_providers(self.definition)
+    def _job(
+        self,
+        trial: Path,
+        job_name: str,
+        *,
+        assessment_only: bool = False,
+    ) -> dict[str, Any]:
+        providers = _assessment_providers(
+            self.definition,
+            assessment_only=assessment_only,
+        )
         labels = {
             **_labels(self.resources),
             "dev.brunner/role": "assessment",
@@ -1621,12 +1759,31 @@ class KubernetesEvaluationFinalizer:
             )
         relative = trial.relative_to(CONTROL_ROOT).as_posix()
         output_relative = self._output_relative(job_name)
+        command = [
+            "brunner",
+            "--benchmark",
+            self.benchmark_ref,
+            "controller-finalize",
+            self.campaign_ref,
+            "--campaign-sha256",
+            self.campaign.sha256,
+            "--trial-relative",
+            relative,
+            "--output-relative",
+            output_relative,
+        ]
+        if assessment_only:
+            command.append("--assessment-only")
         timeout = max(
             300,
             math.ceil(
                 sum(
                     assessment.timeout_seconds
                     for assessment in self.definition.resolved_assessments()
+                    if (
+                        not assessment_only
+                        or assessment.run_if_evaluation_failed
+                    )
                 )
                 + 300
             ),
@@ -1640,19 +1797,7 @@ class KubernetesEvaluationFinalizer:
                 {
                     "name": "assessment",
                     "image": self.campaign.controller.image,
-                    "command": [
-                        "brunner",
-                        "--benchmark",
-                        self.benchmark_ref,
-                        "controller-finalize",
-                        self.campaign_ref,
-                        "--campaign-sha256",
-                        self.campaign.sha256,
-                        "--trial-relative",
-                        relative,
-                        "--output-relative",
-                        output_relative,
-                    ],
+                    "command": command,
                     "workingDir": "/tmp",
                     "env": environment,
                     "resources": {
@@ -1725,15 +1870,33 @@ class KubernetesEvaluationFinalizer:
             },
         }
 
-    def __call__(self, trial: Path) -> dict[str, Any]:
+    def __call__(
+        self,
+        trial: Path,
+        *,
+        assessment_only: bool = False,
+    ) -> dict[str, Any]:
         from brunner.evaluation import _validate_evaluation_result
         from brunner.report import write_run_report
 
-        job_name = self._job_name(trial)
-        job = self._job(trial, job_name)
+        job_name = self._job_name(
+            trial,
+            assessment_only=assessment_only,
+        )
+        job = self._job(
+            trial,
+            job_name,
+            assessment_only=assessment_only,
+        )
         labels = dict(job["metadata"]["labels"])
         self.fence()
-        self.client.apply(self._network_policy(job_name, labels))
+        self.client.apply(
+            self._network_policy(
+                job_name,
+                labels,
+                assessment_only=assessment_only,
+            )
+        )
         self.fence()
         existing = self.client.get("job", job_name)
         self.fence()
@@ -1793,7 +1956,10 @@ class KubernetesEvaluationFinalizer:
                 "assessment Job completed without output results: "
                 f"{output_results}"
             )
-        _validate_evaluation_result(json.loads(output_results.read_text()))
+        _validate_evaluation_result(
+            json.loads(output_results.read_text()),
+            allow_not_run=assessment_only,
+        )
         self.fence()
         _merge_assessment_output(
             output_root,
@@ -1808,7 +1974,8 @@ class KubernetesEvaluationFinalizer:
                 f"{results_path}"
             )
         result = _validate_evaluation_result(
-            json.loads(results_path.read_text())
+            json.loads(results_path.read_text()),
+            allow_not_run=assessment_only,
         )
         self.fence()
         report_path = write_run_report(
@@ -1918,8 +2085,12 @@ def finalize_cluster_trial(
     expected_sha256: str,
     trial_relative: str,
     output_relative: str,
+    assessment_only: bool = False,
 ) -> dict[str, Any]:
-    from brunner.evaluation import finalize_evaluation
+    from brunner.evaluation import (
+        finalize_evaluation,
+        finalize_incomplete_evaluation,
+    )
 
     verify_campaign_sha256(campaign, expected_sha256)
     relative = Path(trial_relative)
@@ -1949,7 +2120,12 @@ def finalize_cluster_trial(
         raise ValueError(
             f"assessment output directory does not exist: {output_trial}"
         )
-    return finalize_evaluation(
+    finalizer = (
+        finalize_incomplete_evaluation
+        if assessment_only
+        else finalize_evaluation
+    )
+    return finalizer(
         definition,
         contract,
         trial,
@@ -2148,6 +2324,13 @@ def run_cluster_controller(
     )
     try:
         while True:
+            lock.assert_held()
+            _process_continuation_request(
+                engine,
+                campaign,
+                resources,
+                client,
+            )
             lock.assert_held()
             marker = RESULTS_ROOT / RESULT_MANIFEST
             control_state = CONTROL_ROOT / "campaign.json"
@@ -2460,6 +2643,18 @@ class ClusterCampaignClient:
         for resource in rendered:
             if resource is deployment or resource is preparation:
                 continue
+            if (
+                resource["kind"] == "ConfigMap"
+                and resource["metadata"]["name"]
+                == self.resources.continuation_config_map
+            ):
+                existing = self.client.get(
+                    "configmap",
+                    self.resources.continuation_config_map,
+                )
+                if existing is not None:
+                    _continuation_requests(existing, self.campaign)
+                    continue
             self.client.apply(resource)
         self.client.delete("deployment", self.resources.deployment, wait=True)
         self.client.delete(
@@ -2527,6 +2722,19 @@ class ClusterCampaignClient:
                 self.campaign.controller.poll_seconds * 4,
             )
         status["namespace"] = self.resources.namespace
+        continuation_resource = self.client.get(
+            "configmap",
+            self.resources.continuation_config_map,
+        )
+        if continuation_resource is not None and isinstance(
+            continuation_resource.get("data", {}).get("requests.json"),
+            str,
+        ):
+            continuation_value = _continuation_requests(
+                continuation_resource,
+                self.campaign,
+            )
+            status["continuation_requests"] = continuation_value["requests"]
         preparation = self.client.get(
             "job",
             self.resources.preparation_job,
@@ -2556,6 +2764,57 @@ class ClusterCampaignClient:
             else:
                 status["preparation_status"] = "pending"
         return status
+
+    def continue_trial(
+        self,
+        test_id: str,
+        *,
+        additional_attempts: int = 1,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        if test_id not in {
+            trial.test_id for trial in self.campaign.plan.trials
+        }:
+            raise ValueError(f"campaign has no trial {test_id!r}")
+        continuation = TrialContinuation(
+            request_id=str(uuid.uuid4()),
+            additional_attempts=additional_attempts,
+            timeout_seconds=timeout_seconds,
+        )
+        continuation.validate()
+        for _attempt in range(5):
+            resource = self.client.get(
+                "configmap",
+                self.resources.continuation_config_map,
+            )
+            if resource is None:
+                raise BackendRequestError(
+                    "campaign continuation control does not exist; submit "
+                    "the campaign with a continuation-capable Brunner image"
+                )
+            value = _continuation_requests(resource, self.campaign)
+            request = {
+                **continuation.to_dict(),
+                "test_id": test_id,
+                "status": "pending",
+                "requested_at": _now(),
+            }
+            value["requests"].append(request)
+            resource["data"]["requests.json"] = json.dumps(
+                value,
+                sort_keys=True,
+            )
+            if self.client.replace(resource):
+                return {
+                    "campaign_id": self.campaign.plan.campaign_id,
+                    "campaign_sha256": self.campaign.sha256,
+                    "namespace": self.resources.namespace,
+                    **request,
+                }
+        raise BackendConnectivityError(
+            "campaign continuation request changed concurrently; retry the "
+            "command"
+        )
 
     def _transfer_pod(self, *, write: bool) -> dict[str, Any]:
         role = "archive-writer" if write else "archive-reader"
@@ -3603,6 +3862,7 @@ class ClusterCampaignClient:
         for kind, name in (
             ("deployment", self.resources.proxy),
             ("configmap", self.resources.proxy),
+            ("configmap", self.resources.continuation_config_map),
             ("configmap", self.resources.status_config_map),
             ("rolebinding", self.resources.role),
             ("role", self.resources.role),

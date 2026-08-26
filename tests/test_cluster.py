@@ -187,6 +187,17 @@ def test_rendered_control_plane_enforces_cluster_ownership() -> None:
         for rule in role_rules
     )
     assert "secrets" not in role_resources
+    config_maps = {
+        resource["metadata"]["name"]: resource
+        for resource in by_kind["ConfigMap"]
+    }
+    continuation_requests = json.loads(
+        config_maps[resources.continuation_config_map]["data"][
+            "requests.json"
+        ]
+    )
+    assert continuation_requests["requests"] == []
+    assert continuation_requests["campaign_sha256"] == campaign.sha256
 
     preparation = by_kind["Job"][0]["spec"]["template"]["spec"]
     assert preparation["automountServiceAccountToken"] is False
@@ -363,6 +374,41 @@ def test_assessment_submission_is_nonblocking(
         / "assessment-output"
         / finalizer._job_name(trial)
     ).is_dir()
+
+
+def test_incomplete_assessment_job_uses_assessment_only_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    trial = control / "collected/run-a"
+    trial.mkdir(parents=True)
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", control)
+    definition = build_definition()
+    campaign = _campaign()
+    resources = campaign_resources(definition, campaign)
+    client = PendingAssessmentClient()
+    finalizer = KubernetesEvaluationFinalizer(
+        definition=definition,
+        campaign=campaign,
+        resources=resources,
+        client=client,  # type: ignore[arg-type]
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+        proxy_url=None,
+        proxy_labels={},
+    )
+
+    with pytest.raises(EvaluationPending, match="submitted"):
+        finalizer(trial, assessment_only=True)
+
+    job = next(item for item in client.applied if item["kind"] == "Job")
+    command = job["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[-1] == "--assessment-only"
+    assert finalizer._job_name(
+        trial,
+        assessment_only=True,
+    ) != finalizer._job_name(trial)
 
 
 class FailedPreparationClient:
@@ -1196,6 +1242,8 @@ class FakeSubmitKubectl:
         assert labels is None
         if kind == "deployment":
             return None
+        if kind == "configmap":
+            return None
         raise AssertionError((kind, name, labels))
 
     def apply(self, resource: dict[str, Any]) -> None:
@@ -1216,6 +1264,133 @@ class FakeSubmitKubectl:
     ) -> None:
         target = name or str(labels)
         self.events.append(("delete", f"{kind}/{target}"))
+
+
+class FakeContinuationKubectl:
+    def __init__(
+        self,
+        campaign: ClusterCampaign,
+        resources: CampaignResources,
+    ) -> None:
+        self.resource = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": resources.continuation_config_map,
+                "namespace": resources.namespace,
+                "resourceVersion": "1",
+            },
+            "data": {
+                "requests.json": json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "campaign_id": campaign.plan.campaign_id,
+                        "campaign_sha256": campaign.sha256,
+                        "requests": [],
+                    }
+                )
+            },
+        }
+
+    def get(
+        self,
+        kind: str,
+        name: str | None = None,
+        *,
+        labels: str | None = None,
+    ) -> dict[str, Any] | None:
+        assert kind == "configmap"
+        assert labels is None
+        assert name == self.resource["metadata"]["name"]
+        return json.loads(json.dumps(self.resource))
+
+    def replace(self, resource: dict[str, Any]) -> bool:
+        self.resource = json.loads(json.dumps(resource))
+        return True
+
+
+def test_client_submits_strict_continuation_request() -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    client = ClusterCampaignClient(
+        definition,
+        campaign,
+        benchmark_ref="examples.text_benchmark.definition",
+        campaign_ref="my_benchmark.campaign",
+    )
+    fake = FakeContinuationKubectl(campaign, client.resources)
+    client.client = fake  # type: ignore[assignment]
+
+    result = client.continue_trial("run-a")
+    requests = json.loads(
+        fake.resource["data"]["requests.json"]
+    )["requests"]
+
+    assert result["status"] == "pending"
+    assert result["additional_attempts"] == 1
+    assert result["strict_resume"] is True
+    assert requests == [
+        {
+            key: result[key]
+            for key in (
+                "additional_attempts",
+                "request_id",
+                "requested_at",
+                "schema_version",
+                "status",
+                "strict_resume",
+                "test_id",
+                "timeout_seconds",
+            )
+        }
+    ]
+
+
+def test_controller_consumes_continuation_request() -> None:
+    campaign = _campaign()
+    definition = build_definition()
+    resources = campaign_resources(definition, campaign)
+    fake = FakeContinuationKubectl(campaign, resources)
+    request = {
+        "schema_version": "1.0",
+        "request_id": "request-1",
+        "test_id": "run-a",
+        "additional_attempts": 1,
+        "timeout_seconds": None,
+        "strict_resume": True,
+        "status": "pending",
+        "requested_at": "2026-08-26T12:00:00+00:00",
+    }
+    value = json.loads(fake.resource["data"]["requests.json"])
+    value["requests"].append(request)
+    fake.resource["data"]["requests.json"] = json.dumps(value)
+    calls: list[dict[str, Any]] = []
+
+    class Engine:
+        def request_continuation(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    processed = cluster_module._process_continuation_request(
+        Engine(),  # type: ignore[arg-type]
+        campaign,
+        resources,
+        fake,  # type: ignore[arg-type]
+    )
+    updated = json.loads(
+        fake.resource["data"]["requests.json"]
+    )["requests"][0]
+
+    assert processed is True
+    assert calls == [
+        {
+            "request_id": "request-1",
+            "test_id": "run-a",
+            "additional_attempts": 1,
+            "timeout_seconds": None,
+        }
+    ]
+    assert updated["status"] == "accepted"
+    assert "processed_at" in updated
 
 
 def test_submit_restores_archive_before_preparation_and_controller(

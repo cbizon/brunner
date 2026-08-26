@@ -197,9 +197,14 @@ qualitative_review=QualitativeReviewDefinition(
 ```
 
 When configured, the cluster controller starts a trusted assessment Job after
-Sterling's deterministic evaluator result has been selectively collected and
-before trial cleanup. Trial creation records the review contract before
-execution.
+selected trial evidence has been collected and before trial cleanup. Normally
+that evidence includes Sterling's deterministic evaluator result. If the agent
+pipeline ends without a terminal provider result, deterministic evaluation
+remains `not_run`, but assessments with
+`run_if_evaluation_failed=True` still run against the collected partial
+workspace, transcript, status, timing, and usage evidence. This preserves an
+inspection of partial work without converting the run into a benchmark
+success. Trial creation records the review contract before execution.
 
 Brunner writes:
 
@@ -774,6 +779,8 @@ brunner --benchmark my_benchmark.definition \
 brunner --benchmark my_benchmark.definition \
   campaign-status my_benchmark.campaign
 brunner --benchmark my_benchmark.definition \
+  campaign-continue my_benchmark.campaign FAILED_TEST_ID
+brunner --benchmark my_benchmark.definition \
   campaign-sync my_benchmark.campaign ./comparison-01-results
 brunner campaign-monitor ./comparison-01-results --local-port 8765
 brunner --benchmark my_benchmark.definition \
@@ -781,11 +788,33 @@ brunner --benchmark my_benchmark.definition \
 ```
 
 `campaign-submit` creates the control/results PVCs, preparation Job, controller
-Deployment, RBAC, and status ConfigMap. The controller publishes a checksummed
-results snapshot after every reconciliation pass. `campaign-sync` is resumable
-and verifies the snapshot manifest and every downloaded file, whether the
-campaign is active or terminal. `campaign-monitor` serves only the synchronized
-local archive and does not contact Kubernetes.
+Deployment, RBAC, status ConfigMap, and continuation-request ConfigMap. The
+controller publishes a checksummed results snapshot after every reconciliation
+pass. `campaign-sync` is resumable and verifies the snapshot manifest and every
+downloaded file, whether the campaign is active or terminal.
+`campaign-monitor` serves only the synchronized local archive and does not
+contact Kubernetes.
+
+If a provider run ends in `provider_error` after creating a resumable session,
+Brunner retains its trial PVC when `retain_failed_storage` is enabled. After
+the provider account is usable again, request one strict continuation:
+
+```sh
+brunner --benchmark my_benchmark.definition \
+  campaign-continue my_benchmark.campaign FAILED_TEST_ID \
+  --additional-attempts 1
+```
+
+The request is written with Kubernetes `resourceVersion` compare-and-swap and
+consumed by the cluster controller. It does not rerun staging or copy data
+through the laptop. The replacement Job uses the pinned workload and challenge
+digests, the same PVC, provider home, workspace, and session ID. Attempt history
+is preserved and the deadline is reset. Exactly one additional provider launch
+is allowed; an unavailable saved session is terminal and never falls back to a
+new paid session. `--timeout-seconds` may shorten, but not extend, the staged
+trial timeout. Continuation is rejected for successful trials, candidate
+failures, non-provider failures, missing sessions, changed workload identity,
+or missing PVCs.
 
 `campaign-retire` first synchronizes again, requires a terminal archive in
 which every trial has durable completed state, verifies that exact manifest
@@ -1081,6 +1110,7 @@ reference-build      Build a reference manifest
 reference-validate   Verify a reference bundle
 campaign-submit      Create/update the Sterling campaign control plane
 campaign-status      Read controller availability and persisted summary
+campaign-continue    Resume one retained provider-error session exactly once
 campaign-sync        Resume and verify a local campaign archive snapshot
 campaign-monitor     Serve a synchronized campaign archive locally
 campaign-retire      Verify terminal sync and delete remote campaign resources

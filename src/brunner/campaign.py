@@ -3,16 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from brunner.backends import (
     BackendHandle,
     CONTAINER_ISOLATION,
     ExecutionBackend,
+    TrialContinuation,
     TrustedEvaluationSpec,
     WorkloadSpec,
     validate_secret_environment,
@@ -32,6 +34,7 @@ from brunner.errors import (
 from brunner.evaluation import (
     evaluation_spec,
     finalize_evaluation,
+    finalize_incomplete_evaluation,
 )
 from brunner.failure import (
     attach_failure,
@@ -54,7 +57,17 @@ WorkloadFactory = Callable[
     ],
     WorkloadSpec,
 ]
-EvaluationFinalizer = Callable[[Path], dict[str, Any]]
+
+
+class EvaluationFinalizer(Protocol):
+    def __call__(
+        self,
+        trial: Path,
+        *,
+        assessment_only: bool = False,
+    ) -> dict[str, Any]: ...
+
+
 ResultPublisher = Callable[[Path, dict[str, Any]], Path | None]
 
 TRIAL_PHASES = frozenset(
@@ -66,6 +79,7 @@ TRIAL_PHASES = frozenset(
         "collection_pending",
         "collection_retry_wait",
         "complete",
+        "continuation_retrying",
         "evaluating",
         "evaluation_pending",
         "infrastructure_retrying",
@@ -525,15 +539,26 @@ class CampaignEngine:
             if dashboard_path is not None
             else self.results_root / "index.html"
         )
-        self.evaluation_finalizer = (
-            evaluation_finalizer
-            if evaluation_finalizer is not None
-            else lambda trial: finalize_evaluation(
-                self.definition,
-                self.contract,
-                trial,
-            )
-        )
+        if evaluation_finalizer is not None:
+            self.evaluation_finalizer = evaluation_finalizer
+        else:
+            def default_finalizer(
+                trial: Path,
+                *,
+                assessment_only: bool = False,
+            ) -> dict[str, Any]:
+                finalizer = (
+                    finalize_incomplete_evaluation
+                    if assessment_only
+                    else finalize_evaluation
+                )
+                return finalizer(
+                    self.definition,
+                    self.contract,
+                    trial,
+                )
+
+            self.evaluation_finalizer = default_finalizer
         self.result_publisher = result_publisher
         self._fence = fence or (lambda: None)
 
@@ -599,6 +624,106 @@ class CampaignEngine:
 
     def initialize(self) -> dict[str, Any]:
         return self._initialize()
+
+    def request_continuation(
+        self,
+        *,
+        request_id: str,
+        test_id: str,
+        additional_attempts: int = 1,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        continuation = TrialContinuation(
+            request_id=request_id,
+            additional_attempts=additional_attempts,
+            timeout_seconds=timeout_seconds,
+        )
+        continuation.validate()
+        state = self._initialize()
+        entry = next(
+            (
+                candidate
+                for candidate in state["trials"]
+                if candidate.get("test_id") == test_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError(f"campaign has no trial {test_id!r}")
+        history = entry.setdefault("continuations", [])
+        if not isinstance(history, list):
+            raise RuntimeError(
+                f"trial {test_id!r} has malformed continuation history"
+            )
+        if any(
+            isinstance(item, dict)
+            and item.get("request_id") == request_id
+            for item in history
+        ):
+            return state
+        if entry.get("phase") != "complete":
+            raise RuntimeError(
+                f"trial {test_id!r} is not complete and cannot be continued"
+            )
+        if entry.get("outcome") != "failed":
+            raise RuntimeError(
+                f"trial {test_id!r} did not fail and cannot be continued"
+            )
+        pipeline = entry.get("pipeline")
+        if (
+            not isinstance(pipeline, dict)
+            or pipeline.get("status") != "provider_error"
+            or pipeline.get("provider_result_present") is not False
+        ):
+            raise RuntimeError(
+                f"trial {test_id!r} is not a resumable provider-error run"
+            )
+        if not isinstance(entry.get("handle"), dict):
+            raise RuntimeError(
+                f"trial {test_id!r} has no retained backend identity"
+            )
+        active = entry.get("active_continuation")
+        if isinstance(active, dict) and active.get("status") in {
+            "requested",
+            "running",
+        }:
+            raise RuntimeError(
+                f"trial {test_id!r} already has an active continuation"
+            )
+        generation = int(entry["attempts"].get("continuation", 0)) + 1
+        entry["attempts"]["continuation"] = generation
+        record = {
+            **continuation.to_dict(),
+            "generation": generation,
+            "status": "requested",
+            "requested_at": _now(),
+            "previous": {
+                "outcome": entry.get("outcome"),
+                "pipeline": entry.get("pipeline"),
+                "benchmark": entry.get("benchmark"),
+                "evaluation_status": (
+                    entry["evaluation"].get("status")
+                    if isinstance(entry.get("evaluation"), dict)
+                    else None
+                ),
+                "collected_trial": entry.get("collected_trial"),
+            },
+        }
+        history.append(record)
+        entry["active_continuation"] = record
+        entry["phase"] = "continuation_retrying"
+        entry["backend_workload_live"] = False
+        state["status"] = "running"
+        state["has_attention"] = False
+        state.pop("completed_at", None)
+        self._event(
+            state,
+            "continuation_requested",
+            "requested one strict resume attempt against the retained session",
+            test_id=test_id,
+        )
+        self._save(state)
+        return state
 
     def _initialize(self) -> dict[str, Any]:
         self.control_root.mkdir(parents=True, exist_ok=True)
@@ -807,6 +932,7 @@ class CampaignEngine:
                 attempts.setdefault("cleanup", 0)
                 attempts.setdefault("publication", 0)
                 attempts.setdefault("infrastructure", 0)
+                attempts.setdefault("continuation", 0)
                 identity_expected = {
                     key: value
                     for key, value in expected.items()
@@ -930,6 +1056,7 @@ class CampaignEngine:
                     "cleanup": 0,
                     "publication": 0,
                     "infrastructure": 0,
+                    "continuation": 0,
                 },
             }
             metadata = _load_optional_object(
@@ -1056,6 +1183,27 @@ class CampaignEngine:
             }
         )
         state["events"] = state["events"][-200:]
+
+    @staticmethod
+    def _update_active_continuation(
+        entry: dict[str, Any],
+        **updates: Any,
+    ) -> None:
+        active = entry.get("active_continuation")
+        if not isinstance(active, dict):
+            return
+        active.update(updates)
+        request_id = active.get("request_id")
+        history = entry.get("continuations")
+        if not isinstance(history, list):
+            return
+        for record in reversed(history):
+            if (
+                isinstance(record, dict)
+                and record.get("request_id") == request_id
+            ):
+                record.update(updates)
+                return
 
     def _pause_connectivity(
         self,
@@ -1491,6 +1639,111 @@ class CampaignEngine:
         self._save(state)
         return restarted
 
+    def _restart_continuation_entry(
+        self,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+        handle: BackendHandle,
+    ) -> BackendHandle | None:
+        restart = getattr(self.backend, "restart", None)
+        if not callable(restart):
+            raise BackendRequestError(
+                "backend does not support retained-session continuation"
+            )
+        active = entry.get("active_continuation")
+        if not isinstance(active, dict):
+            raise RuntimeError(
+                f"trial {entry['test_id']!r} has no active continuation"
+            )
+        continuation = TrialContinuation(
+            request_id=str(active.get("request_id") or ""),
+            additional_attempts=int(active.get("additional_attempts", 1)),
+            timeout_seconds=active.get("timeout_seconds"),
+        )
+        continuation.validate()
+        workload = self._configured_workload(entry)
+        generation = int(active["generation"])
+        destination = self.control_root / "collected" / entry["test_id"]
+        if destination.exists():
+            shutil.rmtree(destination)
+        try:
+            restarted = self._external(
+                lambda: restart(
+                    handle,
+                    workload,
+                    generation,
+                    continuation=continuation,
+                )
+            )
+        except BackendConnectivityError:
+            raise
+        except Exception as error:
+            entry["phase"] = "attention_required"
+            entry["error"] = str(error)
+            self._update_active_continuation(
+                entry,
+                status="failed",
+                failed_at=_now(),
+                error=str(error),
+            )
+            attach_failure(
+                entry,
+                failure_from_exception(
+                    error,
+                    operation="provider_continuation",
+                    domain="backend",
+                    reason="ProviderContinuationFailed",
+                    disposition="attention",
+                    retryable=False,
+                    cleanup_required=True,
+                ),
+            )
+            self._event(
+                state,
+                "continuation_failed",
+                str(error),
+                test_id=entry["test_id"],
+            )
+            self._save(state)
+            return None
+        entry["handle"] = restarted.to_dict()
+        entry["phase"] = "submitted"
+        entry["submitted_at"] = (
+            restarted.metadata.get("submitted_at")
+            if isinstance(restarted.metadata.get("submitted_at"), str)
+            else _now()
+        )
+        entry["backend_workload_live"] = True
+        self._update_active_continuation(
+            entry,
+            status="running",
+            started_at=_now(),
+        )
+        for key in (
+            "backend_snapshot",
+            "benchmark",
+            "collection",
+            "collected_trial",
+            "evaluation",
+            "failure",
+            "failure_class",
+            "pipeline",
+            "source_collected_trial",
+            "timing",
+            "usage",
+        ):
+            entry.pop(key, None)
+        entry["outcome"] = None
+        entry.pop("error", None)
+        self._event(
+            state,
+            "continuation_submitted",
+            f"submitted strict continuation generation {generation}",
+            test_id=entry["test_id"],
+        )
+        self._save(state)
+        return restarted
+
     def _begin_collection_attempt(
         self,
         state: dict[str, Any],
@@ -1525,8 +1778,28 @@ class CampaignEngine:
             int(entry["attempts"].get("cleanup", 0)) + 1
         )
         self._save(state)
+        pipeline = entry.get("pipeline")
+        retain_storage = (
+            bool(getattr(self.backend, "retain_failed_storage", False))
+            and isinstance(pipeline, dict)
+            and pipeline.get("status") == "provider_error"
+            and pipeline.get("provider_result_present") is False
+        )
+        cleanup_handle = handle
+        if retain_storage:
+            cleanup_handle = replace(
+                handle,
+                metadata={
+                    **handle.metadata,
+                    "retain_storage": True,
+                },
+            )
+            entry["handle"] = cleanup_handle.to_dict()
+            entry["backend_storage_retained"] = True
+        else:
+            entry.pop("backend_storage_retained", None)
         try:
-            self._external(lambda: self.backend.cleanup(handle))
+            self._external(lambda: self.backend.cleanup(cleanup_handle))
         except BackendConnectivityError:
             raise
         except Exception as error:
@@ -1561,6 +1834,15 @@ class CampaignEngine:
         entry["phase"] = "complete"
         entry["completed_at"] = _now()
         entry["backend_workload_live"] = False
+        active_continuation = entry.get("active_continuation")
+        if isinstance(active_continuation, dict):
+            self._update_active_continuation(
+                entry,
+                status="finished",
+                completed_at=_now(),
+                outcome=entry.get("outcome"),
+            )
+            entry.pop("active_continuation", None)
         entry.pop("cleanup_error", None)
         entry.pop("next_cleanup_attempt_at", None)
         failure = entry.get("failure")
@@ -1774,7 +2056,8 @@ class CampaignEngine:
             }
         if timing is not None and isinstance(timing.get("summary"), dict):
             entry["timing"] = dict(timing["summary"])
-        if pipeline["provider_result_present"] is not True:
+        assessment_only = pipeline["provider_result_present"] is not True
+        if assessment_only:
             reason = str(
                 pipeline.get("infrastructure_reason")
                 or "AgentPipelineIncomplete"
@@ -1799,9 +2082,12 @@ class CampaignEngine:
                     operation="agent_pipeline",
                     domain="provider",
                     reason=reason,
-                    message=(
-                        "agent pipeline did not produce a terminal "
-                        "provider result"
+                    message=str(
+                        pipeline.get("failure")
+                        or (
+                            "agent pipeline did not produce a terminal "
+                            "provider result"
+                        )
                     ),
                     disposition="terminal",
                     retryable=False,
@@ -1809,25 +2095,62 @@ class CampaignEngine:
                     details={
                         "pipeline_status": pipeline.get("status"),
                         "backend_phase": backend_phase,
+                        "provider_failure_reason": pipeline.get(
+                            "provider_failure_reason"
+                        ),
+                        "provider_api_status": pipeline.get(
+                            "provider_api_status"
+                        ),
                     },
                 ),
             )
-            self._event(
-                state,
-                "evaluation_skipped",
-                (
-                    "trusted evaluation skipped because the agent pipeline "
-                    f"did not produce a terminal provider result: {reason}"
-                ),
-                test_id=entry["test_id"],
-            )
-            self._publish_and_cleanup(state, entry, handle, destination)
-            return
+            eligible_assessments = [
+                assessment
+                for assessment in self.definition.resolved_assessments()
+                if assessment.run_if_evaluation_failed
+            ]
+            if eligible_assessments:
+                self._event(
+                    state,
+                    "deterministic_evaluation_skipped",
+                    (
+                        "deterministic evaluation skipped because the agent "
+                        "pipeline did not produce a terminal provider result; "
+                        "eligible qualitative assessments will still run"
+                    ),
+                    test_id=entry["test_id"],
+                )
+            else:
+                self._event(
+                    state,
+                    "evaluation_skipped",
+                    (
+                        "trusted evaluation skipped because the agent pipeline "
+                        "did not produce a terminal provider result and no "
+                        "assessment is configured to review incomplete runs: "
+                        f"{reason}"
+                    ),
+                    test_id=entry["test_id"],
+                )
+                self._publish_and_cleanup(
+                    state,
+                    entry,
+                    handle,
+                    destination,
+                )
+                return
         entry["phase"] = "evaluating"
         self._save(state)
         try:
             evaluation = self._external(
-                lambda: self.evaluation_finalizer(destination)
+                lambda: (
+                    self.evaluation_finalizer(
+                        destination,
+                        assessment_only=True,
+                    )
+                    if assessment_only
+                    else self.evaluation_finalizer(destination)
+                )
             )
         except EvaluationPending as error:
             entry["phase"] = "evaluation_pending"
@@ -1899,6 +2222,23 @@ class CampaignEngine:
             if evaluation["report"].get("status") != "complete":
                 entry["evaluation"].pop("report", None)
         entry.pop("evaluation_error", None)
+        if assessment_only:
+            self._event(
+                state,
+                "incomplete_trial_assessed",
+                (
+                    "eligible qualitative assessments completed for an "
+                    "agent pipeline without a terminal provider result"
+                ),
+                test_id=entry["test_id"],
+            )
+            self._publish_and_cleanup(
+                state,
+                entry,
+                handle,
+                destination,
+            )
+            return
         evaluation_failure = evaluation.get("failure")
         assessment_failure = evaluation.get("assessment_failure")
         benchmark_succeeded: bool | None
@@ -2124,6 +2464,25 @@ class CampaignEngine:
                 continue
             try:
                 self._restart_infrastructure_entry(
+                    state,
+                    entry,
+                    _handle_from_dict(handle_value),
+                )
+            except BackendConnectivityError as error:
+                return self._pause_connectivity(state, error)
+
+        for entry in state["trials"]:
+            if entry["phase"] != "continuation_retrying":
+                continue
+            handle_value = entry.get("handle")
+            if not isinstance(handle_value, dict):
+                entry["phase"] = "attention_required"
+                entry["error"] = (
+                    "continuation has no retained backend handle"
+                )
+                continue
+            try:
+                self._restart_continuation_entry(
                     state,
                     entry,
                     _handle_from_dict(handle_value),
@@ -2704,6 +3063,7 @@ class CampaignEngine:
             "running",
             "collection_pending",
             "collection_retry_wait",
+            "continuation_retrying",
             "collecting",
             "evaluation_pending",
             "evaluating",

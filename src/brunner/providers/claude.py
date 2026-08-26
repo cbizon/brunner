@@ -43,6 +43,16 @@ CLAUDE_PERMISSION_DENIAL_FRAGMENTS = (
     "but you haven't granted it yet",
     "but you have not granted it yet",
 )
+CLAUDE_TERMINAL_RATE_LIMIT_REASONS = frozenset(
+    {
+        "out_of_credits",
+    }
+)
+CLAUDE_TERMINAL_RATE_LIMIT_CODES = frozenset(
+    {
+        "credits_required",
+    }
+)
 
 
 def _claude_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -266,6 +276,17 @@ class ClaudeAdapter:
                     value = rate_limit.get("overageDisabledReason")
                     if isinstance(value, str):
                         reason = value
+                rate_limit_reason = str(
+                    rate_limit.get("overageDisabledReason") or ""
+                ).strip().lower()
+                rate_limit_code = str(
+                    rate_limit.get("errorCode") or ""
+                ).strip().lower()
+                if rejected_rate_limit and (
+                    rate_limit_reason in CLAUDE_TERMINAL_RATE_LIMIT_REASONS
+                    or rate_limit_code in CLAUDE_TERMINAL_RATE_LIMIT_CODES
+                ):
+                    terminal = True
                 if retry_at_epoch is None:
                     reset = (
                         rate_limit.get("resetsAt")
