@@ -300,6 +300,39 @@ def test_claude_credit_failure_is_terminal_but_rate_limit_is_retryable() -> None
     assert retryable is not None and retryable.terminal is False
 
 
+def test_claude_structured_out_of_credits_failure_is_terminal() -> None:
+    failure = ClaudeAdapter().classify_failure(
+        [
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "resetsAt": 1788220800,
+                    "overageDisabledReason": "out_of_credits",
+                    "errorCode": "credits_required",
+                    "canUserPurchaseCredits": True,
+                },
+            },
+            {
+                "type": "result",
+                "is_error": True,
+                "api_error_status": 429,
+                "result": (
+                    "You're out of usage credits. "
+                    "Switch to another model to continue."
+                ),
+            },
+        ],
+        "",
+    )
+
+    assert failure is not None
+    assert failure.terminal is True
+    assert failure.reason == "out_of_credits"
+    assert failure.wait_category is None
+    assert failure.api_status == 429
+
+
 def test_codex_missing_executable_is_terminal_but_network_is_retryable() -> None:
     adapter = CodexAdapter()
     terminal = adapter.classify_failure(

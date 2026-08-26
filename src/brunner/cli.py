@@ -102,6 +102,15 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
     campaign_submit.add_argument("--resume-from", type=_path)
     campaign_status = subparsers.add_parser("campaign-status")
     campaign_status.add_argument("campaign")
+    campaign_continue = subparsers.add_parser("campaign-continue")
+    campaign_continue.add_argument("campaign")
+    campaign_continue.add_argument("test_id")
+    campaign_continue.add_argument(
+        "--additional-attempts",
+        type=int,
+        default=1,
+    )
+    campaign_continue.add_argument("--timeout-seconds", type=float)
     campaign_monitor = subparsers.add_parser("campaign-monitor")
     campaign_monitor.add_argument("archive", type=_path)
     campaign_monitor.add_argument("--local-port", type=int, default=8765)
@@ -123,6 +132,10 @@ def build_parser(*, require_benchmark: bool) -> argparse.ArgumentParser:
         if name == "controller-finalize":
             internal.add_argument("--trial-relative", required=True)
             internal.add_argument("--output-relative", required=True)
+            internal.add_argument(
+                "--assessment-only",
+                action="store_true",
+            )
     return parser
 
 
@@ -249,6 +262,7 @@ def execute(
                 expected_sha256=args.campaign_sha256,
                 trial_relative=args.trial_relative,
                 output_relative=args.output_relative,
+                assessment_only=args.assessment_only,
             )
         client = ClusterCampaignClient(
             definition,
@@ -260,6 +274,12 @@ def execute(
             return client.submit(resume_from=args.resume_from)
         if args.command == "campaign-status":
             return client.status()
+        if args.command == "campaign-continue":
+            return client.continue_trial(
+                args.test_id,
+                additional_attempts=args.additional_attempts,
+                timeout_seconds=args.timeout_seconds,
+            )
         if args.command == "campaign-sync":
             return client.sync(args.destination)
         if args.command == "campaign-retire":

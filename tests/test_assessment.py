@@ -28,6 +28,7 @@ from brunner.evaluation import (
     evaluation_spec,
     execute_evaluation,
     finalize_evaluation,
+    finalize_incomplete_evaluation,
 )
 from brunner.providers import ProviderSettings
 from brunner.trial import TrialIdentity, create_trial
@@ -355,6 +356,104 @@ Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT"]).write_text(
     assert "invalid assessment output" in (
         result["assessments"][0]["error"]["message"]
     )
+
+
+def test_incomplete_trial_runs_opted_in_assessment_without_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _copy_benchmark(tmp_path)
+    assessment_root = root / "assessment"
+    _write_assessment_materials(assessment_root)
+    assess = assessment_root / "assess.py"
+    assess.write_text(
+        """
+import json
+import os
+from pathlib import Path
+
+evaluation = json.loads(
+    Path(os.environ["BRUNNER_EVALUATION_RESULTS"]).read_text()
+)
+assert evaluation["status"] == "not_run"
+Path(os.environ["BRUNNER_ASSESSMENT_OUTPUT"]).write_text(json.dumps({
+    "verdict": "partial-work-reviewed",
+    "criterion": {
+        "applicability": "applicable",
+        "rating": "mixed",
+        "confidence": "high",
+        "summary": "The partial workspace and transcript were reviewed.",
+        "evidence": [{
+            "source": "trial_status",
+            "path": "evidence/trial/status.json",
+            "finding": "provider_error",
+        }],
+    },
+}))
+"""
+    )
+    definition = _definition(
+        root,
+        AssessmentDefinition(
+            assessment_id="incomplete-review",
+            root=assessment_root,
+            prompt_path="prompt.md",
+            rubric_paths=("rubric.md",),
+            output_schema_path="review.schema.json",
+            output_path="evaluation/incomplete-review.json",
+            command=(sys.executable, str(assess)),
+            trial_evidence_paths=(
+                "workspace",
+                "transcript",
+                "status.json",
+            ),
+            required=True,
+            run_if_evaluation_failed=True,
+        ),
+    )
+    trial, contract = _create_trial(tmp_path, definition)
+    (trial / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "provider_error",
+                "failure": "You're out of usage credits.",
+                "attempts": [
+                    {
+                        "status": "failed",
+                        "failure_reason": "out_of_credits",
+                    }
+                ],
+            }
+        )
+    )
+    _pythonpath(monkeypatch)
+
+    result = finalize_incomplete_evaluation(
+        definition,
+        contract,
+        trial,
+    )
+
+    assert result["status"] == "not_run"
+    assert result["summary"]["reason"] == "AgentProviderError"
+    assert result["assessment_status"] == "complete"
+    assert result["required_assessments_complete"] is True
+    assert result["assessments"][0]["status"] == "complete"
+    dossier = json.loads(
+        (
+            trial
+            / "assessments/incomplete-review/review-input.json"
+        ).read_text()
+    )
+    assert dossier["deterministic_evaluation"]["status"] == "not_run"
+    copied = json.loads(
+        (
+            trial
+            / "assessments/incomplete-review/workspace/evidence/trial/"
+            "evaluation/results.json"
+        ).read_text()
+    )
+    assert copied["status"] == "not_run"
 
 
 def test_required_assessment_failure_is_reported_separately(

@@ -11,6 +11,7 @@ from brunner.artifacts import artifact_metadata
 from brunner.backends import (
     BackendHandle,
     BackendSnapshot,
+    TrialContinuation,
     TrustedEvaluationSpec,
     WorkloadSpec,
 )
@@ -2309,6 +2310,95 @@ def test_kubernetes_stage_runs_as_job_init_container_without_api_copy(
     assert all(
         mount["name"] != "stage-source"
         for mount in agent["volumeMounts"]
+    )
+
+
+def test_kubernetes_continuation_is_outside_workload_identity(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    (trial / "workspace").mkdir(parents=True)
+    (trial / "metadata").mkdir()
+    (trial / "metadata/agent-run.json").write_text(
+        json.dumps(
+            {
+                "runtime": {
+                    "timeout_seconds": 60,
+                    "max_attempts": 1,
+                }
+            }
+        )
+    )
+    (trial / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "provider_error",
+                "session_id": "saved-session",
+                "session_started": True,
+                "attempts": [
+                    {
+                        "number": 1,
+                        "status": "failed",
+                        "provider_started": True,
+                    }
+                ],
+            }
+        )
+    )
+    workload = WorkloadSpec(
+        workload_id="case-1",
+        trial=trial,
+        command=("brunner-agent",),
+        timeout_seconds=60,
+        image="agent:latest",
+    )
+    continuation = TrialContinuation("request-1")
+
+    job = render_job(
+        "case-1-c1",
+        "case-1-data",
+        workload,
+        KubernetesProfile(namespace="benchmarks"),
+        {"app.kubernetes.io/name": "brunner"},
+        continuation=continuation,
+    )
+
+    pod = job["spec"]["template"]["spec"]
+    preparer = pod["initContainers"][0]
+    assert preparer["name"] == "continuation-preparer"
+    subprocess.run(
+        [
+            *preparer["command"][:3],
+            str(trial),
+            preparer["command"][4],
+        ],
+        check=True,
+        cwd=tmp_path,
+    )
+    prepared_status = json.loads((trial / "status.json").read_text())
+    prepared_runtime = json.loads(
+        (trial / "metadata/agent-run.json").read_text()
+    )
+    assert prepared_status["status"] == "retrying"
+    assert prepared_status["active_continuation"]["target_attempts"] == 2
+    assert prepared_runtime["runtime"]["max_attempts"] == 2
+
+    agent = pod["containers"][0]
+    environment = {
+        item["name"]: item.get("value") for item in agent["env"]
+    }
+    assert json.loads(environment["BRUNNER_CONTINUATION_REQUEST"]) == (
+        continuation.to_dict()
+    )
+    assert (
+        job["metadata"]["annotations"]["dev.brunner/workload-sha256"]
+        == workload.sha256
+    )
+    assert (
+        job["metadata"]["annotations"][
+            "dev.brunner/continuation-request-id"
+        ]
+        == "request-1"
     )
 
 

@@ -24,6 +24,7 @@ def test_public_cli_does_not_expose_host_agent_execution() -> None:
     assert "campaign-step" not in help_text
     assert "campaign-run" not in help_text
     assert "campaign-submit" in help_text
+    assert "campaign-continue" in help_text
     assert "campaign-sync" in help_text
     assert "campaign-monitor" in help_text
     assert "campaign-retire" in help_text
@@ -40,6 +41,24 @@ def test_local_campaign_monitor_does_not_require_benchmark() -> None:
 
     assert args.benchmark is None
     assert args.archive == Path("results")
+
+
+def test_controller_finalize_accepts_assessment_only_mode() -> None:
+    args = build_parser(require_benchmark=False).parse_args(
+        [
+            "controller-finalize",
+            "campaign.module",
+            "--campaign-sha256",
+            "a" * 64,
+            "--trial-relative",
+            "collected/run-a",
+            "--output-relative",
+            "assessment-output/run-a",
+            "--assessment-only",
+        ]
+    )
+
+    assert args.assessment_only is True
 
 
 def test_public_backends_are_container_isolated() -> None:

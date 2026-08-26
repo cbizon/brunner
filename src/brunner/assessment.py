@@ -1278,12 +1278,15 @@ def _prepare_workspace(
             }
             if configured_path != relative:
                 record["configured_path"] = configured_path
-            if not source.exists():
+            is_evaluation_result = (
+                relative == definition.evaluation.results_path
+            )
+            if not source.exists() and not is_evaluation_result:
                 record["available"] = False
                 evidence.append(record)
                 continue
             destination = evidence_root / "trial" / relative
-            if relative == definition.evaluation.results_path:
+            if is_evaluation_result:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 selected_evaluation = deterministic_evaluation
                 if assessment.redact_candidate_identity:
@@ -1397,7 +1400,11 @@ def _assessment_environment(
             ),
             "BRUNNER_ASSESSMENT_RESULT": str(result_path),
             "BRUNNER_EVALUATION_RESULTS": str(
-                trial / "evaluation/results.json"
+                (
+                    trial / "evaluation/results.json"
+                    if (trial / "evaluation/results.json").is_file()
+                    else output_trial / "evaluation/results.json"
+                )
             ),
         }
     )

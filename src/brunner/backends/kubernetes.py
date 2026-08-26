@@ -24,6 +24,7 @@ from brunner.backends.base import (
     BackendCapacity,
     BackendHandle,
     BackendSnapshot,
+    TrialContinuation,
     WorkloadSpec,
     native_resource_name,
     trial_resource_id,
@@ -144,6 +145,112 @@ RETRYABLE_CONTAINER_FAILURES = frozenset(
     }
 )
 TERMINATION_LOG_ENV = "BRUNNER_TERMINATION_LOG"
+CONTINUATION_REQUEST_ENV = "BRUNNER_CONTINUATION_REQUEST"
+CONTINUATION_REQUEST_ANNOTATION = (
+    "dev.brunner/continuation-request-id"
+)
+CONTINUATION_PREPARER_SCRIPT = r"""
+import json
+import os
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+def write_atomic(path, value):
+    temporary = path.with_name(f".{path.name}.continuation.tmp")
+    temporary.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.replace(temporary, path)
+
+
+trial = Path(sys.argv[1])
+request = json.loads(sys.argv[2])
+if request.get("additional_attempts") != 1:
+    raise RuntimeError("continuation must authorize exactly one attempt")
+status_path = trial / "status.json"
+runtime_path = trial / "metadata/agent-run.json"
+state = json.loads(status_path.read_text())
+configuration = json.loads(runtime_path.read_text())
+attempts = state.get("attempts")
+if not isinstance(attempts, list):
+    raise RuntimeError("persistent trial attempts must be a list")
+launched = sum(
+    attempt.get("provider_started", True) is not False
+    for attempt in attempts
+)
+active = state.get("active_continuation")
+if isinstance(active, dict) and active.get("request_id") == request.get(
+    "request_id"
+):
+    target = active.get("target_attempts")
+    if not isinstance(target, int):
+        raise RuntimeError("active continuation has no target attempt count")
+    if state.get("status") in {
+        "complete", "failed", "partial", "provider_error", "timeout"
+    } and launched >= target:
+        raise RuntimeError("continuation already consumed its provider attempt")
+else:
+    if state.get("status") != "provider_error":
+        raise RuntimeError("trial is not a terminal provider_error")
+    if isinstance(state.get("final_response"), dict):
+        raise RuntimeError("trial already has a provider result")
+    if state.get("session_started") is not True or not isinstance(
+        state.get("session_id"), str
+    ) or not state["session_id"]:
+        raise RuntimeError("trial has no resumable provider session")
+    if launched < 1:
+        raise RuntimeError("trial never launched the provider")
+    if isinstance(active, dict):
+        active["status"] = "finished"
+        active["finished_at"] = datetime.now(UTC).isoformat()
+    target = launched + 1
+    active = {
+        **request,
+        "status": "running",
+        "started_at": datetime.now(UTC).isoformat(),
+        "baseline_attempts": launched,
+        "target_attempts": target,
+    }
+    state["active_continuation"] = active
+    history = state.setdefault("continuations", [])
+    if not isinstance(history, list):
+        raise RuntimeError("persistent trial continuations must be a list")
+    history.append(dict(active))
+runtime = configuration.get("runtime")
+if not isinstance(runtime, dict):
+    raise RuntimeError("staged agent runtime is malformed")
+configured_timeout = runtime.get("timeout_seconds")
+if not isinstance(configured_timeout, (int, float)):
+    raise RuntimeError("staged trial timeout is malformed")
+timeout = request.get("timeout_seconds")
+if timeout is None:
+    timeout = configured_timeout
+if not isinstance(timeout, (int, float)) or timeout <= 0:
+    raise RuntimeError("continuation timeout must be positive")
+if timeout > configured_timeout:
+    raise RuntimeError("continuation timeout exceeds staged trial timeout")
+runtime["max_attempts"] = target
+state["status"] = "retrying"
+state["deadline_epoch"] = time.time() + timeout
+state["finalization_started"] = False
+for key in (
+    "completed_at",
+    "failure",
+    "finalization_started_at",
+    "harness_failure",
+    "interruption",
+    "next_retry_category",
+    "next_retry_seconds",
+    "retry_backoff_seconds",
+    "retry_not_before_epoch",
+):
+    state.pop(key, None)
+write_atomic(status_path, state)
+write_atomic(runtime_path, configuration)
+"""
 
 
 class ReaderMountError(BackendRequestError):
@@ -779,6 +886,7 @@ def render_job(
     stage_source_sub_path: str | None = None,
     stage_report: dict[str, Any] | None = None,
     stager_image: str | None = None,
+    continuation: TrialContinuation | None = None,
 ) -> dict[str, Any]:
     image = workload.image or profile.agent_image
     if not image:
@@ -786,9 +894,17 @@ def render_job(
             "Kubernetes workloads require an agent image"
         )
     secret_environment = _effective_secret_environment(workload, profile)
-    if TERMINATION_LOG_ENV in profile.nonsecret_environment:
+    reserved_environment = {
+        TERMINATION_LOG_ENV,
+        CONTINUATION_REQUEST_ENV,
+    }
+    configured_reserved = sorted(
+        reserved_environment & set(profile.nonsecret_environment)
+    )
+    if configured_reserved:
         raise BackendRequestError(
-            f"{TERMINATION_LOG_ENV} is reserved by Brunner"
+            "Kubernetes nonsecret_environment uses Brunner-reserved names: "
+            + ", ".join(configured_reserved)
         )
     environment = [
         {"name": key, "value": value}
@@ -835,6 +951,18 @@ def render_job(
             "value": "/dev/termination-log",
         }
     )
+    if continuation is not None:
+        continuation.validate()
+        environment.append(
+            {
+                "name": CONTINUATION_REQUEST_ENV,
+                "value": json.dumps(
+                    continuation.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        )
     resources: dict[str, dict[str, str]] = {}
     requests = {}
     limits = {}
@@ -1008,6 +1136,35 @@ def render_job(
         pod_spec["initContainers"] = [container]
         pod_spec["containers"] = [evaluator]
         active_deadline_seconds += evaluation.timeout_seconds
+    if continuation is not None:
+        continuation_preparer = {
+            "name": "continuation-preparer",
+            "image": image,
+            "command": [
+                "python",
+                "-c",
+                CONTINUATION_PREPARER_SCRIPT,
+                "/brunner/trial",
+                json.dumps(
+                    continuation.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ],
+            "workingDir": "/tmp",
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "capabilities": {"drop": ["ALL"]},
+                "readOnlyRootFilesystem": True,
+            },
+            "volumeMounts": [
+                {"name": "trial", "mountPath": "/brunner/trial"},
+            ],
+        }
+        pod_spec.setdefault("initContainers", []).insert(
+            0,
+            continuation_preparer,
+        )
     staging_values = (
         stage_source_claim,
         stage_source_sub_path,
@@ -1091,6 +1248,10 @@ def render_job(
             profile.network_isolation_mode
         ),
     }
+    if continuation is not None:
+        annotations[CONTINUATION_REQUEST_ANNOTATION] = (
+            continuation.request_id
+        )
     if not profile.unsafe_disable_network_policy_for_tests:
         if not profile.proxy_image:
             raise BackendRequestError(
@@ -1142,6 +1303,7 @@ class KubernetesBackend:
         fence: Callable[[], None] | None = None,
     ) -> None:
         self.profile = profile
+        self.retain_failed_storage = profile.retain_failed_storage
         self.kubectl = kubectl
         self.managed_proxy_name = managed_proxy_name
         self.managed_proxy_campaign_labels = (
@@ -1917,6 +2079,7 @@ class KubernetesBackend:
         challenge_sha256: str,
         egress_proxy_sha256: str | None,
         network_isolation_mode: str,
+        continuation_request_id: str | None = None,
     ) -> None:
         labels = job.get("metadata", {}).get("labels", {})
         if labels.get("dev.brunner/workload") != (
@@ -1939,6 +2102,10 @@ class KubernetesBackend:
         if egress_proxy_sha256 is not None:
             expected_job_annotations[EGRESS_PROXY_SHA256_ANNOTATION] = (
                 egress_proxy_sha256
+            )
+        if continuation_request_id is not None:
+            expected_job_annotations[CONTINUATION_REQUEST_ANNOTATION] = (
+                continuation_request_id
             )
         actual_job_annotations = dict(job_annotations)
         actual_job_annotations.setdefault(
@@ -2239,6 +2406,8 @@ class KubernetesBackend:
         handle: BackendHandle,
         workload: WorkloadSpec,
         generation: int,
+        *,
+        continuation: TrialContinuation | None = None,
     ) -> BackendHandle:
         workload = self.prepare_workload(workload)
         workload.validate()
@@ -2248,6 +2417,8 @@ class KubernetesBackend:
             raise BackendRequestError(
                 "Kubernetes restart generation must be positive"
             )
+        if continuation is not None:
+            continuation.validate()
         expected_proxy_sha256 = (
             managed_proxy_sha256(self.profile.proxy_image)
             if self.profile.proxy_image
@@ -2302,7 +2473,11 @@ class KubernetesBackend:
         job_name = native_resource_name(
             workload.workload_id,
             workload.resource_id,
-            suffix=f"-r{generation}",
+            suffix=(
+                f"-c{generation}"
+                if continuation is not None
+                else f"-r{generation}"
+            ),
         )
         labels = {
             "app.kubernetes.io/name": "brunner",
@@ -2365,6 +2540,11 @@ class KubernetesBackend:
                 network_isolation_mode=(
                     self.profile.network_isolation_mode
                 ),
+                continuation_request_id=(
+                    continuation.request_id
+                    if continuation is not None
+                    else None
+                ),
             )
             restarted = self._submission_handle(
                 workload,
@@ -2400,6 +2580,7 @@ class KubernetesBackend:
                     if staged
                     else self.profile.artifact_reader_image
                 ),
+                continuation=continuation,
             )
         )
         restarted = self._submission_handle(
@@ -3545,9 +3726,13 @@ class KubernetesBackend:
             if state_path.is_file()
             else {}
         )
-        retain_storage = False
-        if (
+        retain_storage = (
             self.profile.retain_failed_storage
+            and bool(handle.metadata.get("retain_storage"))
+        )
+        if (
+            not retain_storage
+            and self.profile.retain_failed_storage
             and not state.get("artifacts_collected_at")
         ):
             retain_storage = self.inspect(handle).phase == "failed"

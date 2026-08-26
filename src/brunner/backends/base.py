@@ -225,6 +225,36 @@ class TrustedEvaluationSpec:
 
 
 @dataclass(frozen=True)
+class TrialContinuation:
+    request_id: str
+    additional_attempts: int = 1
+    timeout_seconds: float | None = None
+
+    def validate(self) -> None:
+        if not self.request_id.strip():
+            raise ValueError("continuation request_id cannot be empty")
+        if self.additional_attempts != 1:
+            raise ValueError(
+                "strict session continuation currently permits exactly one "
+                "additional provider attempt"
+            )
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError(
+                "continuation timeout_seconds must be positive"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "schema_version": "1.0",
+            "request_id": self.request_id,
+            "additional_attempts": self.additional_attempts,
+            "timeout_seconds": self.timeout_seconds,
+            "strict_resume": True,
+        }
+
+
+@dataclass(frozen=True)
 class WorkloadSpec:
     workload_id: str
     trial: Path
@@ -434,6 +464,8 @@ class ExecutionBackend(Protocol):
         handle: BackendHandle,
         workload: WorkloadSpec,
         generation: int,
+        *,
+        continuation: TrialContinuation | None = None,
     ) -> BackendHandle: ...
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot: ...
