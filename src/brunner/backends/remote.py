@@ -4,7 +4,6 @@ import argparse
 import base64
 import json
 import os
-import re
 import shutil
 import stat
 import sys
@@ -22,9 +21,6 @@ from brunner.errors import IntegrityError
 from brunner.io import write_json_atomic
 from brunner.runtime_protocol import runtime_identity
 from brunner.submission import safe_child
-
-
-SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def _policy(
@@ -81,19 +77,13 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("path")
     read.add_argument("offset", type=int)
     read.add_argument("count", type=int)
-    file_info = subparsers.add_parser("file-info")
-    file_info.add_argument("root", type=Path)
-    file_info.add_argument("path")
-    write_chunk = subparsers.add_parser("write-chunk")
-    write_chunk.add_argument("root", type=Path)
-    write_chunk.add_argument("path")
-    write_chunk.add_argument("offset", type=int)
-    write_chunk.add_argument("total_size", type=int)
-    commit_file = subparsers.add_parser("commit-file")
-    commit_file.add_argument("root", type=Path)
-    commit_file.add_argument("path")
-    commit_file.add_argument("size", type=int)
-    commit_file.add_argument("sha256")
+    restore = subparsers.add_parser("restore-stream")
+    restore.add_argument("results", type=Path)
+    restore.add_argument("control", type=Path)
+    restore.add_argument("--inactivity-seconds", type=float, default=120)
+    restore.add_argument(
+        "--lock-path", type=Path, default=Path("/tmp/brunner-archive-restore.lock")
+    )
     subparsers.add_parser("protocol")
     clear = subparsers.add_parser("clear")
     clear.add_argument("root", type=Path)
@@ -121,145 +111,6 @@ def _clear_root(root: Path) -> None:
             path.unlink()
         else:
             shutil.rmtree(path)
-
-
-def _safe_output(root: Path, value: str) -> Path:
-    if not value:
-        raise IntegrityError("remote output path cannot be empty")
-    if not root.is_dir() or root.is_symlink():
-        raise IntegrityError(f"remote output root is unsafe: {root}")
-    relative = Path(value)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise IntegrityError(
-            f"remote output path escapes its root: {value}"
-        )
-    current = root
-    for part in relative.parts[:-1]:
-        current = current / part
-        if current.is_symlink():
-            raise IntegrityError(
-                f"remote output path contains a symlink: {current}"
-            )
-    target = root / relative
-    if target.is_symlink():
-        raise IntegrityError(
-            f"remote output path is a symlink: {target}"
-        )
-    resolved_parent = target.parent.resolve()
-    if not resolved_parent.is_relative_to(root.resolve()):
-        raise IntegrityError(
-            f"remote output path escapes its root: {value}"
-        )
-    return target
-
-
-def _file_info(root: Path, value: str) -> dict[str, object]:
-    path = _safe_output(root, value)
-    if not path.exists():
-        return {"exists": False}
-    if not path.is_file():
-        raise IntegrityError(f"remote path is not a regular file: {path}")
-    metadata = artifact_metadata(path)
-    if metadata is None or metadata.type != "file":
-        raise IntegrityError(f"remote path is not a regular file: {path}")
-    return {
-        "exists": True,
-        "size": metadata.size,
-        "sha256": metadata.sha256,
-    }
-
-
-def _write_chunk(
-    root: Path,
-    value: str,
-    offset: int,
-    total_size: int,
-) -> dict[str, object]:
-    if offset < 0 or total_size < 0 or offset > total_size:
-        raise IntegrityError("remote upload offset or size is invalid")
-    target = _safe_output(root, value)
-    if target.exists():
-        raise IntegrityError(
-            f"remote upload refuses to overwrite an existing file: {target}"
-        )
-    partial = target.with_name(target.name + ".brunner-part")
-    if partial.is_symlink():
-        raise IntegrityError(
-            f"remote upload partial path is a symlink: {partial}"
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    current_size = partial.stat().st_size if partial.is_file() else 0
-    if offset == 0:
-        mode = "wb"
-    elif current_size == offset:
-        mode = "ab"
-    else:
-        raise IntegrityError(
-            "remote upload offset does not match partial file size: "
-            f"{offset} != {current_size}"
-        )
-    data = sys.stdin.buffer.read()
-    if offset + len(data) > total_size:
-        raise IntegrityError(
-            "remote upload chunk exceeds declared file size"
-        )
-    with partial.open(mode) as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    return {"size": partial.stat().st_size}
-
-
-def _commit_file(
-    root: Path,
-    value: str,
-    size: int,
-    expected_sha256: str,
-) -> dict[str, object]:
-    target = _safe_output(root, value)
-    partial = target.with_name(target.name + ".brunner-part")
-    if (
-        size < 0
-        or SHA256_PATTERN.fullmatch(expected_sha256) is None
-    ):
-        raise IntegrityError("remote upload file metadata is invalid")
-    if target.is_file():
-        observed = _file_info(root, value)
-        if (
-            observed.get("size") == size
-            and observed.get("sha256") == expected_sha256
-        ):
-            partial.unlink(missing_ok=True)
-            return observed
-        raise IntegrityError(
-            f"remote upload refuses to replace changed content: {target}"
-        )
-    if not partial.is_file() or partial.is_symlink():
-        raise IntegrityError(
-            f"remote upload partial file is missing or unsafe: {partial}"
-        )
-    if partial.stat().st_size != size:
-        raise IntegrityError(
-            "remote upload partial file size mismatch: "
-            f"{partial.stat().st_size} != {size}"
-        )
-    metadata = artifact_metadata(partial)
-    if metadata is None or metadata.type != "file":
-        raise IntegrityError(
-            f"remote upload partial file is unsafe: {partial}"
-        )
-    observed_sha256 = metadata.sha256
-    if observed_sha256 != expected_sha256:
-        raise IntegrityError(
-            "remote upload partial file checksum mismatch: "
-            f"{observed_sha256} != {expected_sha256}"
-        )
-    partial.replace(target)
-    return {
-        "exists": True,
-        "size": size,
-        "sha256": observed_sha256,
-    }
 
 
 def _workspace_inventory(workspace: Path) -> dict[str, dict[str, object]]:
@@ -597,6 +448,14 @@ def _collect_copy(
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.command == "restore-stream":
+        from brunner.archive_transfer import serve_restore
+
+        return serve_restore(
+            args.results, args.control,
+            lock_path=args.lock_path,
+            timeout=args.inactivity_seconds,
+        )
     if args.command == "protocol":
         print(json.dumps(runtime_identity(), sort_keys=True))
         return 0
@@ -628,35 +487,6 @@ def main() -> int:
     root = args.root.resolve()
     if args.command == "clear":
         _clear_root(root)
-        return 0
-    if args.command == "file-info":
-        print(json.dumps(_file_info(root, args.path), sort_keys=True))
-        return 0
-    if args.command == "write-chunk":
-        print(
-            json.dumps(
-                _write_chunk(
-                    root,
-                    args.path,
-                    args.offset,
-                    args.total_size,
-                ),
-                sort_keys=True,
-            )
-        )
-        return 0
-    if args.command == "commit-file":
-        print(
-            json.dumps(
-                _commit_file(
-                    root,
-                    args.path,
-                    args.size,
-                    args.sha256,
-                ),
-                sort_keys=True,
-            )
-        )
         return 0
     if args.command == "verify-stage":
         print(json.dumps(_verify_stage(root, args.expected), sort_keys=True))

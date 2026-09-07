@@ -478,7 +478,7 @@ class ContinuationBackend(ImmediateBackend):
             workload_id=workload.workload_id,
             native_id=f"{workload.workload_id}-c{generation}",
             trial=workload.trial,
-            metadata={"submitted_at": "2026-08-26T12:00:00+00:00"},
+            metadata={"submitted_at": datetime.now(UTC).isoformat()},
         )
 
     def inspect(self, handle: BackendHandle) -> BackendSnapshot:

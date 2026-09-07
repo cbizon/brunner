@@ -659,3 +659,49 @@ metadata into fresh PVCs. Preparation and the controller start only after
 restore completes. Reconciliation then preserves historical completed IDs and
 stages only newly appended IDs. Existing differing remote content is never
 overwritten silently.
+
+Archive restoration uses the versioned `brunner-archive-stream-v1` protocol
+over one bidirectional `kubectl exec -i` connection per successful session.
+The sender provides the existing archive manifest once; the helper reconciles
+files on the PVC and requests only missing data. Chunks are bounded at 4 MiB,
+checksum-checked, flushed, and fsynced before acknowledgement. Each completed
+file is verified against its manifest SHA-256 and published without replacing
+an existing destination. File information, writes, and commits do not open
+separate Kubernetes connections.
+
+The control PVC's `.brunner-restore.json` binds restore progress to the campaign
+and archive-manifest hash. The checkpoint records verified files/bytes and the
+current partial offset, but it is not trusted as proof that files still match.
+Reconnecting reconciles existing files locally in the helper, without replaying
+per-file Kubernetes calls. Existing valid files and legacy `.brunner-part`
+uploads are reusable; a partial prefix must match the local source before it
+is extended. An interrupted chunk, lost acknowledgement, or interrupted commit
+is resolved from the actual files. Conflicting committed content, unsafe paths,
+malformed checkpoints, and storage failures are terminal errors.
+
+The single campaign archive-writer Pod uses a process lock on its local
+`emptyDir`, not on the network PVC, to serialize receivers. A dead receiver
+releases that lock. Reconnects adopt the same compatible Pod. Replacing a legacy
+or terminated helper requires confirmed normal Pod deletion; Brunner never
+force-deletes it or runs a second writer against the same claims. A completed
+restore can only be verified read-only, so a competing reconnect cannot reset
+its checkpoint while another submit starts preparation.
+
+Transport failures reconnect with bounded exponential backoff. The streaming
+inactivity timeout is separate from the short-command timeout; continued
+transfer or verification progress does not consume a fixed whole-upload
+deadline. Exhausting the no-progress retry budget or cancelling the submit
+leaves the helper, deny-all NetworkPolicy, and PVC data available for the same
+`--resume-from` command. Diagnostics include acknowledged upload bytes,
+verified files/bytes, and reconnects.
+
+The helper copies compact campaign state and historical trial metadata directly
+from results to control. It publishes the results manifest and restore marker
+only after verification, then marks the checkpoint complete. Preparation also
+checks the checkpoint, independently of the submit client, before touching
+historical state. Helper cleanup occurs only after successful restoration;
+cleanup errors explicitly report that restoration completed and submission
+needs another attempt. No cleanup exception can replace an upload failure.
+The stream protocol is independent of the agent runtime protocol: using it
+requires updated local Brunner and controller/archive-writer images, not
+rebuilding unchanged agent or evaluator images.
