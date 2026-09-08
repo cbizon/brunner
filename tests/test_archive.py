@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
-import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from brunner.archive import ARCHIVE_MANIFEST, load_campaign_archive
+from brunner.archive_transfer import restore_archive_stream
 from brunner.errors import IntegrityError
 
 
@@ -117,40 +117,27 @@ def test_remote_upload_protocol_resumes_and_commits_real_subprocess(
 ) -> None:
     root = tmp_path / "remote"
     root.mkdir()
+    control = tmp_path / "control"
+    control.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_archive(source)
     content = b"portable campaign archive"
-    command = [
-        sys.executable,
-        "-m",
-        "brunner.backends.remote",
-        "write-chunk",
-        str(root),
-        "nested/archive.bin",
-    ]
-    subprocess.run(
-        [*command, "0", str(len(content))],
-        input=content[:9],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [*command, "9", str(len(content))],
-        input=content[9:],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "brunner.backends.remote",
-            "commit-file",
-            str(root),
-            "nested/archive.bin",
-            str(len(content)),
-            hashlib.sha256(content).hexdigest(),
-        ],
-        check=True,
-        capture_output=True,
+    (source / "nested").mkdir()
+    (source / "nested/archive.bin").write_bytes(content)
+    manifest = json.loads((source / ARCHIVE_MANIFEST).read_text())
+    manifest["files"].append({
+        "path": "nested/archive.bin", "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    })
+    (source / ARCHIVE_MANIFEST).write_text(json.dumps(manifest))
+    (root / "nested").mkdir()
+    (root / "nested/archive.bin.brunner-part").write_bytes(content[:9])
+    restore_archive_stream(
+        (sys.executable, "-m", "brunner.backends.remote", "restore-stream",
+         str(root), str(control), "--lock-path", str(tmp_path / "lock")),
+        load_campaign_archive(source, require_resumable=True),
+        retry_seconds=0,
     )
 
     assert (root / "nested/archive.bin").read_bytes() == content

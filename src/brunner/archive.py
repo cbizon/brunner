@@ -1,18 +1,41 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 from brunner.errors import IntegrityError
 from brunner.hashing import sha256_file
 
-
 ARCHIVE_MANIFEST = "result-manifest.json"
 ARCHIVE_SCHEMA_VERSIONS = frozenset({"1.0", "2.0"})
 TERMINAL_CAMPAIGN_STATES = frozenset({"complete", "attention_required"})
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def safe_archive_destination(root: Path, value: str) -> Path:
+    if not value:
+        raise IntegrityError("remote output path cannot be empty")
+    if not root.is_dir() or root.is_symlink():
+        raise IntegrityError(f"remote output root is unsafe: {root}")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise IntegrityError(f"remote output path escapes its root: {value}")
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise IntegrityError(
+                f"remote output path contains a symlink: {current}"
+            )
+    target = root / relative
+    if target.is_symlink():
+        raise IntegrityError(f"remote output path is a symlink: {target}")
+    resolved_parent = target.parent.resolve()
+    if not resolved_parent.is_relative_to(root.resolve()):
+        raise IntegrityError(f"remote output path escapes its root: {value}")
+    return target
 
 
 def _safe_archive_file(root: Path, relative_value: object) -> Path:

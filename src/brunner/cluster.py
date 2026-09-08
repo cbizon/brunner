@@ -7,29 +7,34 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
+import sys
 import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from brunner.archive import (
     ARCHIVE_MANIFEST,
     load_campaign_archive,
 )
+from brunner.archive_transfer import (
+    RESTORE_JOURNAL,
+    restore_archive_stream,
+    transport_error_type,
+)
+from brunner.artifacts import artifact_metadata
 from brunner.backends import (
     KubernetesBackend,
     KubernetesProfile,
     TrialContinuation,
 )
-from brunner.artifacts import artifact_metadata
 from brunner.backends.squid import (
     MANAGED_PROXY_PORT,
-    managed_proxy_labels,
 )
 from brunner.campaign import (
     CampaignEngine,
@@ -48,7 +53,6 @@ from brunner.errors import (
 )
 from brunner.hashing import sha256_file
 from brunner.io import write_json_atomic
-
 
 CONTROL_ROOT = Path("/brunner/control")
 RESULTS_ROOT = Path("/brunner/results")
@@ -129,6 +133,8 @@ class ControllerProfile:
     lock_duration_seconds: int = 60
     command_timeout_seconds: float = 120
     retrieval_chunk_bytes: int = 4 * 1024 * 1024
+    restore_inactivity_seconds: float = 120
+    restore_retry_seconds: float = 10 * 60
     max_published_trial_bytes: int | None = 10 * 1024 * 1024 * 1024
     controller_cpu_request: str = "250m"
     controller_cpu_limit: str = "2"
@@ -182,6 +188,10 @@ class ControllerProfile:
             raise ValueError(
                 "controller retrieval_chunk_bytes must be positive"
             )
+        for name in ("restore_inactivity_seconds", "restore_retry_seconds"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"controller {name} must be positive and finite")
         if (
             self.max_published_trial_bytes is not None
             and self.max_published_trial_bytes < 1
@@ -474,26 +484,7 @@ class Kubectl:
             message = (result.stderr or result.stdout).decode(
                 errors="replace"
             ).strip()
-            lowered = message.lower()
-            error_type = (
-                BackendConnectivityError
-                if any(
-                    fragment in lowered
-                    for fragment in (
-                        "connection refused",
-                        "connection reset",
-                        "context deadline exceeded",
-                        "i/o timeout",
-                        "no route to host",
-                        "no such host",
-                        "service unavailable",
-                        "tls handshake timeout",
-                        "unable to connect",
-                        "unexpected eof",
-                    )
-                )
-                else BackendRequestError
-            )
+            error_type = transport_error_type(message)
             raise error_type(
                 f"{self.executable} {' '.join(arguments)} exited "
                 f"{result.returncode}: {message}"
@@ -548,7 +539,14 @@ class Kubectl:
             input_value=json.dumps(resource),
             check=False,
         )
-        return result.returncode == 0
+        if result.returncode:
+            diagnostic = result.stderr or result.stdout
+            if "alreadyexists" in diagnostic.lower() or "already exists" in diagnostic.lower():
+                return False
+            raise transport_error_type(diagnostic)(
+                f"kubectl create failed: {diagnostic}"
+            )
+        return True
 
     def get(
         self,
@@ -566,7 +564,14 @@ class Kubectl:
         arguments.extend(("-o", "json"))
         result = self.run(*arguments, check=False)
         if result.returncode:
-            lowered = (result.stderr or result.stdout).lower()
+            diagnostic = result.stderr or result.stdout
+            lowered = diagnostic.lower()
+            error_type = transport_error_type(diagnostic)
+            if error_type is BackendConnectivityError:
+                raise error_type(
+                    f"kubectl {' '.join(arguments)} exited "
+                    f"{result.returncode}: {diagnostic}"
+                )
             if "not found" in lowered or "notfound" in lowered:
                 return None
             raise BackendRequestError(
@@ -2023,6 +2028,20 @@ def prepare_cluster_campaign(
     )
     try:
         verify_campaign_sha256(campaign, expected_sha256)
+        restore_journal = CONTROL_ROOT / RESTORE_JOURNAL
+        if restore_journal.exists() or restore_journal.is_symlink():
+            if restore_journal.is_symlink():
+                raise IntegrityError("unsafe archive restore checkpoint")
+            restore_state = json.loads(restore_journal.read_text())
+            if (
+                not isinstance(restore_state, dict)
+                or restore_state.get("status") != "complete"
+                or restore_state.get("campaign_id") != campaign.plan.campaign_id
+            ):
+                raise IntegrityError(
+                    "campaign archive restoration is incomplete; rerun "
+                    "campaign-submit with the same --resume-from archive"
+                )
         result_manifest = RESULTS_ROOT / RESULT_MANIFEST
         if result_manifest.is_file():
             existing = json.loads(result_manifest.read_text())
@@ -2624,6 +2643,13 @@ class ClusterCampaignClient:
                 "Deployment exists; retire the remote campaign first or "
                 "submit without --resume-from"
             )
+        if archive is None and self.client.get(
+            "pod", f"{self.resources.base}-archive-writer"
+        ) is not None:
+            raise BackendRequestError(
+                "an archive writer exists; finish restoration using the same "
+                "--resume-from archive before submitting the campaign"
+            )
         rendered = render_cluster_resources(
             self.definition,
             self.campaign,
@@ -2929,7 +2955,7 @@ class ClusterCampaignClient:
             timeout_seconds=330,
         )
         if result.returncode:
-            raise BackendRequestError(
+            raise transport_error_type(result.stderr or result.stdout)(
                 f"campaign archive transfer Pod did not become ready: "
                 f"{result.stderr or result.stdout}"
             )
@@ -2974,302 +3000,153 @@ class ClusterCampaignClient:
             count,
         )
 
-    def _remote_file_info(
-        self,
-        pod: str,
-        root: Path,
-        relative: str,
-    ) -> dict[str, Any]:
-        result = self.client.run(
-            "exec",
-            "-n",
-            self.resources.namespace,
-            pod,
-            "--",
-            "python",
-            "-m",
-            "brunner.backends.remote",
-            "file-info",
-            str(root),
-            relative,
-        )
-        value = json.loads(result.stdout)
-        if not isinstance(value, dict):
-            raise IntegrityError(
-                "archive transfer returned malformed file metadata"
-            )
-        return value
-
-    def _write_remote_chunk(
-        self,
-        pod: str,
-        root: Path,
-        relative: str,
-        *,
-        offset: int,
-        total_size: int,
-        data: bytes,
-    ) -> None:
-        self.client.run_bytes(
-            "exec",
-            "-i",
-            "-n",
-            self.resources.namespace,
-            pod,
-            "--",
-            "python",
-            "-m",
-            "brunner.backends.remote",
-            "write-chunk",
-            str(root),
-            relative,
-            str(offset),
-            str(total_size),
-            input_bytes=data,
-        )
-
-    def _commit_remote_file(
-        self,
-        pod: str,
-        root: Path,
-        relative: str,
-        *,
-        size: int,
-        sha256: str,
-    ) -> None:
-        self.client.run(
-            "exec",
-            "-n",
-            self.resources.namespace,
-            pod,
-            "--",
-            "python",
-            "-m",
-            "brunner.backends.remote",
-            "commit-file",
-            str(root),
-            relative,
-            str(size),
-            sha256,
-        )
-
-    def _upload_file(
-        self,
-        pod: str,
-        root: Path,
-        relative: str,
-        source: Path,
-        *,
-        size: int,
-        expected_sha256: str,
-    ) -> None:
-        existing = self._remote_file_info(pod, root, relative)
-        if existing.get("exists") is True:
-            if (
-                existing.get("size") == size
-                and existing.get("sha256") == expected_sha256
-            ):
-                return
-            raise IntegrityError(
-                "campaign archive restore refuses to overwrite changed "
-                f"remote content: {relative}"
-            )
-        partial_relative = relative + ".brunner-part"
-        partial = self._remote_file_info(
-            pod,
-            root,
-            partial_relative,
-        )
-        offset = int(partial.get("size") or 0)
-        if offset > size:
-            offset = 0
-        if offset:
-            prefix_digest = hashlib.sha256()
-            remaining = offset
-            with source.open("rb") as stream:
-                while remaining:
-                    chunk = stream.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        break
-                    prefix_digest.update(chunk)
-                    remaining -= len(chunk)
-            if (
-                remaining
-                or partial.get("sha256") != prefix_digest.hexdigest()
-            ):
-                offset = 0
-        with source.open("rb") as stream:
-            stream.seek(offset)
-            if size == 0 and offset == 0:
-                self._write_remote_chunk(
-                    pod,
-                    root,
-                    relative,
-                    offset=0,
-                    total_size=0,
-                    data=b"",
-                )
-            while offset < size:
-                data = stream.read(
-                    min(
-                        self.campaign.controller.retrieval_chunk_bytes,
-                        size - offset,
-                    )
-                )
-                if not data:
-                    raise IntegrityError(
-                        "campaign archive source ended early during restore: "
-                        f"{relative} at {offset}"
-                    )
-                self._write_remote_chunk(
-                    pod,
-                    root,
-                    relative,
-                    offset=offset,
-                    total_size=size,
-                    data=data,
-                )
-                offset += len(data)
-        self._commit_remote_file(
-            pod,
-            root,
-            relative,
-            size=size,
-            sha256=expected_sha256,
-        )
-
-    def _upload_bytes(
-        self,
-        pod: str,
-        root: Path,
-        relative: str,
-        content: bytes,
-    ) -> None:
-        descriptor, name = tempfile.mkstemp(
-            prefix="brunner-archive-",
-            suffix=".json",
-        )
-        os.close(descriptor)
-        temporary = Path(name)
-        try:
-            temporary.write_bytes(content)
-            self._upload_file(
-                pod,
-                root,
-                relative,
-                temporary,
-                size=len(content),
-                expected_sha256=hashlib.sha256(content).hexdigest(),
-            )
-        finally:
-            temporary.unlink(missing_ok=True)
-
     def _restore_archive(self, archive: dict[str, Any]) -> None:
         pod_resource = self._transfer_pod(write=True)
         pod = str(pod_resource["metadata"]["name"])
         role = "archive-writer"
-        self.client.delete("pod", pod, wait=True)
-        self.client.delete("networkpolicy", pod, wait=True)
-        self.client.apply(
-            self._transfer_network_policy(pod, role=role)
-        )
-        self.client.apply(pod_resource)
-        try:
-            self._wait_transfer_pod(pod)
-            expected_manifest = archive["manifest_sha256"]
-            existing_manifest = self._remote_file_info(
-                pod,
-                RESULTS_ROOT,
-                RESULT_MANIFEST,
-            )
-            if (
-                existing_manifest.get("exists") is True
-                and existing_manifest.get("sha256") != expected_manifest
-            ):
-                raise IntegrityError(
-                    "results PVC already contains a different campaign "
-                    "archive"
+        manifest_annotation = "dev.brunner/restore-manifest-sha256"
+        pod_resource["metadata"]["annotations"] = {
+            manifest_annotation: archive["manifest_sha256"],
+        }
+
+        def command() -> tuple[str, ...]:
+            if self.client.get("deployment", self.resources.deployment) is not None:
+                raise BackendRequestError(
+                    "controller started during archive restore; "
+                    "do not restore over an active campaign"
                 )
-            campaign_record = archive["files"]["campaign.json"]
-            existing_state = self._remote_file_info(
-                pod,
-                CONTROL_ROOT,
-                "campaign.json",
+            existing = self.client.get("pod", pod)
+            if existing is not None:
+                metadata = existing.get("metadata", {})
+                if any(
+                    metadata.get("labels", {}).get(key) != value
+                    for key, value in pod_resource["metadata"]["labels"].items()
+                ):
+                    raise IntegrityError("archive writer Pod has different ownership")
+                recorded = metadata.get("annotations", {}).get(manifest_annotation)
+                if recorded not in {None, archive["manifest_sha256"]}:
+                    raise IntegrityError("archive writer belongs to a different archive")
+                if (
+                    recorded is None
+                    or existing.get("status", {}).get("phase") in {"Failed", "Succeeded"}
+                ):
+                    # Fence an old helper before replacement; never force-delete
+                    # or run two writers against these claims.
+                    self.client.delete("pod", pod, wait=True)
+                    existing = None
+                else:
+                    spec = existing.get("spec", {})
+                    containers = spec.get("containers", [])
+                    expected = pod_resource["spec"]
+                    expected_container = expected["containers"][0]
+                    actual_volumes = {
+                        volume["name"]: volume for volume in spec.get("volumes", [])
+                    }
+                    expected_volumes = {
+                        volume["name"]: volume for volume in expected["volumes"]
+                    }
+                    volumes_match = set(actual_volumes) == set(expected_volumes)
+                    for name, volume in expected_volumes.items():
+                        actual = actual_volumes.get(name, {})
+                        if "persistentVolumeClaim" in volume:
+                            claim = actual.get("persistentVolumeClaim", {})
+                            volumes_match = volumes_match and (
+                                claim.get("claimName")
+                                == volume["persistentVolumeClaim"]["claimName"]
+                                and not claim.get("readOnly", False)
+                            )
+                        else:
+                            volumes_match = volumes_match and actual.get("emptyDir") == {}
+                    mounts_match = len(containers) == 1 and {
+                        (
+                            mount.get("name"), mount.get("mountPath"),
+                            bool(mount.get("readOnly", False)),
+                            mount.get("subPath"), mount.get("subPathExpr"),
+                        )
+                        for mount in containers[0].get("volumeMounts", [])
+                    } == {
+                        (
+                            mount["name"], mount["mountPath"],
+                            bool(mount.get("readOnly", False)), None, None,
+                        )
+                        for mount in expected_container["volumeMounts"]
+                    }
+                    if (
+                        spec.get("automountServiceAccountToken") is not False
+                        or not volumes_match
+                        or not mounts_match
+                        or containers[0].get("image") != expected_container["image"]
+                        or containers[0].get("command") != expected_container["command"]
+                    ):
+                        raise BackendRequestError(
+                            "archive writer image or mounts changed; finish or stop "
+                            "the existing restore before replacing its helper"
+                        )
+            self.client.apply(self._transfer_network_policy(pod, role=role))
+            # create is atomic; another submit may have won the race.
+            if existing is None and not self.client.create(pod_resource):
+                raise BackendConnectivityError(
+                    "archive writer creation raced; reconnecting"
+                )
+            self._wait_transfer_pod(pod)
+            return (
+                self.client.executable, "exec", "-i",
+                "-n", self.resources.namespace, pod, "--",
+                "python", "-m", "brunner.backends.remote", "restore-stream",
+                str(RESULTS_ROOT), str(CONTROL_ROOT),
+                "--inactivity-seconds",
+                str(self.campaign.controller.restore_inactivity_seconds),
             )
-            if existing_state.get("exists") is True and (
-                existing_state.get("size") != campaign_record["size"]
-                or existing_state.get("sha256")
-                != campaign_record["sha256"]
+
+        last_report = 0.0
+        uploaded = 0
+        verified_files = 0
+        verified_bytes = 0
+        total = sum(record["size"] for record in archive["files"].values())
+
+        def progress(event: dict[str, Any]) -> None:
+            nonlocal last_report, uploaded, verified_files, verified_bytes
+            if event["type"] == "uploaded":
+                uploaded += event["bytes"]
+            verified_files = max(verified_files, event.get("files_verified", 0))
+            verified_bytes = max(verified_bytes, event.get("bytes_verified", 0))
+            now = time.monotonic()
+            if event["type"] in {"reconnecting", "complete"} or (
+                now - last_report >= 5
             ):
-                raise IntegrityError(
-                    "control PVC already contains different campaign state"
+                last_report = now
+                print(
+                    "Archive restore: "
+                    + (
+                        f"reconnecting in {event['delay_seconds']:.1f}s: {event['error']}"
+                        if event["type"] == "reconnecting"
+                        else f"{verified_files}/{len(archive['files'])} "
+                        f"files, {verified_bytes}/{total} bytes verified; "
+                        f"{uploaded} uploaded bytes acknowledged; "
+                        f"{event['reconnects']} reconnects"
+                    ),
+                    file=sys.stderr,
+                    flush=True,
                 )
 
-            for relative, record in sorted(archive["files"].items()):
-                self._upload_file(
-                    pod,
-                    RESULTS_ROOT,
-                    relative,
-                    archive["root"] / relative,
-                    size=int(record["size"]),
-                    expected_sha256=str(record["sha256"]),
-                )
-            manifest_path = archive["manifest_path"]
-            self._upload_file(
-                pod,
-                RESULTS_ROOT,
-                RESULT_MANIFEST,
-                manifest_path,
-                size=manifest_path.stat().st_size,
-                expected_sha256=expected_manifest,
-            )
-            for trial in archive["state"]["trials"]:
-                test_id = str(trial["test_id"])
-                relative = f"trials/{test_id}/metadata/manifest.json"
-                record = archive["files"][relative]
-                self._upload_file(
-                    pod,
-                    CONTROL_ROOT,
-                    relative,
-                    archive["root"] / relative,
-                    size=int(record["size"]),
-                    expected_sha256=str(record["sha256"]),
-                )
-            state_path = archive["root"] / "campaign.json"
-            self._upload_file(
-                pod,
-                CONTROL_ROOT,
-                "campaign.json",
-                state_path,
-                size=int(campaign_record["size"]),
-                expected_sha256=str(campaign_record["sha256"]),
-            )
-            self._upload_file(
-                pod,
-                CONTROL_ROOT,
-                "campaign.json.bak",
-                state_path,
-                size=int(campaign_record["size"]),
-                expected_sha256=str(campaign_record["sha256"]),
-            )
-            marker = json.dumps(
-                {
-                    "schema_version": "1.0",
-                    "campaign_id": self.campaign.plan.campaign_id,
-                    "archive_manifest_sha256": expected_manifest,
-                },
-                indent=2,
-                sort_keys=True,
-            ).encode() + b"\n"
-            self._upload_bytes(
-                pod,
-                CONTROL_ROOT,
-                RESUME_ARCHIVE_MARKER,
-                marker,
-            )
-        finally:
+        # On failure retain the helper and its deny-all policy as well as both
+        # PVCs. Cleanup cannot hide the primary error and reconnect can adopt it.
+        restore_archive_stream(
+            command, archive,
+            inactivity_seconds=self.campaign.controller.restore_inactivity_seconds,
+            retry_seconds=self.campaign.controller.restore_retry_seconds,
+            chunk_bytes=self.campaign.controller.retrieval_chunk_bytes,
+            progress=progress,
+        )
+        try:
             self.client.delete("pod", pod, wait=True)
             self.client.delete("networkpolicy", pod, wait=True)
+        except (BackendConnectivityError, BackendRequestError) as error:
+            raise type(error)(
+                "archive restore is complete, but helper cleanup failed; "
+                "rerun the same --resume-from command to finish submission: "
+                f"{error}"
+            ) from error
 
     def _download_file(
         self,

@@ -132,6 +132,13 @@ Brunner restores completed state and published results before preparation and
 reconciliation, so unchanged historical IDs are not rerun and new IDs append
 normally.
 
+Archive restoration streams over a reconnectable Kubernetes exec session
+instead of opening a connection per file or chunk. Temporary network loss
+retries automatically; after cancellation or an exhausted retry budget, repeat
+the same `--resume-from` command to reuse verified files and partial uploads.
+Restore requires updated local Brunner and controller images, without changing
+the archive format or rebuilding unchanged agent/evaluator images.
+
 The controller image must contain Brunner, `kubectl`, and the benchmark
 definition/campaign/assessment code. Provider credentials must already exist
 as Kubernetes Secrets. Brunner passes Secret references only to agent or

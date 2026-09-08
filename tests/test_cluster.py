@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import json
+import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,8 @@ import pytest
 import brunner
 import brunner.cluster as cluster_module
 from brunner.archive import load_campaign_archive
-from brunner.backends import KubernetesProfile
-from brunner.campaign import CampaignPlan, CampaignTrial
+from brunner.backends import KubernetesBackend, KubernetesProfile
+from brunner.campaign import CampaignEngine, CampaignPlan, CampaignTrial
 from brunner.cluster import (
     CAMPAIGN_IMAGE_OVERRIDES_ENV,
     CAMPAIGN_SHA256_ANNOTATION,
@@ -25,25 +26,25 @@ from brunner.cluster import (
     ClusterCampaignClient,
     ConfigMapLock,
     ControllerProfile,
-    KubernetesEvaluationFinalizer,
     Kubectl,
+    KubernetesEvaluationFinalizer,
     apply_campaign_image_overrides,
     apply_definition_image_override,
     campaign_image_environment,
-    definition_image_environment,
     campaign_resources,
+    definition_image_environment,
     finalize_result_bundle,
     publish_trial_results,
     render_cluster_resources,
 )
 from brunner.contract import load_output_contract
 from brunner.errors import (
+    BackendConnectivityError,
     BackendRequestError,
     EvaluationPending,
     IntegrityError,
 )
 from examples.text_benchmark.definition import build_definition
-
 
 IMAGE = "registry.example/brunner@sha256:" + "1" * 64
 
@@ -1240,7 +1241,7 @@ class FakeSubmitKubectl:
         labels: str | None = None,
     ) -> dict[str, Any] | None:
         assert labels is None
-        if kind == "deployment":
+        if kind in {"deployment", "pod"}:
             return None
         if kind == "configmap":
             return None
@@ -1445,56 +1446,258 @@ def test_restore_uploads_published_results_and_compact_control_state(
     archive = client._validate_resume_archive(tmp_path)
     fake = FakeSubmitKubectl()
     client.client = fake  # type: ignore[assignment]
-    uploads: list[tuple[Path, str]] = []
-    byte_uploads: list[tuple[Path, str]] = []
     monkeypatch.setattr(client, "_wait_transfer_pod", lambda name: None)
-    monkeypatch.setattr(
-        client,
-        "_remote_file_info",
-        lambda *args: {"exists": False},
-    )
-    monkeypatch.setattr(
-        client,
-        "_upload_file",
-        lambda pod, root, relative, *args, **kwargs: uploads.append(
-            (root, relative)
-        ),
-    )
-    monkeypatch.setattr(
-        client,
-        "_upload_bytes",
-        lambda pod, root, relative, content: byte_uploads.append(
-            (root, relative)
-        ),
-    )
+    results = tmp_path / "remote-results"
+    control = tmp_path / "remote-control"
+    results.mkdir()
+    control.mkdir()
+    monkeypatch.setattr(cluster_module, "RESULTS_ROOT", results)
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", control)
+    fake.executable = "kubectl"  # type: ignore[attr-defined]
+    fake.create = lambda resource: True  # type: ignore[attr-defined]
+    streaming_restore = cluster_module.restore_archive_stream
+    commands = []
+
+    def local_restore(command, archive, **kwargs):
+        arguments = command()
+        commands.append(arguments)
+        start = arguments.index("--") + 2
+        return streaming_restore(
+            (sys.executable, *arguments[start:], "--lock-path", str(tmp_path / "lock")),
+            archive,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cluster_module, "restore_archive_stream", local_restore)
 
     client._restore_archive(archive)
 
     result_paths = {
-        relative
-        for root, relative in uploads
-        if root == cluster_module.RESULTS_ROOT
+        path.relative_to(results).as_posix()
+        for path in results.rglob("*") if path.is_file()
     }
     assert result_paths == {
         *archive["files"],
         RESULT_MANIFEST,
     }
     control_paths = {
-        relative
-        for root, relative in uploads
-        if root == cluster_module.CONTROL_ROOT
+        path.relative_to(control).as_posix()
+        for path in control.rglob("*") if path.is_file()
     }
     assert control_paths == {
         "campaign.json",
         "campaign.json.bak",
         "trials/run-a/metadata/manifest.json",
+        cluster_module.RESUME_ARCHIVE_MARKER,
+        cluster_module.RESTORE_JOURNAL,
     }
-    assert byte_uploads == [
-        (
-            cluster_module.CONTROL_ROOT,
-            cluster_module.RESUME_ARCHIVE_MARKER,
+    assert len(commands) == 1
+    assert "restore-stream" in commands[0]
+
+
+def test_restored_sixteen_trials_remain_complete_when_two_are_appended(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    from brunner.archive_transfer import restore_archive_stream
+
+    definition = build_definition()
+    contract = load_output_contract(definition.contract_path)
+    trials = tuple(CampaignTrial(f"old-{index}", "codex", "model-a") for index in range(16))
+    campaign = _campaign(*trials)
+    backend = KubernetesBackend(campaign.backend)
+    control = tmp_path / "control"
+    results = tmp_path / "results"
+    engine = CampaignEngine(
+        definition, contract, campaign.plan, backend,
+        control_root=control, results_root=results,
+    )
+    state = engine.initialize()
+    state["status"] = "complete"
+    for entry in state["trials"]:
+        entry.update(phase="complete", outcome="succeeded", completed_at="2026-08-26T12:00:00+00:00")
+    source = tmp_path / "archive"
+    source.mkdir()
+    (source / "campaign.json").write_text(json.dumps(state))
+    for entry in state["trials"]:
+        name = f"trials/{entry['test_id']}/metadata/manifest.json"
+        destination = source / name
+        destination.parent.mkdir(parents=True)
+        shutil.copyfile(control / name, destination)
+        destination.with_name("historical-result.txt").write_text(entry["test_id"])
+    manifest = {
+        "schema_version": "2.0", "campaign_id": campaign.plan.campaign_id,
+        "campaign_sha256": campaign.sha256, "terminal": True,
+        "files": [
+            {"path": path.relative_to(source).as_posix(),
+             "size": path.stat().st_size,
+             "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in source.rglob("*") if path.is_file()
+        ],
+    }
+    (source / RESULT_MANIFEST).write_text(json.dumps(manifest))
+    archive = load_campaign_archive(source, require_resumable=True)
+    shutil.rmtree(control)
+    control.mkdir()
+    # The existing dashboard is a fixture artifact, not part of the archive.
+    shutil.rmtree(results)
+    results.mkdir()
+    restore_archive_stream(
+        (sys.executable, "-m", "brunner.backends.remote", "restore-stream",
+         str(results), str(control), "--lock-path", str(tmp_path / "lock")),
+        archive, retry_seconds=0,
+    )
+    before = {
+        path: path.read_bytes()
+        for path in results.rglob("historical-result.txt")
+    }
+    plan = replace(campaign.plan, trials=(
+        *trials,
+        CampaignTrial("new-a", "codex", "new-model"),
+        CampaignTrial("new-b", "codex", "new-model"),
+    ))
+    restored = CampaignEngine(
+        definition, contract, plan, backend,
+        control_root=control, results_root=results,
+    ).initialize()
+    by_id = {entry["test_id"]: entry for entry in restored["trials"]}
+    assert len(by_id) == 18
+    assert all(by_id[trial.test_id]["phase"] == "complete" for trial in trials)
+    assert all(
+        by_id[trial.test_id]["completed_at"] == "2026-08-26T12:00:00+00:00"
+        for trial in trials
+    )
+    assert [by_id[name]["phase"] for name in ("new-a", "new-b")] == ["pending", "pending"]
+    assert all(path.read_bytes() == value for path, value in before.items())
+
+
+def test_restore_failure_preserves_primary_error_and_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    _write_archive(tmp_path, campaign)
+    client = ClusterCampaignClient(
+        build_definition(), campaign,
+        benchmark_ref="examples.text_benchmark.definition", campaign_ref="campaign",
+    )
+    fake = FakeSubmitKubectl()
+    client.client = fake
+
+    def interrupted(*args, **kwargs):
+        raise BackendConnectivityError("original transport failure")
+
+    monkeypatch.setattr(cluster_module, "restore_archive_stream", interrupted)
+    with pytest.raises(BackendConnectivityError, match="original transport failure"):
+        client._restore_archive(client._validate_resume_archive(tmp_path))
+    assert not any(event[0] == "delete" for event in fake.events)
+
+
+def test_completed_restore_cleanup_failure_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    _write_archive(tmp_path, campaign)
+    client = ClusterCampaignClient(
+        build_definition(), campaign,
+        benchmark_ref="examples.text_benchmark.definition", campaign_ref="campaign",
+    )
+    fake = FakeSubmitKubectl()
+    client.client = fake
+    monkeypatch.setattr(cluster_module, "restore_archive_stream", lambda *args, **kwargs: {})
+
+    def offline(*args, **kwargs):
+        raise BackendConnectivityError("no such host")
+
+    monkeypatch.setattr(fake, "delete", offline)
+    with pytest.raises(BackendConnectivityError, match="complete, but helper cleanup failed"):
+        client._restore_archive(client._validate_resume_archive(tmp_path))
+
+
+def test_preparation_cannot_bypass_incomplete_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = build_definition()
+    campaign = _campaign()
+    monkeypatch.setattr(cluster_module, "CONTROL_ROOT", tmp_path)
+    (tmp_path / cluster_module.RESTORE_JOURNAL).write_text(json.dumps({
+        "campaign_id": campaign.plan.campaign_id, "status": "restoring",
+    }))
+    with pytest.raises(IntegrityError, match="restoration is incomplete"):
+        cluster_module.prepare_cluster_campaign(
+            definition, load_output_contract(definition.contract_path),
+            campaign, expected_sha256=campaign.sha256,
         )
-    ]
+    assert not (tmp_path / f"prepared-{campaign.sha256}.json").exists()
+
+
+def test_restore_adopts_pod_with_kubernetes_defaulted_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    _write_archive(tmp_path, campaign)
+    client = ClusterCampaignClient(
+        build_definition(), campaign,
+        benchmark_ref="examples.text_benchmark.definition", campaign_ref="campaign",
+    )
+    archive = client._validate_resume_archive(tmp_path)
+    pod = client._transfer_pod(write=True)
+    pod["metadata"]["annotations"] = {
+        "dev.brunner/restore-manifest-sha256": archive["manifest_sha256"],
+    }
+    for volume in pod["spec"]["volumes"]:
+        volume.get("persistentVolumeClaim", {}).pop("readOnly", None)
+    for mount in pod["spec"]["containers"][0]["volumeMounts"]:
+        mount.pop("readOnly", None)
+    fake = FakeSubmitKubectl()
+    fake.executable = "kubectl"
+    monkeypatch.setattr(fake, "get", lambda kind, name: pod if kind == "pod" else None)
+    client.client = fake
+    monkeypatch.setattr(client, "_wait_transfer_pod", lambda name: None)
+    commands = []
+
+    def connect(command, archive, **kwargs):
+        commands.append(command())
+        return {}
+
+    monkeypatch.setattr(cluster_module, "restore_archive_stream", connect)
+    client._restore_archive(archive)
+    assert len(commands) == 1
+    assert not any(event == ("apply", f"Pod/{pod['metadata']['name']}") for event in fake.events)
+
+
+def test_submit_without_archive_cannot_bypass_retained_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign = _campaign()
+    client = ClusterCampaignClient(
+        build_definition(), campaign,
+        benchmark_ref="examples.text_benchmark.definition", campaign_ref="campaign",
+    )
+    fake = FakeSubmitKubectl()
+    monkeypatch.setattr(fake, "get", lambda kind, name: {} if kind == "pod" else None)
+    client.client = fake
+    with pytest.raises(BackendRequestError, match="archive writer exists"):
+        client.submit()
+    assert fake.events == []
+
+
+@pytest.mark.parametrize("message,exception", [
+    ("read tcp: can't assign requested address", BackendConnectivityError),
+    ("Forbidden", BackendRequestError),
+])
+def test_kubectl_create_classifies_real_process_failure(
+    tmp_path: Path, message: str, exception: type[Exception],
+) -> None:
+    executable = tmp_path / "kubectl"
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        f"sys.stderr.write({message!r})\nsys.exit(1)\n"
+    )
+    executable.chmod(0o700)
+    client = Kubectl("bizon", executable=str(executable))
+    with pytest.raises(exception, match=message):
+        client.create({"kind": "Pod"})
 
 
 def test_resume_rejects_incompatible_trial_metadata(

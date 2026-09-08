@@ -840,6 +840,53 @@ and starts the controller. Existing completed IDs remain complete; newly added
 IDs are staged and run. A restore is refused while the old controller
 Deployment still exists or if either new PVC already contains different state.
 
+Restoration uses a single streaming `kubectl exec -i` session, reconnecting on
+transient transport failures. It does not create one connection per file or
+chunk. The terminal archive format and `--resume-from` command are unchanged.
+The archive-writer uses the configured controller image; update both local
+Brunner and that image before using the streaming protocol. An older image
+fails explicitly rather than falling back to the per-file uploader. This
+transport change does not require new agent or evaluator images.
+
+The transfer prints verified file/byte counts, acknowledged uploaded bytes,
+and reconnect attempts to stderr. `ControllerProfile` exposes:
+
+- `restore_inactivity_seconds` (default 120): maximum silence during streaming
+  I/O, not a limit on total restore duration.
+- `restore_retry_seconds` (default 600): bounded outage retry window, reset
+  when additional data is acknowledged or verified on reconnect. Repeatedly
+  rechecking the same bytes does not reset this budget.
+
+If your laptop sleeps, connectivity fails, or you cancel the command, rerun
+the identical `campaign-submit ... --resume-from ...` command. Brunner retains
+the PVC checkpoint, verified files, partial files, helper Pod, and deny-all
+NetworkPolicy. Reconciliation runs inside the helper; it verifies existing
+bytes locally rather than issuing a `kubectl exec` per file. The checkpoint
+does not bypass checksum validation. Valid uploads left by the old per-file
+implementation can also be reused.
+
+Authentication/permission failures, checksum conflicts, unsafe paths, and
+storage exhaustion are not automatically retried. Errors report the original
+failure and retain progress. Do not delete the PVCs to recover an interrupted
+upload. If cleanup fails after successful verification, Brunner explicitly
+reports "archive restore is complete" and the same command retries cleanup
+and finishes submission. Preparation will not proceed with an incomplete
+restore checkpoint, even if invoked separately.
+
+The receiver is tokenless and deny-all network-isolated, just like the archive
+reader. It serializes writers with a process lock on the Pod's local
+`emptyDir`, not on the shared storage. Brunner never force-deletes a helper
+to bypass an active writer. Concurrent restore attempts use the same
+campaign/manifest identity; an already-completed restore is verified read-only.
+
+The opt-in large regression reproduces 753 files / 810 MiB with an injected
+lost acknowledgement, using real subprocesses and no provider calls:
+
+```sh
+BRUNNER_LARGE_ARCHIVE_TEST=1 uv run pytest \
+  tests/test_archive_transfer.py::test_large_archive_restore_advances_after_interruption
+```
+
 The controller image must contain Brunner, `kubectl`, the benchmark definition
 and campaign modules, assessment materials, reviewer CLIs when configured, and
 the artifact-reader runtime. Agent images need Brunner and the selected
